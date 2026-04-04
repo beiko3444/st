@@ -176,6 +176,15 @@ class SmartStoreConnector:
                 return None
 
     @staticmethod
+    def _to_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
     def _build_product_url(product_id: Any, product_name: str | None) -> Optional[str]:
         numeric_id = SmartStoreConnector._to_int(product_id)
         if numeric_id is not None:
@@ -218,6 +227,25 @@ class SmartStoreConnector:
         start_date: date,
         end_date: date,
     ) -> Dict[str, int]:
+        rows = self._fetch_product_sales_chunk_rows(channel_no, start_date, end_date)
+        sales_map: Dict[str, int] = {}
+        for row in rows:
+            product_id = row.get("productId")
+            if not product_id:
+                continue
+            purchases = self._to_int(row.get("numPurchases"))
+            if purchases is None:
+                continue
+            key = str(product_id)
+            sales_map[key] = sales_map.get(key, 0) + purchases
+        return sales_map
+
+    def _fetch_product_sales_chunk_rows(
+        self,
+        channel_no: str,
+        start_date: date,
+        end_date: date,
+    ) -> List[Dict[str, Any]]:
         endpoint = f"/v1/bizdata-stats/channels/{channel_no}/sales/product/detail"
         date_formats = ["%Y-%m-%d", "%Y%m%d"]
         errors: List[str] = []
@@ -244,22 +272,11 @@ class SmartStoreConnector:
                 detail = f"{body.get('code')}: {body.get('message')}"
                 errors.append(f"{response.request.url} -> {detail}")
                 continue
-
-            sales_map: Dict[str, int] = {}
-            for row in rows:
-                product_id = row.get("productId")
-                if not product_id:
-                    continue
-                purchases = self._to_int(row.get("numPurchases"))
-                if purchases is None:
-                    continue
-                key = str(product_id)
-                sales_map[key] = sales_map.get(key, 0) + purchases
-            return sales_map
+            return rows
 
         if errors:
             raise RuntimeError("네이버 통계 API(판매량) 조회 실패\n" + "\n".join(errors))
-        return {}
+        return []
 
     def fetch_product_sales_counts(self, days: int = 30) -> Dict[str, int]:
         channel_no = self.fetch_primary_channel_no()
@@ -276,6 +293,45 @@ class SmartStoreConnector:
             chunk_sales = self._fetch_product_sales_chunk(channel_no, cursor, chunk_end)
             for key, count in chunk_sales.items():
                 merged[key] = merged.get(key, 0) + count
+            cursor = chunk_end + timedelta(days=1)
+
+        return merged
+
+    def fetch_product_sales_revenue(self, days: int = 30) -> Dict[str, Dict[str, Any]]:
+        channel_no = self.fetch_primary_channel_no()
+
+        lookback_days = max(1, int(days))
+        final_end = datetime.now().date()
+        final_start = final_end - timedelta(days=lookback_days - 1)
+
+        cursor = final_start
+        merged: Dict[str, Dict[str, Any]] = {}
+        while cursor <= final_end:
+            chunk_end = min(cursor + timedelta(days=13), final_end)
+            chunk_rows = self._fetch_product_sales_chunk_rows(channel_no, cursor, chunk_end)
+
+            for row in chunk_rows:
+                product_id = row.get("productId")
+                if product_id is None:
+                    continue
+                key = str(product_id)
+                existing = merged.setdefault(
+                    key,
+                    {
+                        "product_id": key,
+                        "product_name": str(row.get("productName") or ""),
+                        "orders": 0,
+                        "quantity": 0,
+                        "pay_amount": 0.0,
+                        "refund_amount": 0.0,
+                    },
+                )
+
+                existing["orders"] += self._to_int(row.get("numPurchases")) or 0
+                existing["quantity"] += self._to_int(row.get("productQuantity")) or 0
+                existing["pay_amount"] += self._to_float(row.get("payAmount")) or 0.0
+                existing["refund_amount"] += self._to_float(row.get("refundPayAmount")) or 0.0
+
             cursor = chunk_end + timedelta(days=1)
 
         return merged
