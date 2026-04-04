@@ -9,6 +9,32 @@ from inventory_app.connectors.smartstore import SmartStoreConnector
 from inventory_app.models import ChannelProduct
 
 
+def _to_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+
+def _assign_serial_by_sales(rows: List[ChannelProduct]) -> None:
+    ranked = sorted(
+        rows,
+        key=lambda row: (
+            1 if _to_int(row.sales) is None else 0,
+            -(_to_int(row.sales) or 0),
+            row.name.lower(),
+            row.product_id,
+        ),
+    )
+    for index, row in enumerate(ranked, start=1):
+        row.serial = index
+
+
 class NaverChannelService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -51,8 +77,7 @@ class NaverChannelService:
             for row in rows:
                 row.sales = sales_map.get(row.product_id, 0)
 
-        for index, row in enumerate(rows, start=1):
-            row.serial = index
+        _assign_serial_by_sales(rows)
         return rows, warnings
 
     def _fetch_sales_map(self, warnings: List[str]) -> dict[str, int] | None:
@@ -106,6 +131,5 @@ class CoupangChannelService:
                 )
             )
 
-        for index, row in enumerate(rows, start=1):
-            row.serial = index
+        _assign_serial_by_sales(rows)
         return rows, warnings
