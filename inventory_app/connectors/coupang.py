@@ -2,6 +2,8 @@
 
 import hashlib
 import hmac
+import threading
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus, urlencode
@@ -10,6 +12,11 @@ import httpx
 
 
 class CoupangRocketConnector:
+    _CACHE_TTL_SECONDS = 120.0
+    _shared_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+    _shared_vendor_locks: Dict[str, threading.Lock] = {}
+    _shared_guard = threading.Lock()
+
     def __init__(
         self,
         vendor_id: str,
@@ -22,6 +29,8 @@ class CoupangRocketConnector:
         self.secret_key = secret_key
         self.base_url = "https://api-gateway.coupang.com"
         self.client = httpx.Client(base_url=self.base_url, timeout=timeout_seconds)
+        self.max_retry_attempts = 6
+        self.detail_sleep_seconds = 0.15
 
     @staticmethod
     def _signed_date() -> str:
@@ -42,6 +51,43 @@ class CoupangRocketConnector:
             f"signature={signature}"
         )
 
+    @staticmethod
+    def _extract_error_detail(response: httpx.Response) -> str:
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                message = payload.get("message")
+                code = payload.get("code")
+                if code and message:
+                    return f"{code}: {message}"
+                if message:
+                    return str(message)
+                return str(payload)
+        except Exception:  # noqa: BLE001
+            pass
+        text = response.text.strip()
+        if text:
+            return text[:400]
+        return f"HTTP {response.status_code}"
+
+    @staticmethod
+    def _parse_retry_after_seconds(response: httpx.Response) -> float | None:
+        value = response.headers.get("Retry-After")
+        if not value:
+            return None
+        try:
+            seconds = float(value.strip())
+            return max(0.0, min(seconds, 30.0))
+        except (TypeError, ValueError):
+            return None
+
+    def _retry_delay_seconds(self, response: httpx.Response | None, attempt: int) -> float:
+        if response is not None:
+            retry_after = self._parse_retry_after_seconds(response)
+            if retry_after is not None:
+                return retry_after
+        return min(8.0, 0.6 * (2 ** attempt))
+
     def _request(
         self,
         method: str,
@@ -50,14 +96,40 @@ class CoupangRocketConnector:
     ) -> Dict[str, Any]:
         params = params or {}
         query_string = urlencode(params, doseq=True)
-        headers = {
-            "Authorization": self._authorization(method, path, query_string),
-            "Content-Type": "application/json;charset=UTF-8",
-            "X-EXTENDED-TIMEOUT": "90000",
-        }
-        response = self.client.request(method, path, params=params, headers=headers)
-        response.raise_for_status()
-        return response.json()
+
+        retry_statuses = {429, 500, 502, 503, 504}
+        last_error: str | None = None
+
+        for attempt in range(self.max_retry_attempts):
+            headers = {
+                "Authorization": self._authorization(method, path, query_string),
+                "Content-Type": "application/json;charset=UTF-8",
+                "X-EXTENDED-TIMEOUT": "90000",
+            }
+
+            try:
+                response = self.client.request(method, path, params=params, headers=headers)
+            except httpx.RequestError as exc:
+                last_error = str(exc)
+                if attempt < self.max_retry_attempts - 1:
+                    time.sleep(self._retry_delay_seconds(None, attempt))
+                    continue
+                raise RuntimeError(f"쿠팡 API 요청 실패: {last_error}") from exc
+
+            if response.status_code < 400:
+                return response.json()
+
+            status = response.status_code
+            detail = self._extract_error_detail(response)
+            last_error = f"{status}: {detail} ({response.request.url})"
+
+            if status in retry_statuses and attempt < self.max_retry_attempts - 1:
+                time.sleep(self._retry_delay_seconds(response, attempt))
+                continue
+
+            raise RuntimeError(f"쿠팡 API 오류: {last_error}")
+
+        raise RuntimeError(f"쿠팡 API 요청 실패: {last_error or 'unknown error'}")
 
     @staticmethod
     def _to_int(value: Any) -> Optional[int]:
@@ -294,7 +366,33 @@ class CoupangRocketConnector:
                 return head
         return {}
 
-    def fetch_products(self, max_products: int = 500) -> List[Dict[str, Any]]:
+    @classmethod
+    def _get_vendor_lock(cls, cache_key: str) -> threading.Lock:
+        with cls._shared_guard:
+            lock = cls._shared_vendor_locks.get(cache_key)
+            if lock is None:
+                lock = threading.Lock()
+                cls._shared_vendor_locks[cache_key] = lock
+            return lock
+
+    @classmethod
+    def _read_cache(cls, cache_key: str) -> Optional[List[Dict[str, Any]]]:
+        with cls._shared_guard:
+            cached = cls._shared_cache.get(cache_key)
+        if not cached:
+            return None
+
+        cached_at, rows = cached
+        if time.monotonic() - cached_at > cls._CACHE_TTL_SECONDS:
+            return None
+        return [dict(row) for row in rows]
+
+    @classmethod
+    def _write_cache(cls, cache_key: str, rows: List[Dict[str, Any]]) -> None:
+        with cls._shared_guard:
+            cls._shared_cache[cache_key] = (time.monotonic(), [dict(row) for row in rows])
+
+    def _fetch_products_uncached(self, max_products: int = 500) -> List[Dict[str, Any]]:
         inventory_map, sales_map = self._fetch_inventory_maps()
         listed_products = self._fetch_rocket_seller_products(max_products=max_products)
 
@@ -304,30 +402,48 @@ class CoupangRocketConnector:
             if seller_product_id is None:
                 continue
 
-            detail = self._fetch_product_detail(seller_product_id)
+            listed_items = listed.get("items")
+            if not isinstance(listed_items, list):
+                listed_items = []
+            listed_image = self._pick_image(listed.get("images"))
+            need_detail = not listed_items or listed_image is None
+
+            detail: Dict[str, Any] = {}
+            if need_detail:
+                try:
+                    if self.detail_sleep_seconds > 0:
+                        time.sleep(self.detail_sleep_seconds)
+                    detail = self._fetch_product_detail(seller_product_id)
+                except Exception:  # noqa: BLE001
+                    detail = {}
+
             product_name = (
                 detail.get("displayProductName")
                 or detail.get("sellerProductName")
                 or listed.get("sellerProductName")
                 or ""
             )
-            image_url = self._pick_image(detail.get("images"))
+            image_url = self._pick_image(detail.get("images")) or listed_image
 
             items = detail.get("items")
             if not isinstance(items, list) or not items:
-                results.append(
-                    {
-                        "channel": "쿠팡로켓",
-                        "product_id": str(seller_product_id),
-                        "item_id": None,
-                        "name": str(product_name),
-                        "image_url": image_url,
-                        "product_url": self._build_product_url(str(product_name), None, None),
-                        "stock": None,
-                        "sales": None,
-                        "price": None,
-                    }
-                )
+                items = listed_items
+
+            if not items:
+                row = {
+                    "channel": "쿠팡로켓",
+                    "product_id": str(seller_product_id),
+                    "item_id": None,
+                    "name": str(product_name),
+                    "image_url": image_url,
+                    "product_url": self._build_product_url(str(product_name), None, None),
+                    "stock": None,
+                    "sales": None,
+                    "price": None,
+                }
+                if row["sales"] is None:
+                    row["sales"] = 0
+                results.append(row)
                 continue
 
             for item in items:
@@ -342,13 +458,11 @@ class CoupangRocketConnector:
                 item_image_url = self._pick_image(item.get("images")) or image_url
 
                 stock = None
-                sales = None
+                sales = 0
                 if vendor_item_id is not None:
                     key = str(vendor_item_id)
                     stock = inventory_map.get(key)
-                    sales = sales_map.get(key)
-                    if sales is None:
-                        sales = 0
+                    sales = sales_map.get(key) or 0
 
                 results.append(
                     {
@@ -365,3 +479,21 @@ class CoupangRocketConnector:
                 )
 
         return results
+
+    def fetch_products(self, max_products: int = 500) -> List[Dict[str, Any]]:
+        capped_products = max(1, int(max_products))
+        cache_key = f"{self.vendor_id}:{capped_products}"
+
+        cached = self._read_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        lock = self._get_vendor_lock(cache_key)
+        with lock:
+            cached = self._read_cache(cache_key)
+            if cached is not None:
+                return cached
+
+            rows = self._fetch_products_uncached(max_products=capped_products)
+            self._write_cache(cache_key, rows)
+            return [dict(row) for row in rows]
