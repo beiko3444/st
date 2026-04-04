@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -89,17 +90,20 @@ class ProductImageLabel(QLabel):
 
 class ChannelTab(QWidget):
     image_downloaded = Signal(str, object)
+    sync_finished = Signal(str, bool)
 
     def __init__(
         self,
         channel_name: str,
         sales_header: str,
         fetch_fn: Callable[[], tuple[List[ChannelProduct], List[str]]],
+        initial_fetch_fn: Callable[[], tuple[List[ChannelProduct], List[str]]] | None = None,
     ) -> None:
         super().__init__()
         self.channel_name = channel_name
         self.sales_header = sales_header
         self.fetch_fn = fetch_fn
+        self.initial_fetch_fn = initial_fetch_fn
 
         self.worker: ChannelSyncWorker | None = None
         self.rows: List[ChannelProduct] = []
@@ -123,6 +127,7 @@ class ChannelTab(QWidget):
 
         self.image_downloaded.connect(self._on_image_downloaded)
         self._build_ui()
+        self._load_initial_rows()
         self._set_busy(False)
 
     def _build_ui(self) -> None:
@@ -235,15 +240,33 @@ class ChannelTab(QWidget):
             """
         )
 
-    def sync_now(self) -> None:
-        if self.worker and self.worker.isRunning():
+    def _load_initial_rows(self) -> None:
+        if self.initial_fetch_fn is None:
             return
+        try:
+            rows, warnings = self.initial_fetch_fn()
+        except Exception:  # noqa: BLE001
+            return
+        if not rows:
+            return
+        self.rows = list(rows)
+        self._apply_filters()
+        summary = f"{self.channel_name} 캐시 로드: {len(self.rows)}건"
+        if warnings:
+            summary += f" | 경고 {len(warnings)}건"
+        self.status_label.setText(summary)
+        self.status_label.setToolTip("\n".join(warnings) if warnings else "")
+
+    def sync_now(self) -> bool:
+        if self.worker and self.worker.isRunning():
+            return False
 
         self._set_busy(True, f"{self.channel_name} 데이터를 동기화하는 중입니다...")
         self.worker = ChannelSyncWorker(self.fetch_fn)
         self.worker.completed.connect(self._on_sync_completed)
         self.worker.failed.connect(self._on_sync_failed)
         self.worker.start()
+        return True
 
     def _set_busy(self, busy: bool, message: str = "") -> None:
         self.sync_button.setEnabled(not busy)
@@ -251,28 +274,38 @@ class ChannelTab(QWidget):
         if message:
             self.status_label.setText(message)
 
+    @staticmethod
+    def _changed_row_count(previous_rows: List[ChannelProduct], current_rows: List[ChannelProduct]) -> int:
+        overlap = min(len(previous_rows), len(current_rows))
+        changed = sum(1 for idx in range(overlap) if previous_rows[idx] is not current_rows[idx])
+        return changed + abs(len(previous_rows) - len(current_rows))
+
     @Slot(object, object)
     def _on_sync_completed(self, rows: object, warnings: object) -> None:
         self._set_busy(False)
 
+        previous_rows = self.rows
         self.rows = list(rows) if isinstance(rows, list) else []
         warning_messages = list(warnings) if isinstance(warnings, list) else []
+        changed_count = self._changed_row_count(previous_rows, self.rows)
 
-        self._apply_filters()
+        if changed_count > 0:
+            self._apply_filters()
 
         summary = f"{self.channel_name} 동기화 완료: {len(self.rows)}건"
+        summary += f" | 변경 {changed_count}건"
         if warning_messages:
             summary += f" | 경고 {len(warning_messages)}건"
         self.status_label.setText(summary)
-
-        if warning_messages:
-            QMessageBox.warning(self, f"{self.channel_name} 일부 경고", "\n".join(warning_messages))
+        self.status_label.setToolTip("\n".join(warning_messages) if warning_messages else "")
+        self.sync_finished.emit(self.channel_name, True)
 
     @Slot(str)
     def _on_sync_failed(self, error: str) -> None:
         self._set_busy(False)
         self.status_label.setText(f"{self.channel_name} 동기화 실패")
         QMessageBox.critical(self, f"{self.channel_name} 동기화 실패", error)
+        self.sync_finished.emit(self.channel_name, False)
 
     @staticmethod
     def _fmt_int(value: int | None, suffix: str = "") -> str:
@@ -394,8 +427,16 @@ class ChannelTab(QWidget):
                 continue
             filtered.append(row)
 
-        self.filtered_rows = self._sort_rows(filtered)
-        self._render_table(self.filtered_rows)
+        previous_rows = self.filtered_rows
+        next_rows = self._sort_rows(filtered)
+        if self._can_patch_render(previous_rows, next_rows):
+            changed_indexes = self._changed_row_indexes(previous_rows, next_rows)
+            self.filtered_rows = next_rows
+            if changed_indexes:
+                self._patch_table_rows(self.filtered_rows, changed_indexes)
+        else:
+            self.filtered_rows = next_rows
+            self._render_table(self.filtered_rows)
 
     @Slot(int)
     def _on_header_clicked(self, column: int) -> None:
@@ -451,6 +492,107 @@ class ChannelTab(QWidget):
             return sorted(rows, key=lambda row: row.synced_at, reverse=descending)
         return list(rows)
 
+    @staticmethod
+    def _row_identity_key(row: ChannelProduct) -> tuple[str, str]:
+        if row.product_id:
+            return (f"id:{row.product_id}", row.item_id or "")
+        if row.product_url:
+            return (f"url:{row.product_url}", "")
+        return (f"name:{row.name}", "")
+
+    @classmethod
+    def _can_patch_render(
+        cls,
+        previous_rows: List[ChannelProduct],
+        current_rows: List[ChannelProduct],
+    ) -> bool:
+        if len(previous_rows) != len(current_rows):
+            return False
+        return all(
+            cls._row_identity_key(previous) == cls._row_identity_key(current)
+            for previous, current in zip(previous_rows, current_rows)
+        )
+
+    @staticmethod
+    def _changed_row_indexes(
+        previous_rows: List[ChannelProduct],
+        current_rows: List[ChannelProduct],
+    ) -> list[int]:
+        return [
+            index
+            for index, (previous, current) in enumerate(zip(previous_rows, current_rows))
+            if previous is not current
+        ]
+
+    def _render_row(self, index: int, row: ChannelProduct, token: int) -> None:
+        self.table.setRowHeight(index, 62)
+        self.table.setCellWidget(index, 0, self._favorite_button(row))
+
+        self.table.setItem(
+            index,
+            1,
+            self._table_item(
+                str(row.serial),
+                Qt.AlignCenter,
+                sort_value=row.serial,
+            ),
+        )
+
+        image_cell, image_label = self._image_cell(row.product_url)
+        self.table.setCellWidget(index, 2, image_cell)
+
+        self.table.setItem(
+            index,
+            3,
+            self._table_item(
+                row.name,
+                Qt.AlignVCenter | Qt.AlignLeft,
+                sort_value=row.name.lower(),
+            ),
+        )
+
+        self.table.setItem(
+            index,
+            4,
+            self._table_item(
+                self._fmt_int(row.stock),
+                Qt.AlignCenter,
+                sort_value=self._sortable_none_last(row.stock),
+            ),
+        )
+
+        self.table.setItem(
+            index,
+            5,
+            self._table_item(
+                self._fmt_int(row.sales),
+                Qt.AlignCenter,
+                sort_value=self._sortable_none_last(row.sales),
+            ),
+        )
+
+        self.table.setItem(
+            index,
+            6,
+            self._table_item(
+                self._fmt_int(row.price, "원"),
+                Qt.AlignRight | Qt.AlignVCenter,
+                sort_value=self._sortable_none_last(row.price),
+            ),
+        )
+
+        self.table.setItem(
+            index,
+            7,
+            self._table_item(
+                row.synced_at.strftime("%Y-%m-%d %H:%M:%S"),
+                Qt.AlignCenter,
+                sort_value=row.synced_at.timestamp(),
+            ),
+        )
+
+        self._queue_image(image_label, row.image_url, token)
+
     def _render_table(self, rows: List[ChannelProduct]) -> None:
         self.render_token += 1
         token = self.render_token
@@ -459,77 +601,16 @@ class ChannelTab(QWidget):
         self.table.setRowCount(len(rows))
 
         for index, row in enumerate(rows):
-            self.table.setRowHeight(index, 62)
-
-            self.table.setCellWidget(index, 0, self._favorite_button(row))
-
-            self.table.setItem(
-                index,
-                1,
-                self._table_item(
-                    str(row.serial),
-                    Qt.AlignCenter,
-                    sort_value=row.serial,
-                ),
-            )
-
-            image_cell, image_label = self._image_cell(row.product_url)
-            self.table.setCellWidget(index, 2, image_cell)
-
-            self.table.setItem(
-                index,
-                3,
-                self._table_item(
-                    row.name,
-                    Qt.AlignVCenter | Qt.AlignLeft,
-                    sort_value=row.name.lower(),
-                ),
-            )
-
-            self.table.setItem(
-                index,
-                4,
-                self._table_item(
-                    self._fmt_int(row.stock),
-                    Qt.AlignCenter,
-                    sort_value=self._sortable_none_last(row.stock),
-                ),
-            )
-
-            self.table.setItem(
-                index,
-                5,
-                self._table_item(
-                    self._fmt_int(row.sales),
-                    Qt.AlignCenter,
-                    sort_value=self._sortable_none_last(row.sales),
-                ),
-            )
-
-            self.table.setItem(
-                index,
-                6,
-                self._table_item(
-                    self._fmt_int(row.price, "원"),
-                    Qt.AlignRight | Qt.AlignVCenter,
-                    sort_value=self._sortable_none_last(row.price),
-                ),
-            )
-
-            self.table.setItem(
-                index,
-                7,
-                self._table_item(
-                    row.synced_at.strftime("%Y-%m-%d %H:%M:%S"),
-                    Qt.AlignCenter,
-                    sort_value=row.synced_at.timestamp(),
-                ),
-            )
-
-            self._queue_image(image_label, row.image_url, token)
+            self._render_row(index, row, token)
 
         if rows and self.table.currentRow() < 0:
             self.table.setCurrentCell(0, 1)
+
+    def _patch_table_rows(self, rows: List[ChannelProduct], changed_indexes: list[int]) -> None:
+        token = self.render_token
+        for index in changed_indexes:
+            if 0 <= index < len(rows):
+                self._render_row(index, rows[index], token)
 
     @staticmethod
     def _normalize_image_url(path_or_url: str | None) -> str | None:
@@ -658,6 +739,8 @@ class RevenueSyncWorker(QThread):
 
 
 class RevenueTab(QWidget):
+    sync_finished = Signal(str, bool)
+
     def __init__(
         self,
         fetch_fn: Callable[[int], tuple[RevenueSnapshot, List[str]]],
@@ -828,15 +911,16 @@ class RevenueTab(QWidget):
             self.status_label.setText(message)
 
     @Slot()
-    def sync_now(self) -> None:
+    def sync_now(self) -> bool:
         if self.worker and self.worker.isRunning():
-            return
+            return False
         period_days = int(self.period_combo.currentData() or 30)
         self._set_busy(True, f"매출 데이터를 동기화하는 중입니다... ({period_days}일)")
         self.worker = RevenueSyncWorker(self.fetch_fn, period_days)
         self.worker.completed.connect(self._on_sync_completed)
         self.worker.failed.connect(self._on_sync_failed)
         self.worker.start()
+        return True
 
     @staticmethod
     def _fmt_int(value: int | None) -> str:
@@ -864,6 +948,7 @@ class RevenueTab(QWidget):
         self._set_busy(False)
         if not isinstance(snapshot_obj, RevenueSnapshot):
             self.status_label.setText("매출 동기화 실패: 응답 형식 오류")
+            self.sync_finished.emit("매출비교", False)
             return
 
         warnings = list(warnings_obj) if isinstance(warnings_obj, list) else []
@@ -878,16 +963,22 @@ class RevenueTab(QWidget):
                 f"| {snapshot_obj.generated_at.strftime('%Y-%m-%d %H:%M:%S')}"
             )
         )
-        self.note_label.setText("\n".join(snapshot_obj.notes))
-
+        note_lines = list(snapshot_obj.notes)
         if warnings:
-            QMessageBox.warning(self, "매출 일부 경고", "\n".join(warnings))
+            note_lines.append("")
+            note_lines.append("[경고]")
+            note_lines.extend(warnings)
+        note_text = "\n".join(note_lines)
+        self.note_label.setText(note_text)
+        self.note_label.setToolTip("\n".join(warnings) if warnings else "")
+        self.sync_finished.emit("매출비교", True)
 
     @Slot(str)
     def _on_sync_failed(self, error: str) -> None:
         self._set_busy(False)
         self.status_label.setText("매출 동기화 실패")
         QMessageBox.critical(self, "매출 동기화 실패", error)
+        self.sync_finished.emit("매출비교", False)
 
     def _render_summary(self, rows: List[RevenueChannelSummary]) -> None:
         self.summary_table.setSortingEnabled(False)
@@ -1040,18 +1131,25 @@ class MainWindow(QMainWindow):
 
         self.sync_all_button = QPushButton("전체 동기화")
         self.sync_all_button.setObjectName("primarySyncButton")
+        self.sync_progress = QProgressBar()
         self.tabs = QTabWidget()
+        self._sync_expected_sources: set[str] = set()
+        self._sync_finished_sources: set[str] = set()
+        self._sync_failed_sources: set[str] = set()
+        self._sync_session_active = False
 
         sales_days = max(1, int(config.stats_lookback_days))
         self.naver_tab = ChannelTab(
             channel_name="네이버",
             sales_header=f"판매량({sales_days}일)",
             fetch_fn=self.naver_service.fetch,
+            initial_fetch_fn=self.naver_service.fetch_cached,
         )
         self.coupang_tab = ChannelTab(
             channel_name="쿠팡",
             sales_header="판매량",
             fetch_fn=self.coupang_service.fetch,
+            initial_fetch_fn=self.coupang_service.fetch_cached,
         )
         self.revenue_tab = RevenueTab(
             fetch_fn=self.revenue_service.fetch,
@@ -1064,23 +1162,35 @@ class MainWindow(QMainWindow):
         self.favorite_shortcut.setContext(Qt.ApplicationShortcut)
         self.favorite_shortcut.activated.connect(self._toggle_favorite_on_current_tab)
 
+        self.naver_tab.sync_finished.connect(self._on_sub_sync_finished)
+        self.coupang_tab.sync_finished.connect(self._on_sub_sync_finished)
+        self.revenue_tab.sync_finished.connect(self._on_sub_sync_finished)
+
     def _build_ui(self) -> None:
         root = QWidget(self)
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(10, 10, 10, 10)
         root_layout.setSpacing(8)
 
-        top_bar = QHBoxLayout()
-        top_bar.setSpacing(8)
         self.sync_all_button.clicked.connect(self.sync_now)
-        top_bar.addWidget(self.sync_all_button)
-        top_bar.addStretch(1)
+        self.sync_progress.setObjectName("syncProgressBar")
+        self.sync_progress.setRange(0, 100)
+        self.sync_progress.setValue(0)
+        self.sync_progress.setTextVisible(True)
+        self.sync_progress.setFormat("대기 중")
+        self.sync_progress.setVisible(False)
 
         self.tabs.addTab(self.naver_tab, "네이버")
         self.tabs.addTab(self.coupang_tab, "쿠팡")
         self.tabs.addTab(self.revenue_tab, "매출비교")
+        corner = QWidget()
+        corner_layout = QHBoxLayout(corner)
+        corner_layout.setContentsMargins(0, 0, 0, 0)
+        corner_layout.setSpacing(0)
+        corner_layout.addWidget(self.sync_all_button)
+        self.tabs.setCornerWidget(corner, Qt.TopRightCorner)
 
-        root_layout.addLayout(top_bar)
+        root_layout.addWidget(self.sync_progress, 0)
         root_layout.addWidget(self.tabs, 1)
 
         self.setCentralWidget(root)
@@ -1106,6 +1216,20 @@ class MainWindow(QMainWindow):
             #primarySyncButton:pressed {
                 background: #245587;
             }
+            #syncProgressBar {
+                min-height: 18px;
+                max-height: 18px;
+                border: 1px solid #d8dee4;
+                border-radius: 7px;
+                background: #f8fafc;
+                text-align: center;
+                color: #334155;
+                font-size: 11px;
+            }
+            #syncProgressBar::chunk {
+                border-radius: 6px;
+                background: #3b82f6;
+            }
             QTabWidget::pane {
                 border: 1px solid #d8dee4;
                 border-radius: 10px;
@@ -1130,11 +1254,64 @@ class MainWindow(QMainWindow):
             """
         )
 
+    def _start_sync_session(self, sources: set[str]) -> None:
+        self._sync_expected_sources = set(sources)
+        self._sync_finished_sources.clear()
+        self._sync_failed_sources.clear()
+        self._sync_session_active = bool(self._sync_expected_sources)
+        if not self._sync_session_active:
+            self.sync_progress.setVisible(False)
+            return
+        total = len(self._sync_expected_sources)
+        self.sync_progress.setVisible(True)
+        self.sync_progress.setValue(0)
+        self.sync_progress.setFormat(f"동기화 진행 중... (0/{total})")
+
+    def _update_sync_progress(self) -> None:
+        if not self._sync_session_active:
+            return
+        total = len(self._sync_expected_sources)
+        done = len(self._sync_finished_sources)
+        if total <= 0:
+            self.sync_progress.setVisible(False)
+            self._sync_session_active = False
+            return
+        percent = int((done * 100) / total)
+        self.sync_progress.setValue(percent)
+        if done >= total:
+            if self._sync_failed_sources:
+                self.sync_progress.setFormat(f"동기화 완료 (일부 실패: {done}/{total})")
+            else:
+                self.sync_progress.setFormat(f"동기화 완료 ({done}/{total})")
+            self._sync_session_active = False
+        else:
+            self.sync_progress.setFormat(f"동기화 진행 중... ({done}/{total})")
+
     @Slot()
     def sync_now(self) -> None:
-        self.naver_tab.sync_now()
-        self.coupang_tab.sync_now()
-        self.revenue_tab.sync_now()
+        started_sources: set[str] = set()
+        if self.naver_tab.sync_now():
+            started_sources.add("네이버")
+        if self.coupang_tab.sync_now():
+            started_sources.add("쿠팡")
+        if self.revenue_tab.sync_now():
+            started_sources.add("매출비교")
+
+        self._start_sync_session(started_sources)
+
+    @Slot(str, bool)
+    def _on_sub_sync_finished(self, source: str, succeeded: bool) -> None:
+        if not self._sync_session_active:
+            return
+        if source not in self._sync_expected_sources:
+            return
+        if source in self._sync_finished_sources:
+            return
+
+        self._sync_finished_sources.add(source)
+        if not succeeded:
+            self._sync_failed_sources.add(source)
+        self._update_sync_progress()
 
     @Slot()
     def _toggle_favorite_on_current_tab(self) -> None:

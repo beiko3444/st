@@ -1,6 +1,6 @@
 # SmartStore + 쿠팡로켓 재고 조회 GUI
 
-윈도우에서 실행하는 Python(PySide6) 기반 데스크톱 앱입니다.
+Windows/macOS에서 실행하는 Python(PySide6) 기반 데스크톱 앱입니다.
 
 아래 컬럼을 통합 조회합니다.
 
@@ -30,7 +30,9 @@
 - `inventory_app/services/aggregator.py`: 채널 통합 서비스
 - `inventory_app/ui/main_window.py`: 메인 GUI
 
-## 실행 방법 (Windows PowerShell)
+## 실행 방법
+
+### Windows (PowerShell)
 
 1. Python 3.11+ 설치
 2. 프로젝트 폴더에서 가상환경 생성/활성화
@@ -52,17 +54,46 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## EXE 빌드/실행
+### macOS (zsh/bash)
 
-이미 빌드가 완료된 경우 실행 파일 경로:
+1. Python 3.11+ 설치
+2. 프로젝트 폴더에서 가상환경 생성/활성화
 
-- `dist\\SmartInventory\\SmartInventory.exe`
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
 
-재빌드:
+3. 패키지 설치
+
+```bash
+pip install -r requirements.txt
+```
+
+4. 실행
+
+```bash
+python3 main.py
+```
+
+## 실행파일 빌드
+
+Windows PowerShell:
 
 ```powershell
 .\build_exe.ps1
 ```
+
+macOS/Linux:
+
+```bash
+./build_exe.sh
+```
+
+빌드 결과:
+
+- Windows: `dist\SmartInventory_v###\SmartInventory_v###.exe`
+- macOS: `dist/SmartInventory_v###.app`
 
 ## 참고
 

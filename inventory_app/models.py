@@ -9,6 +9,7 @@ from typing import Optional
 class ChannelProduct:
     serial: int
     product_id: str
+    item_id: Optional[str]
     name: str
     image_url: Optional[str]
     product_url: Optional[str]
