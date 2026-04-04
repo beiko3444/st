@@ -24,6 +24,12 @@ from PySide6.QtWidgets import (
 from inventory_app.config import AppConfig
 from inventory_app.models import ChannelProduct
 from inventory_app.services.channel_services import CoupangChannelService, NaverChannelService
+from inventory_app.services.revenue_services import (
+    RevenueChannelSummary,
+    RevenueComparisonService,
+    RevenueProductSummary,
+    RevenueSnapshot,
+)
 
 
 class SortableTableItem(QTableWidgetItem):
@@ -630,6 +636,396 @@ class ChannelTab(QWidget):
         self.image_executor.shutdown(wait=False, cancel_futures=True)
 
 
+class RevenueSyncWorker(QThread):
+    completed = Signal(object, object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        fetch_fn: Callable[[int], tuple[RevenueSnapshot, List[str]]],
+        period_days: int,
+    ) -> None:
+        super().__init__()
+        self.fetch_fn = fetch_fn
+        self.period_days = max(1, int(period_days))
+
+    def run(self) -> None:
+        try:
+            snapshot, warnings = self.fetch_fn(self.period_days)
+            self.completed.emit(snapshot, warnings)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
+class RevenueTab(QWidget):
+    def __init__(
+        self,
+        fetch_fn: Callable[[int], tuple[RevenueSnapshot, List[str]]],
+        default_days: int,
+    ) -> None:
+        super().__init__()
+        self.fetch_fn = fetch_fn
+        self.default_days = max(1, int(default_days))
+        self.worker: RevenueSyncWorker | None = None
+
+        self.sync_button = QPushButton("동기화")
+        self.period_combo = QComboBox()
+        self.summary_table = QTableWidget(0, 7)
+        self.product_table = QTableWidget(0, 8)
+        self.status_label = QLabel("준비 완료")
+        self.note_label = QLabel("")
+
+        self._build_ui()
+        self._set_busy(False)
+
+    def _build_ui(self) -> None:
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(10, 10, 10, 10)
+        root_layout.setSpacing(10)
+
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(8)
+        self.sync_button.clicked.connect(self.sync_now)
+
+        self.period_combo.addItem("7일", 7)
+        self.period_combo.addItem("14일", 14)
+        self.period_combo.addItem("30일", 30)
+        self.period_combo.addItem("60일", 60)
+        self._select_default_period()
+
+        top_bar.addWidget(self.sync_button)
+        top_bar.addWidget(QLabel("기준기간"))
+        top_bar.addWidget(self.period_combo)
+        top_bar.addStretch(1)
+
+        self.summary_table.setHorizontalHeaderLabels(
+            [
+                "채널",
+                "총매출",
+                "환불",
+                "순매출",
+                "주문수",
+                "데이터유형",
+                "비고",
+            ]
+        )
+        self.summary_table.verticalHeader().setVisible(False)
+        self.summary_table.setAlternatingRowColors(True)
+        self.summary_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.summary_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.summary_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.summary_table.setSortingEnabled(True)
+        self.summary_table.setColumnWidth(0, 90)
+        self.summary_table.setColumnWidth(1, 140)
+        self.summary_table.setColumnWidth(2, 130)
+        self.summary_table.setColumnWidth(3, 140)
+        self.summary_table.setColumnWidth(4, 100)
+        self.summary_table.setColumnWidth(5, 110)
+        self.summary_table.setColumnWidth(6, 260)
+
+        self.product_table.setHorizontalHeaderLabels(
+            [
+                "채널",
+                "상품ID",
+                "상품명",
+                "주문수",
+                "총매출",
+                "환불",
+                "순매출",
+                "데이터유형",
+            ]
+        )
+        self.product_table.verticalHeader().setVisible(False)
+        self.product_table.setAlternatingRowColors(True)
+        self.product_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.product_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.product_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.product_table.setSortingEnabled(True)
+        self.product_table.setColumnWidth(0, 80)
+        self.product_table.setColumnWidth(1, 120)
+        self.product_table.setColumnWidth(2, 560)
+        self.product_table.setColumnWidth(3, 100)
+        self.product_table.setColumnWidth(4, 140)
+        self.product_table.setColumnWidth(5, 130)
+        self.product_table.setColumnWidth(6, 140)
+        self.product_table.setColumnWidth(7, 110)
+
+        self.status_label.setStyleSheet("color: #475569;")
+        self.note_label.setStyleSheet("color: #475569;")
+        self.note_label.setWordWrap(True)
+
+        root_layout.addLayout(top_bar)
+        root_layout.addWidget(QLabel("채널 합계"), 0)
+        root_layout.addWidget(self.summary_table, 0)
+        root_layout.addWidget(QLabel("상품별 매출 (순매출 상위)"), 0)
+        root_layout.addWidget(self.product_table, 1)
+        root_layout.addWidget(self.status_label, 0)
+        root_layout.addWidget(self.note_label, 0)
+
+        self._apply_styles()
+
+    def _apply_styles(self) -> None:
+        self.setStyleSheet(
+            """
+            QWidget {
+                font-family: "Segoe UI";
+                font-size: 12px;
+            }
+            QLineEdit, QComboBox, QPushButton {
+                background: #ffffff;
+                border: 1px solid #d0d7de;
+                border-radius: 8px;
+                padding: 4px 8px;
+                color: #1f2937;
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border: 1px solid #7aa7e0;
+            }
+            QPushButton:hover {
+                background: #f4f8fc;
+            }
+            QPushButton:pressed {
+                background: #e7eff8;
+            }
+            QPushButton:disabled {
+                background: #f8fafc;
+                color: #9aa4b2;
+            }
+            QTableWidget {
+                background: #ffffff;
+                alternate-background-color: #f8fafc;
+                border: 1px solid #d8dee4;
+                gridline-color: #e5e7eb;
+                selection-background-color: #dbeafe;
+                selection-color: #111827;
+            }
+            QHeaderView::section {
+                background: #f1f5f9;
+                border: none;
+                border-bottom: 1px solid #d8dee4;
+                border-right: 1px solid #e5e7eb;
+                color: #111827;
+                font-weight: 600;
+                padding: 6px;
+            }
+            """
+        )
+
+    def _select_default_period(self) -> None:
+        target = self.default_days
+        for idx in range(self.period_combo.count()):
+            value = self.period_combo.itemData(idx)
+            if int(value) == target:
+                self.period_combo.setCurrentIndex(idx)
+                return
+        self.period_combo.setCurrentIndex(2)
+
+    def _set_busy(self, busy: bool, message: str = "") -> None:
+        self.sync_button.setEnabled(not busy)
+        self.sync_button.setText("동기화 중..." if busy else "동기화")
+        self.period_combo.setEnabled(not busy)
+        if message:
+            self.status_label.setText(message)
+
+    @Slot()
+    def sync_now(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        period_days = int(self.period_combo.currentData() or 30)
+        self._set_busy(True, f"매출 데이터를 동기화하는 중입니다... ({period_days}일)")
+        self.worker = RevenueSyncWorker(self.fetch_fn, period_days)
+        self.worker.completed.connect(self._on_sync_completed)
+        self.worker.failed.connect(self._on_sync_failed)
+        self.worker.start()
+
+    @staticmethod
+    def _fmt_int(value: int | None) -> str:
+        return f"{int(value or 0):,}"
+
+    @staticmethod
+    def _fmt_money(value: float | int | None) -> str:
+        return f"{int(round(float(value or 0.0))):,}원"
+
+    @staticmethod
+    def _table_item(
+        text: str,
+        align: Qt.AlignmentFlag,
+        sort_value: Any | None = None,
+    ) -> QTableWidgetItem:
+        item = SortableTableItem(text)
+        item.setTextAlignment(align)
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        if sort_value is not None:
+            item.setData(Qt.UserRole, sort_value)
+        return item
+
+    @Slot(object, object)
+    def _on_sync_completed(self, snapshot_obj: object, warnings_obj: object) -> None:
+        self._set_busy(False)
+        if not isinstance(snapshot_obj, RevenueSnapshot):
+            self.status_label.setText("매출 동기화 실패: 응답 형식 오류")
+            return
+
+        warnings = list(warnings_obj) if isinstance(warnings_obj, list) else []
+
+        self._render_summary(snapshot_obj.summaries)
+        self._render_products(snapshot_obj.products)
+
+        self.status_label.setText(
+            (
+                f"매출 동기화 완료: 네이버 {snapshot_obj.period_days}일 / 쿠팡 최근30일 기준 "
+                f"(채널 {len(snapshot_obj.summaries)}개, 상품 {len(snapshot_obj.products)}건) "
+                f"| {snapshot_obj.generated_at.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+        )
+        self.note_label.setText("\n".join(snapshot_obj.notes))
+
+        if warnings:
+            QMessageBox.warning(self, "매출 일부 경고", "\n".join(warnings))
+
+    @Slot(str)
+    def _on_sync_failed(self, error: str) -> None:
+        self._set_busy(False)
+        self.status_label.setText("매출 동기화 실패")
+        QMessageBox.critical(self, "매출 동기화 실패", error)
+
+    def _render_summary(self, rows: List[RevenueChannelSummary]) -> None:
+        self.summary_table.setSortingEnabled(False)
+        self.summary_table.setRowCount(len(rows))
+
+        for index, row in enumerate(rows):
+            self.summary_table.setRowHeight(index, 34)
+            dtype = "추정" if row.estimated else "실측"
+
+            self.summary_table.setItem(
+                index,
+                0,
+                self._table_item(row.channel, Qt.AlignCenter, row.channel),
+            )
+            self.summary_table.setItem(
+                index,
+                1,
+                self._table_item(
+                    self._fmt_money(row.gross),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    row.gross,
+                ),
+            )
+            self.summary_table.setItem(
+                index,
+                2,
+                self._table_item(
+                    self._fmt_money(row.refund),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    row.refund,
+                ),
+            )
+            self.summary_table.setItem(
+                index,
+                3,
+                self._table_item(
+                    self._fmt_money(row.net),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    row.net,
+                ),
+            )
+            self.summary_table.setItem(
+                index,
+                4,
+                self._table_item(self._fmt_int(row.orders), Qt.AlignCenter, row.orders),
+            )
+            self.summary_table.setItem(
+                index,
+                5,
+                self._table_item(dtype, Qt.AlignCenter, dtype),
+            )
+            self.summary_table.setItem(
+                index,
+                6,
+                self._table_item(row.note, Qt.AlignLeft | Qt.AlignVCenter, row.note),
+            )
+
+        self.summary_table.setSortingEnabled(True)
+        if rows:
+            self.summary_table.sortItems(3, Qt.DescendingOrder)
+
+    def _render_products(self, rows: List[RevenueProductSummary]) -> None:
+        self.product_table.setSortingEnabled(False)
+        self.product_table.setRowCount(len(rows))
+
+        for index, row in enumerate(rows):
+            self.product_table.setRowHeight(index, 32)
+            dtype = "추정" if row.estimated else "실측"
+
+            self.product_table.setItem(
+                index,
+                0,
+                self._table_item(row.channel, Qt.AlignCenter, row.channel),
+            )
+            self.product_table.setItem(
+                index,
+                1,
+                self._table_item(row.product_id, Qt.AlignCenter, row.product_id),
+            )
+            self.product_table.setItem(
+                index,
+                2,
+                self._table_item(
+                    row.name,
+                    Qt.AlignVCenter | Qt.AlignLeft,
+                    row.name.lower(),
+                ),
+            )
+            self.product_table.setItem(
+                index,
+                3,
+                self._table_item(self._fmt_int(row.orders), Qt.AlignCenter, row.orders),
+            )
+            self.product_table.setItem(
+                index,
+                4,
+                self._table_item(
+                    self._fmt_money(row.gross),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    row.gross,
+                ),
+            )
+            self.product_table.setItem(
+                index,
+                5,
+                self._table_item(
+                    self._fmt_money(row.refund),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    row.refund,
+                ),
+            )
+            self.product_table.setItem(
+                index,
+                6,
+                self._table_item(
+                    self._fmt_money(row.net),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    row.net,
+                ),
+            )
+            self.product_table.setItem(
+                index,
+                7,
+                self._table_item(dtype, Qt.AlignCenter, dtype),
+            )
+
+        self.product_table.setSortingEnabled(True)
+        if rows:
+            self.product_table.sortItems(6, Qt.DescendingOrder)
+
+    def shutdown(self) -> None:
+        if self.worker and self.worker.isRunning():
+            finished = self.worker.wait(60000)
+            if not finished:
+                self.worker.terminate()
+                self.worker.wait(2000)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
@@ -637,6 +1033,7 @@ class MainWindow(QMainWindow):
 
         self.naver_service = NaverChannelService(config)
         self.coupang_service = CoupangChannelService(config)
+        self.revenue_service = RevenueComparisonService(config)
 
         self.setWindowTitle("스마트스토어 / 쿠팡 분리 재고 대시보드")
         self.resize(1780, 900)
@@ -655,6 +1052,10 @@ class MainWindow(QMainWindow):
             channel_name="쿠팡",
             sales_header="판매량",
             fetch_fn=self.coupang_service.fetch,
+        )
+        self.revenue_tab = RevenueTab(
+            fetch_fn=self.revenue_service.fetch,
+            default_days=sales_days,
         )
 
         self._build_ui()
@@ -677,6 +1078,7 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(self.naver_tab, "네이버")
         self.tabs.addTab(self.coupang_tab, "쿠팡")
+        self.tabs.addTab(self.revenue_tab, "매출비교")
 
         root_layout.addLayout(top_bar)
         root_layout.addWidget(self.tabs, 1)
@@ -732,6 +1134,7 @@ class MainWindow(QMainWindow):
     def sync_now(self) -> None:
         self.naver_tab.sync_now()
         self.coupang_tab.sync_now()
+        self.revenue_tab.sync_now()
 
     @Slot()
     def _toggle_favorite_on_current_tab(self) -> None:
@@ -742,4 +1145,5 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         self.naver_tab.shutdown()
         self.coupang_tab.shutdown()
+        self.revenue_tab.shutdown()
         super().closeEvent(event)
