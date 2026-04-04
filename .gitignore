@@ -1,0 +1,12 @@
+.venv/
+.python/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+dist/
+build/
+python-embed.zip
+get-pip.py
+SmartInventory.spec
