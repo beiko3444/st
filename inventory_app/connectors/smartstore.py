@@ -278,6 +278,54 @@ class SmartStoreConnector:
             raise RuntimeError("네이버 통계 API(판매량) 조회 실패\n" + "\n".join(errors))
         return []
 
+    def _fetch_bizdata_stats_rows(
+        self,
+        endpoint: str,
+        start_date: date,
+        end_date: date,
+        purpose: str,
+    ) -> List[Dict[str, Any]]:
+        date_formats = ["%Y-%m-%d", "%Y%m%d"]
+        errors: List[str] = []
+
+        for fmt in date_formats:
+            params = {
+                "startDate": start_date.strftime(fmt),
+                "endDate": end_date.strftime(fmt),
+            }
+            response = self.api_client.get(
+                endpoint,
+                params=params,
+                headers=self._auth_headers(),
+            )
+
+            if response.status_code >= 400:
+                detail = self._extract_error_detail(response)
+                errors.append(f"{response.request.url} -> HTTP {response.status_code} ({detail})")
+                continue
+
+            body = response.json()
+            rows = self._extract_rows(body)
+            if isinstance(body, dict) and body.get("code") and not rows:
+                detail = f"{body.get('code')}: {body.get('message')}"
+                errors.append(f"{response.request.url} -> {detail}")
+                continue
+            return rows
+
+        if errors:
+            raise RuntimeError(f"네이버 통계 API({purpose}) 조회 실패\n" + "\n".join(errors))
+        return []
+
+    @staticmethod
+    def _iter_date_chunks(start_date: date, end_date: date, chunk_days: int = 14) -> List[tuple[date, date]]:
+        chunks: List[tuple[date, date]] = []
+        cursor = start_date
+        while cursor <= end_date:
+            chunk_end = min(cursor + timedelta(days=max(1, chunk_days) - 1), end_date)
+            chunks.append((cursor, chunk_end))
+            cursor = chunk_end + timedelta(days=1)
+        return chunks
+
     def fetch_product_sales_counts(self, days: int = 30) -> Dict[str, int]:
         channel_no = self.fetch_primary_channel_no()
 
@@ -296,6 +344,44 @@ class SmartStoreConnector:
             cursor = chunk_end + timedelta(days=1)
 
         return merged
+
+    def fetch_search_channel_keyword_rows(self, days: int = 30) -> List[Dict[str, Any]]:
+        channel_no = self.fetch_primary_channel_no()
+        lookback_days = max(1, int(days))
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=lookback_days - 1)
+        endpoint = f"/v1/bizdata-stats/channels/{channel_no}/marketing/search/keyword"
+
+        rows: List[Dict[str, Any]] = []
+        for chunk_start, chunk_end in self._iter_date_chunks(start_date, end_date, chunk_days=14):
+            rows.extend(
+                self._fetch_bizdata_stats_rows(
+                    endpoint=endpoint,
+                    start_date=chunk_start,
+                    end_date=chunk_end,
+                    purpose="검색 채널 키워드",
+                )
+            )
+        return rows
+
+    def fetch_product_search_keyword_rows(self, days: int = 30) -> List[Dict[str, Any]]:
+        channel_no = self.fetch_primary_channel_no()
+        lookback_days = max(1, int(days))
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=lookback_days - 1)
+        endpoint = f"/v1/bizdata-stats/channels/{channel_no}/sales/product-search/keyword-by-product"
+
+        rows: List[Dict[str, Any]] = []
+        for chunk_start, chunk_end in self._iter_date_chunks(start_date, end_date, chunk_days=14):
+            rows.extend(
+                self._fetch_bizdata_stats_rows(
+                    endpoint=endpoint,
+                    start_date=chunk_start,
+                    end_date=chunk_end,
+                    purpose="상품/검색 채널 상품별 키워드",
+                )
+            )
+        return rows
 
     def fetch_product_sales_revenue(self, days: int = 30) -> Dict[str, Dict[str, Any]]:
         channel_no = self.fetch_primary_channel_no()

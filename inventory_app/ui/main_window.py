@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import math
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable, List
 
@@ -28,6 +29,11 @@ from PySide6.QtWidgets import (
 from inventory_app.config import AppConfig
 from inventory_app.models import ChannelProduct
 from inventory_app.services.channel_services import CoupangChannelService, NaverChannelService
+from inventory_app.services.keyword_services import (
+    KeywordRevenueRow,
+    KeywordRevenueSnapshot,
+    NaverKeywordRevenueService,
+)
 from inventory_app.services.local_cache import ChannelProductCache
 from inventory_app.services.revenue_services import (
     RevenueChannelSummary,
@@ -143,7 +149,7 @@ class ChannelTab(QWidget):
         self.favorite_filter = QComboBox()
         self.search_input = QLineEdit()
         self.status_label = QLabel("준비 완료")
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 9)
 
         self.image_downloaded.connect(self._on_image_downloaded)
         self._build_ui()
@@ -184,6 +190,7 @@ class ChannelTab(QWidget):
                 "상품명",
                 "재고",
                 self.sales_header,
+                "품절예상(일)",
                 "예측 한달매출",
                 "가격",
             ]
@@ -208,15 +215,17 @@ class ChannelTab(QWidget):
         header.setSectionResizeMode(5, QHeaderView.Fixed)
         header.setSectionResizeMode(6, QHeaderView.Fixed)
         header.setSectionResizeMode(7, QHeaderView.Fixed)
+        header.setSectionResizeMode(8, QHeaderView.Fixed)
 
         self.table.setColumnWidth(0, 36)
-        self.table.setColumnWidth(1, 56)
-        self.table.setColumnWidth(2, 74)
-        self.table.setColumnWidth(3, 460)
-        self.table.setColumnWidth(4, 96)
-        self.table.setColumnWidth(5, 112)
-        self.table.setColumnWidth(6, 150)
-        self.table.setColumnWidth(7, 122)
+        self.table.setColumnWidth(1, 44)
+        self.table.setColumnWidth(2, 64)
+        self.table.setColumnWidth(3, 360)
+        self.table.setColumnWidth(4, 78)
+        self.table.setColumnWidth(5, 88)
+        self.table.setColumnWidth(6, 90)
+        self.table.setColumnWidth(7, 118)
+        self.table.setColumnWidth(8, 98)
 
         self.status_label.setStyleSheet("color: #475569;")
 
@@ -261,8 +270,12 @@ class ChannelTab(QWidget):
                 alternate-background-color: #edf2f7;
                 border: 1px solid #d8dee4;
                 gridline-color: #e5e7eb;
-                selection-background-color: #dbeafe;
-                selection-color: #111827;
+                selection-background-color: #bbf7d0;
+                selection-color: #14532d;
+            }
+            QTableWidget::item:selected {
+                background: #bbf7d0;
+                color: #14532d;
             }
             QHeaderView::section {
                 background: #f1f5f9;
@@ -460,23 +473,35 @@ class ChannelTab(QWidget):
         estimated_qty = sales * (30.0 / float(period))
         return int(round(estimated_qty * price))
 
+    def _stockout_days(self, row: ChannelProduct) -> int | None:
+        if row.stock is None or row.sales is None or not self.sales_period_days:
+            return None
+        stock = max(0, int(row.stock))
+        sales = max(0, int(row.sales))
+        if sales <= 0:
+            return None
+        period = max(1, int(self.sales_period_days))
+        daily_sales = sales / float(period)
+        if daily_sales <= 0:
+            return None
+        return int(math.ceil(stock / daily_sales))
+
     def _image_label(self) -> ProductImageLabel:
         label = ProductImageLabel()
         label.clicked.connect(self._open_product_page)
         return label
 
-    def _image_cell(self, product_url: str | None) -> tuple[QWidget, ProductImageLabel]:
+    def _image_cell(self, row: ChannelProduct) -> tuple[QWidget, ProductImageLabel]:
         container = QWidget()
         container.setFixedWidth(58)
 
-        layout = QVBoxLayout(container)
+        layout = QHBoxLayout(container)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(0)
 
         label = self._image_label()
-        label.set_product_url(product_url)
+        label.set_product_url(row.product_url)
         layout.addWidget(label, 0, Qt.AlignCenter)
-
         return container, label
 
     def _stock_cover_meta(self, row: ChannelProduct) -> tuple[int, str, str]:
@@ -515,50 +540,75 @@ class ChannelTab(QWidget):
         )
         return gauge_value, color, label
 
-    def _name_cell(self, row: ChannelProduct) -> QWidget:
+    def _serial_cell(self, row: ChannelProduct) -> QWidget:
         gauge_value, gauge_color, gauge_text = self._stock_cover_meta(row)
-        display_name = self._display_name(row)
-        original_name = row.name
 
         container = QWidget()
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(6, 4, 6, 4)
-        layout.setSpacing(4)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
 
-        name_label = EditableNameLabel(display_name)
-        if display_name != original_name:
-            name_label.setToolTip(f"원래 상품명: {original_name}\n더블클릭: 표시 상품명 수정")
-        else:
-            name_label.setToolTip("더블클릭: 표시 상품명 수정")
-        name_label.setStyleSheet("color: #0f172a; font-weight: 600;")
-        name_label.double_clicked.connect(lambda item=row: self._edit_row_name(item))
+        serial_label = QLabel(str(row.serial))
+        serial_label.setAlignment(Qt.AlignCenter)
+        serial_label.setStyleSheet("color: #111827; font-weight: 600;")
+        layout.addWidget(serial_label)
 
         gauge_bar = QProgressBar()
         gauge_bar.setRange(0, 100)
         gauge_bar.setValue(gauge_value)
         gauge_bar.setTextVisible(False)
-        gauge_bar.setFixedHeight(8)
-        gauge_bar.setFixedWidth(110)
+        gauge_bar.setFixedHeight(4)
+        gauge_bar.setFixedWidth(30)
+        gauge_bar.setToolTip(gauge_text)
         gauge_bar.setStyleSheet(
             f"""
             QProgressBar {{
                 border: 1px solid #cbd5e1;
-                border-radius: 4px;
+                border-radius: 2px;
                 background: #f1f5f9;
             }}
             QProgressBar::chunk {{
-                border-radius: 4px;
+                border-radius: 2px;
                 background: {gauge_color};
             }}
             """
         )
+        layout.addWidget(gauge_bar, 0, Qt.AlignHCenter)
+        return container
 
-        gauge_label = QLabel(gauge_text)
-        gauge_label.setStyleSheet("color: #64748b; font-size: 11px;")
+    def _name_cell(self, row: ChannelProduct) -> QWidget:
+        display_name = self._display_name(row)
+        original_name = row.name
+        is_customized = display_name != original_name
+        is_zero_stock = row.stock is not None and int(row.stock) == 0
 
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(6, 0, 6, 0)
+        layout.setSpacing(0)
+
+        name_label = EditableNameLabel(display_name)
+        name_color = "#b91c1c" if is_zero_stock else "#0f172a"
+        if is_customized:
+            name_label.setToolTip(f"원래 상품명: {original_name}\n더블클릭: 표시 상품명 수정")
+            name_label.setStyleSheet(
+                f"color: {name_color}; font-weight: 700; padding: 0px; margin: 0px;"
+            )
+        else:
+            name_label.setToolTip("더블클릭: 표시 상품명 수정")
+            name_label.setStyleSheet(
+                f"color: {name_color}; font-weight: 500; padding: 0px; margin: 0px;"
+            )
+        name_label.double_clicked.connect(lambda item=row: self._edit_row_name(item))
         layout.addWidget(name_label)
-        layout.addWidget(gauge_bar)
-        layout.addWidget(gauge_label)
+        if is_customized:
+            original_label = QLabel(f"원상품명: {original_name}")
+            original_color = "#dc2626" if is_zero_stock else "#64748b"
+            original_label.setStyleSheet(
+                f"color: {original_color}; font-size: 8px; padding: 0px; margin: 0px;"
+            )
+            original_label.setToolTip(original_name)
+            layout.addWidget(original_label)
         return container
 
     def _edit_row_name(self, row: ChannelProduct) -> None:
@@ -666,8 +716,10 @@ class ChannelTab(QWidget):
         if col == 5:
             return self._sort_nullable_numeric(rows, lambda row: row.sales, descending)
         if col == 6:
-            return self._sort_nullable_numeric(rows, self._predicted_monthly_revenue, descending)
+            return self._sort_nullable_numeric(rows, self._stockout_days, descending)
         if col == 7:
+            return self._sort_nullable_numeric(rows, self._predicted_monthly_revenue, descending)
+        if col == 8:
             return self._sort_nullable_numeric(rows, lambda row: row.price, descending)
         return list(rows)
 
@@ -704,20 +756,12 @@ class ChannelTab(QWidget):
         ]
 
     def _render_row(self, index: int, row: ChannelProduct, token: int) -> None:
-        self.table.setRowHeight(index, 74)
+        self.table.setRowHeight(index, 66)
         self.table.setCellWidget(index, 0, self._favorite_cell(row))
 
-        self.table.setItem(
-            index,
-            1,
-            self._table_item(
-                str(row.serial),
-                Qt.AlignCenter,
-                sort_value=row.serial,
-            ),
-        )
+        self.table.setCellWidget(index, 1, self._serial_cell(row))
 
-        image_cell, image_label = self._image_cell(row.product_url)
+        image_cell, image_label = self._image_cell(row)
         self.table.setCellWidget(index, 2, image_cell)
 
         self.table.setCellWidget(index, 3, self._name_cell(row))
@@ -727,7 +771,7 @@ class ChannelTab(QWidget):
             4,
             self._table_item(
                 self._fmt_int(row.stock),
-                Qt.AlignCenter,
+                Qt.AlignRight | Qt.AlignVCenter,
                 sort_value=self._sortable_none_last(row.stock),
             ),
         )
@@ -737,7 +781,7 @@ class ChannelTab(QWidget):
             5,
             self._table_item(
                 self._fmt_int(row.sales),
-                Qt.AlignCenter,
+                Qt.AlignRight | Qt.AlignVCenter,
                 sort_value=self._sortable_none_last(row.sales),
             ),
         )
@@ -745,6 +789,16 @@ class ChannelTab(QWidget):
         self.table.setItem(
             index,
             6,
+            self._table_item(
+                self._fmt_int(self._stockout_days(row)),
+                Qt.AlignRight | Qt.AlignVCenter,
+                sort_value=self._sortable_none_last(self._stockout_days(row)),
+            ),
+        )
+
+        self.table.setItem(
+            index,
+            7,
             self._table_item(
                 self._fmt_int(self._predicted_monthly_revenue(row), "원"),
                 Qt.AlignRight | Qt.AlignVCenter,
@@ -754,7 +808,7 @@ class ChannelTab(QWidget):
 
         self.table.setItem(
             index,
-            7,
+            8,
             self._table_item(
                 self._fmt_int(row.price, "원"),
                 Qt.AlignRight | Qt.AlignVCenter,
@@ -968,6 +1022,7 @@ class RevenueTab(QWidget):
         self.period_combo.addItem("30일", 30)
         self.period_combo.addItem("60일", 60)
         self._select_default_period()
+        self.period_combo.currentIndexChanged.connect(lambda _idx: self.sync_now())
 
         top_bar.addWidget(self.sync_button)
         top_bar.addWidget(QLabel("기준기간"))
@@ -1074,8 +1129,12 @@ class RevenueTab(QWidget):
                 alternate-background-color: #edf2f7;
                 border: 1px solid #d8dee4;
                 gridline-color: #e5e7eb;
-                selection-background-color: #dbeafe;
-                selection-color: #111827;
+                selection-background-color: #bbf7d0;
+                selection-color: #14532d;
+            }
+            QTableWidget::item:selected {
+                background: #bbf7d0;
+                color: #14532d;
             }
             QHeaderView::section {
                 background: #f1f5f9;
@@ -1391,6 +1450,379 @@ class RevenueTab(QWidget):
         self.product_image_executor.shutdown(wait=False, cancel_futures=True)
 
 
+class KeywordSyncWorker(QThread):
+    completed = Signal(object, object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        fetch_fn: Callable[[int], tuple[KeywordRevenueSnapshot, List[str]]],
+        period_days: int,
+    ) -> None:
+        super().__init__()
+        self.fetch_fn = fetch_fn
+        self.period_days = max(1, int(period_days))
+
+    def run(self) -> None:
+        try:
+            snapshot, warnings = self.fetch_fn(self.period_days)
+            self.completed.emit(snapshot, warnings)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
+class KeywordRevenueTab(QWidget):
+    sync_finished = Signal(str, bool)
+
+    def __init__(
+        self,
+        fetch_fn: Callable[[int], tuple[KeywordRevenueSnapshot, List[str]]],
+        default_days: int,
+    ) -> None:
+        super().__init__()
+        self.fetch_fn = fetch_fn
+        self.default_days = max(1, int(default_days))
+        self.worker: KeywordSyncWorker | None = None
+
+        self.sync_button = QPushButton("동기화")
+        self.period_combo = QComboBox()
+        self.table = QTableWidget(0, 8)
+        self.status_label = QLabel("준비 완료")
+        self.note_label = QLabel("")
+
+        self._build_ui()
+        self._set_busy(False)
+
+    def _build_ui(self) -> None:
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(10, 10, 10, 10)
+        root_layout.setSpacing(10)
+
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(8)
+        self.sync_button.clicked.connect(self.sync_now)
+
+        self.period_combo.addItem("7일", 7)
+        self.period_combo.addItem("14일", 14)
+        self.period_combo.addItem("30일", 30)
+        self.period_combo.addItem("60일", 60)
+        self._select_default_period()
+        self.period_combo.currentIndexChanged.connect(lambda _idx: self.sync_now())
+
+        top_bar.addWidget(self.sync_button)
+        top_bar.addWidget(QLabel("기준기간"))
+        top_bar.addWidget(self.period_combo)
+        top_bar.addStretch(1)
+
+        self.table.setHorizontalHeaderLabels(
+            [
+                "연번",
+                "키워드",
+                "매출",
+                "주문수",
+                "유입수",
+                "전환율",
+                "객단가",
+                "데이터출처",
+            ]
+        )
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setSortingEnabled(True)
+        self.table.setColumnWidth(0, 54)
+        self.table.setColumnWidth(1, 300)
+        self.table.setColumnWidth(2, 140)
+        self.table.setColumnWidth(3, 100)
+        self.table.setColumnWidth(4, 100)
+        self.table.setColumnWidth(5, 100)
+        self.table.setColumnWidth(6, 130)
+        self.table.setColumnWidth(7, 140)
+
+        self.status_label.setStyleSheet("color: #475569;")
+        self.note_label.setStyleSheet("color: #475569;")
+        self.note_label.setWordWrap(True)
+
+        root_layout.addLayout(top_bar)
+        root_layout.addWidget(QLabel("네이버 키워드 매출"), 0)
+        root_layout.addWidget(self.table, 1)
+        root_layout.addWidget(self.status_label, 0)
+        root_layout.addWidget(self.note_label, 0)
+        self._apply_styles()
+
+    def _apply_styles(self) -> None:
+        self.setStyleSheet(
+            """
+            QWidget {
+                font-family: "Segoe UI";
+                font-size: 12px;
+            }
+            QLineEdit, QComboBox, QPushButton {
+                background: #ffffff;
+                border: 1px solid #d0d7de;
+                border-radius: 8px;
+                padding: 4px 8px;
+                color: #1f2937;
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border: 1px solid #7aa7e0;
+            }
+            QPushButton:hover {
+                background: #f4f8fc;
+            }
+            QPushButton:pressed {
+                background: #e7eff8;
+            }
+            QPushButton:disabled {
+                background: #f8fafc;
+                color: #9aa4b2;
+            }
+            QTableWidget {
+                background: #ffffff;
+                alternate-background-color: #edf2f7;
+                border: 1px solid #d8dee4;
+                gridline-color: #e5e7eb;
+                selection-background-color: #bbf7d0;
+                selection-color: #14532d;
+            }
+            QTableWidget::item:selected {
+                background: #bbf7d0;
+                color: #14532d;
+            }
+            QHeaderView::section {
+                background: #f1f5f9;
+                border: none;
+                border-bottom: 1px solid #d8dee4;
+                border-right: 1px solid #e5e7eb;
+                color: #111827;
+                font-weight: 600;
+                padding: 6px;
+            }
+            """
+        )
+
+    def _select_default_period(self) -> None:
+        for idx in range(self.period_combo.count()):
+            value = int(self.period_combo.itemData(idx) or 0)
+            if value == self.default_days:
+                self.period_combo.setCurrentIndex(idx)
+                return
+        self.period_combo.setCurrentIndex(2)
+
+    def _set_busy(self, busy: bool, message: str = "") -> None:
+        self.sync_button.setEnabled(not busy)
+        self.sync_button.setText("동기화 중..." if busy else "동기화")
+        self.period_combo.setEnabled(not busy)
+        if message:
+            self.status_label.setText(message)
+
+    @Slot()
+    def sync_now(self) -> bool:
+        if self.worker and self.worker.isRunning():
+            return False
+        period_days = int(self.period_combo.currentData() or 30)
+        self._set_busy(True, f"네이버 키워드 매출 데이터를 동기화하는 중입니다... ({period_days}일)")
+        self.worker = KeywordSyncWorker(self.fetch_fn, period_days)
+        self.worker.completed.connect(self._on_sync_completed)
+        self.worker.failed.connect(self._on_sync_failed)
+        self.worker.start()
+        return True
+
+    @staticmethod
+    def _fmt_int(value: int | None) -> str:
+        if value is None:
+            return "-"
+        return f"{int(value):,}"
+
+    @staticmethod
+    def _fmt_money(value: float | int | None) -> str:
+        if value is None:
+            return "-"
+        return f"{int(round(float(value))):,}원"
+
+    @staticmethod
+    def _fmt_rate(value: float | None) -> str:
+        if value is None:
+            return "-"
+        return f"{value:.2f}%"
+
+    @staticmethod
+    def _risk_level(row: KeywordRevenueRow) -> str | None:
+        if row.inflow is None or row.inflow <= 0:
+            return None
+
+        conversion = row.conversion_rate
+        if conversion is None and row.inflow > 0:
+            conversion = (float(row.orders) / float(row.inflow)) * 100.0
+        if conversion is None:
+            return None
+
+        # 고유입 + 저전환 자동 탐지 기준
+        if row.inflow >= 200 and conversion < 1.2:
+            return "high"
+        if row.inflow >= 80 and conversion < 2.5:
+            return "medium"
+        return None
+
+    @staticmethod
+    def _table_item(
+        text: str,
+        align: Qt.AlignmentFlag,
+        sort_value: Any | None = None,
+    ) -> QTableWidgetItem:
+        item = SortableTableItem(text)
+        item.setTextAlignment(align)
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        if sort_value is not None:
+            item.setData(Qt.UserRole, sort_value)
+        return item
+
+    @Slot(object, object)
+    def _on_sync_completed(self, snapshot_obj: object, warnings_obj: object) -> None:
+        self._set_busy(False)
+        if not isinstance(snapshot_obj, KeywordRevenueSnapshot):
+            self.status_label.setText("키워드 매출 동기화 실패: 응답 형식 오류")
+            self.sync_finished.emit("키워드매출", False)
+            return
+
+        warnings = list(warnings_obj) if isinstance(warnings_obj, list) else []
+        high_count, medium_count = self._render_rows(snapshot_obj.rows)
+
+        self.status_label.setText(
+            (
+                f"키워드 동기화 완료: 최근 {snapshot_obj.period_days}일 "
+                f"(키워드 {len(snapshot_obj.rows)}건, 고위험 {high_count}건, 주의 {medium_count}건) "
+                f"| {snapshot_obj.generated_at.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+        )
+
+        note_lines = list(snapshot_obj.notes)
+        note_lines.append("")
+        note_lines.append("[자동 하이라이트 기준]")
+        note_lines.append("빨강: 유입수 200 이상 + 전환율 1.2% 미만")
+        note_lines.append("주황: 유입수 80 이상 + 전환율 2.5% 미만")
+        note_lines.append(f"탐지 결과: 고위험 {high_count}건 / 주의 {medium_count}건")
+        if warnings:
+            note_lines.append("")
+            note_lines.append("[경고]")
+            note_lines.extend(warnings)
+        self.note_label.setText("\n".join(note_lines))
+        self.note_label.setToolTip("\n".join(warnings) if warnings else "")
+        self.sync_finished.emit("키워드매출", True)
+
+    @Slot(str)
+    def _on_sync_failed(self, error: str) -> None:
+        self._set_busy(False)
+        self.status_label.setText("키워드 매출 동기화 실패")
+        QMessageBox.critical(self, "키워드 매출 동기화 실패", error)
+        self.sync_finished.emit("키워드매출", False)
+
+    def _render_rows(self, rows: List[KeywordRevenueRow]) -> tuple[int, int]:
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(rows))
+        high_count = 0
+        medium_count = 0
+        for index, row in enumerate(rows):
+            self.table.setRowHeight(index, 34)
+            self.table.setItem(
+                index,
+                0,
+                self._table_item(str(index + 1), Qt.AlignCenter, index + 1),
+            )
+            self.table.setItem(
+                index,
+                1,
+                self._table_item(row.keyword, Qt.AlignVCenter | Qt.AlignLeft, row.keyword.lower()),
+            )
+            self.table.setItem(
+                index,
+                2,
+                self._table_item(
+                    self._fmt_money(row.pay_amount),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    row.pay_amount,
+                ),
+            )
+            self.table.setItem(
+                index,
+                3,
+                self._table_item(self._fmt_int(row.orders), Qt.AlignRight | Qt.AlignVCenter, row.orders),
+            )
+            self.table.setItem(
+                index,
+                4,
+                self._table_item(
+                    self._fmt_int(row.inflow),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    -1 if row.inflow is None else row.inflow,
+                ),
+            )
+            self.table.setItem(
+                index,
+                5,
+                self._table_item(
+                    self._fmt_rate(row.conversion_rate),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    -1.0 if row.conversion_rate is None else row.conversion_rate,
+                ),
+            )
+            self.table.setItem(
+                index,
+                6,
+                self._table_item(
+                    self._fmt_money(row.avg_order_value),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    -1.0 if row.avg_order_value is None else row.avg_order_value,
+                ),
+            )
+            self.table.setItem(
+                index,
+                7,
+                self._table_item(row.source, Qt.AlignCenter, row.source),
+            )
+
+            risk = self._risk_level(row)
+            if risk == "high":
+                high_count += 1
+                bg = QColor("#fee2e2")
+                fg = QColor("#991b1b")
+                tip = "고유입 저전환(고위험): 유입수 200+ / 전환율 1.2% 미만"
+            elif risk == "medium":
+                medium_count += 1
+                bg = QColor("#ffedd5")
+                fg = QColor("#9a3412")
+                tip = "고유입 저전환(주의): 유입수 80+ / 전환율 2.5% 미만"
+            else:
+                bg = None
+                fg = None
+                tip = ""
+
+            if bg is not None and fg is not None:
+                for col in range(8):
+                    item = self.table.item(index, col)
+                    if item is None:
+                        continue
+                    item.setBackground(bg)
+                    if col in (1, 5):
+                        item.setForeground(fg)
+                    if tip:
+                        item.setToolTip(tip)
+
+        self.table.setSortingEnabled(True)
+        if rows:
+            self.table.sortItems(2, Qt.DescendingOrder)
+        return high_count, medium_count
+
+    def shutdown(self) -> None:
+        if self.worker and self.worker.isRunning():
+            finished = self.worker.wait(60000)
+            if not finished:
+                self.worker.terminate()
+                self.worker.wait(2000)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
@@ -1399,6 +1831,7 @@ class MainWindow(QMainWindow):
         self.naver_service = NaverChannelService(config)
         self.coupang_service = CoupangChannelService(config)
         self.revenue_service = RevenueComparisonService(config)
+        self.keyword_service = NaverKeywordRevenueService(config)
 
         self.setWindowTitle("스마트스토어 / 쿠팡 분리 재고 대시보드")
         self.resize(1780, 900)
@@ -1431,6 +1864,10 @@ class MainWindow(QMainWindow):
             fetch_fn=self.revenue_service.fetch,
             default_days=sales_days,
         )
+        self.keyword_tab = KeywordRevenueTab(
+            fetch_fn=self.keyword_service.fetch,
+            default_days=sales_days,
+        )
 
         self._build_ui()
 
@@ -1450,9 +1887,14 @@ class MainWindow(QMainWindow):
         self.tab_shortcut_3.setContext(Qt.ApplicationShortcut)
         self.tab_shortcut_3.activated.connect(lambda: self._activate_tab_shortcut(2))
 
+        self.tab_shortcut_4 = QShortcut(QKeySequence("4"), self)
+        self.tab_shortcut_4.setContext(Qt.ApplicationShortcut)
+        self.tab_shortcut_4.activated.connect(lambda: self._activate_tab_shortcut(3))
+
         self.naver_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.coupang_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.revenue_tab.sync_finished.connect(self._on_sub_sync_finished)
+        self.keyword_tab.sync_finished.connect(self._on_sub_sync_finished)
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -1466,11 +1908,12 @@ class MainWindow(QMainWindow):
         self.sync_progress.setValue(0)
         self.sync_progress.setTextVisible(False)
         self.sync_progress.setFormat("대기 중 0%")
-        self.sync_progress.setVisible(True)
+        self.sync_progress.setVisible(False)
 
         self.tabs.addTab(self.naver_tab, "네이버")
         self.tabs.addTab(self.coupang_tab, "쿠팡")
         self.tabs.addTab(self.revenue_tab, "매출비교")
+        self.tabs.addTab(self.keyword_tab, "키워드매출")
         corner = QWidget()
         corner_layout = QHBoxLayout(corner)
         corner_layout.setContentsMargins(0, 0, 0, 0)
@@ -1547,7 +1990,9 @@ class MainWindow(QMainWindow):
         if not self._sync_session_active:
             self.sync_progress.setValue(0)
             self.sync_progress.setFormat("대기 중 0%")
+            self.sync_progress.setVisible(False)
             return
+        self.sync_progress.setVisible(True)
         self.sync_progress.setValue(0)
         self.sync_progress.setFormat("동기화 진행 중... 0%")
 
@@ -1560,6 +2005,7 @@ class MainWindow(QMainWindow):
             self.sync_progress.setValue(0)
             self.sync_progress.setFormat("대기 중 0%")
             self._sync_session_active = False
+            self.sync_progress.setVisible(False)
             return
         percent = int(round((done * 100) / total))
         self.sync_progress.setValue(percent)
@@ -1570,6 +2016,7 @@ class MainWindow(QMainWindow):
             else:
                 self.sync_progress.setFormat("동기화 완료 100%")
             self._sync_session_active = False
+            self.sync_progress.setVisible(False)
         else:
             self.sync_progress.setFormat(f"동기화 진행 중... {percent}%")
 
@@ -1582,6 +2029,8 @@ class MainWindow(QMainWindow):
             started_sources.add("쿠팡")
         if self.revenue_tab.sync_now():
             started_sources.add("매출비교")
+        if self.keyword_tab.sync_now():
+            started_sources.add("키워드매출")
 
         self._start_sync_session(started_sources)
 
@@ -1616,4 +2065,5 @@ class MainWindow(QMainWindow):
         self.naver_tab.shutdown()
         self.coupang_tab.shutdown()
         self.revenue_tab.shutdown()
+        self.keyword_tab.shutdown()
         super().closeEvent(event)
