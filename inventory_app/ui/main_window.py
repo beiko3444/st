@@ -1176,9 +1176,9 @@ class MainWindow(QMainWindow):
         self.sync_progress.setObjectName("syncProgressBar")
         self.sync_progress.setRange(0, 100)
         self.sync_progress.setValue(0)
-        self.sync_progress.setTextVisible(True)
-        self.sync_progress.setFormat("대기 중")
-        self.sync_progress.setVisible(False)
+        self.sync_progress.setTextVisible(False)
+        self.sync_progress.setFormat("대기 중 0%")
+        self.sync_progress.setVisible(True)
 
         self.tabs.addTab(self.naver_tab, "네이버")
         self.tabs.addTab(self.coupang_tab, "쿠팡")
@@ -1190,8 +1190,8 @@ class MainWindow(QMainWindow):
         corner_layout.addWidget(self.sync_all_button)
         self.tabs.setCornerWidget(corner, Qt.TopRightCorner)
 
-        root_layout.addWidget(self.sync_progress, 0)
         root_layout.addWidget(self.tabs, 1)
+        root_layout.addWidget(self.sync_progress, 0)
 
         self.setCentralWidget(root)
         self._apply_styles()
@@ -1217,18 +1217,15 @@ class MainWindow(QMainWindow):
                 background: #245587;
             }
             #syncProgressBar {
-                min-height: 18px;
-                max-height: 18px;
+                min-height: 6px;
+                max-height: 6px;
                 border: 1px solid #d8dee4;
-                border-radius: 7px;
+                border-radius: 3px;
                 background: #f8fafc;
-                text-align: center;
-                color: #334155;
-                font-size: 11px;
             }
             #syncProgressBar::chunk {
-                border-radius: 6px;
-                background: #3b82f6;
+                border-radius: 3px;
+                background: #10b981;
             }
             QTabWidget::pane {
                 border: 1px solid #d8dee4;
@@ -1260,12 +1257,11 @@ class MainWindow(QMainWindow):
         self._sync_failed_sources.clear()
         self._sync_session_active = bool(self._sync_expected_sources)
         if not self._sync_session_active:
-            self.sync_progress.setVisible(False)
+            self.sync_progress.setValue(0)
+            self.sync_progress.setFormat("대기 중 0%")
             return
-        total = len(self._sync_expected_sources)
-        self.sync_progress.setVisible(True)
         self.sync_progress.setValue(0)
-        self.sync_progress.setFormat(f"동기화 진행 중... (0/{total})")
+        self.sync_progress.setFormat("동기화 진행 중... 0%")
 
     def _update_sync_progress(self) -> None:
         if not self._sync_session_active:
@@ -1273,19 +1269,21 @@ class MainWindow(QMainWindow):
         total = len(self._sync_expected_sources)
         done = len(self._sync_finished_sources)
         if total <= 0:
-            self.sync_progress.setVisible(False)
+            self.sync_progress.setValue(0)
+            self.sync_progress.setFormat("대기 중 0%")
             self._sync_session_active = False
             return
-        percent = int((done * 100) / total)
+        percent = int(round((done * 100) / total))
         self.sync_progress.setValue(percent)
         if done >= total:
+            self.sync_progress.setValue(100)
             if self._sync_failed_sources:
-                self.sync_progress.setFormat(f"동기화 완료 (일부 실패: {done}/{total})")
+                self.sync_progress.setFormat("동기화 완료 (일부 실패) 100%")
             else:
-                self.sync_progress.setFormat(f"동기화 완료 ({done}/{total})")
+                self.sync_progress.setFormat("동기화 완료 100%")
             self._sync_session_active = False
         else:
-            self.sync_progress.setFormat(f"동기화 진행 중... ({done}/{total})")
+            self.sync_progress.setFormat(f"동기화 진행 중... {percent}%")
 
     @Slot()
     def sync_now(self) -> None:
