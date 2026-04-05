@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from inventory_app.config import AppConfig
 from inventory_app.connectors.coupang import CoupangRocketConnector
 from inventory_app.connectors.smartstore import SmartStoreConnector
+from inventory_app.services.local_cache import ChannelProductCache
 
 
 @dataclass
@@ -25,6 +26,7 @@ class RevenueProductSummary:
     channel: str
     product_id: str
     name: str
+    image_url: str | None
     orders: int
     gross: float
     refund: float
@@ -62,6 +64,23 @@ class RevenueComparisonService:
             secret_key=config.coupang_secret_key,
             timeout_seconds=config.timeout_seconds,
         )
+        self.cache = ChannelProductCache()
+
+    def _load_cached_image_map(self, channel: str) -> Dict[str, str]:
+        image_map: Dict[str, str] = {}
+        try:
+            rows = self.cache.load_rows(channel)
+        except Exception:  # noqa: BLE001
+            return image_map
+
+        for row in rows:
+            key = str(row.product_id or "").strip()
+            if not key or key in image_map:
+                continue
+            image_url = str(row.image_url or "").strip()
+            if image_url:
+                image_map[key] = image_url
+        return image_map
 
     def fetch(self, period_days: int) -> Tuple[RevenueSnapshot, List[str]]:
         days = max(1, int(period_days))
@@ -116,6 +135,7 @@ class RevenueComparisonService:
             connectors.append(self.naver_fallback)
 
         last_error: str | None = None
+        naver_image_map = self._load_cached_image_map("naver")
         for connector in connectors:
             try:
                 revenue_map = connector.fetch_product_sales_revenue(days=days)
@@ -138,6 +158,7 @@ class RevenueComparisonService:
                             channel="네이버",
                             product_id=product_id,
                             name=str(item.get("product_name") or ""),
+                            image_url=naver_image_map.get(product_id),
                             orders=orders,
                             gross=gross,
                             refund=refund,
@@ -201,12 +222,15 @@ class RevenueComparisonService:
                     product_id,
                     {
                         "name": name,
+                        "image_url": row.get("image_url"),
                         "orders": 0,
                         "gross": 0.0,
                     },
                 )
                 if not item["name"] and name:
                     item["name"] = name
+                if not item.get("image_url") and row.get("image_url"):
+                    item["image_url"] = row.get("image_url")
                 item["orders"] += max(0, sales_i)
                 item["gross"] += gross
 
@@ -223,6 +247,7 @@ class RevenueComparisonService:
                         channel="쿠팡",
                         product_id=product_id,
                         name=str(item.get("name") or ""),
+                        image_url=(str(item.get("image_url")) if item.get("image_url") else None),
                         orders=orders,
                         gross=gross,
                         refund=0.0,

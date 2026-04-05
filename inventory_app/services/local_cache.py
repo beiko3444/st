@@ -5,7 +5,7 @@ import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 from inventory_app.models import ChannelProduct
 
@@ -56,6 +56,17 @@ class ChannelProductCache:
                 """
                 CREATE INDEX IF NOT EXISTS idx_channel_products_channel_serial
                 ON channel_products(channel, serial)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS product_name_overrides (
+                    channel TEXT NOT NULL,
+                    product_key TEXT NOT NULL,
+                    custom_name TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (channel, product_key)
+                )
                 """
             )
             conn.commit()
@@ -126,3 +137,56 @@ class ChannelProductCache:
                 )
             )
         return parsed
+
+    def load_name_overrides(self, channel: str) -> Dict[str, str]:
+        channel_key = str(channel).strip().lower()
+        with self._guard, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                SELECT product_key, custom_name
+                FROM product_name_overrides
+                WHERE channel = ?
+                """,
+                (channel_key,),
+            )
+            rows = cursor.fetchall()
+
+        overrides: Dict[str, str] = {}
+        for product_key, custom_name in rows:
+            key = str(product_key or "").strip()
+            value = str(custom_name or "").strip()
+            if key and value:
+                overrides[key] = value
+        return overrides
+
+    def save_name_override(self, channel: str, product_key: str, custom_name: str | None) -> None:
+        channel_key = str(channel).strip().lower()
+        item_key = str(product_key).strip()
+        value = str(custom_name or "").strip()
+        if not item_key:
+            return
+
+        with self._guard, self._connect() as conn:
+            if value:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO product_name_overrides (
+                        channel, product_key, custom_name, updated_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        channel_key,
+                        item_key,
+                        value,
+                        datetime.now().isoformat(),
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    DELETE FROM product_name_overrides
+                    WHERE channel = ? AND product_key = ?
+                    """,
+                    (channel_key, item_key),
+                )
+            conn.commit()
