@@ -49,6 +49,35 @@ class LocalCacheTests(unittest.TestCase):
         self.assertEqual(loaded[0].synced_at, now)
         self.assertEqual(loaded[1].price, 2000)
 
+    def test_save_and_load_cost_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = ChannelProductCache(Path(tmpdir) / "cache.sqlite3")
+            cache.save_cost_override("naver", "id:1001|item:", 3500)
+            cache.save_cost_override("naver", "id:1002|item:2002", 4200)
+
+            loaded = cache.load_cost_overrides("naver")
+            self.assertEqual(loaded["id:1001|item:"], 3500)
+            self.assertEqual(loaded["id:1002|item:2002"], 4200)
+
+            cache.save_cost_override("naver", "id:1001|item:", None)
+            after_delete = cache.load_cost_overrides("naver")
+            self.assertNotIn("id:1001|item:", after_delete)
+            self.assertEqual(after_delete["id:1002|item:2002"], 4200)
+
+    def test_save_and_load_favorite_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = ChannelProductCache(Path(tmpdir) / "cache.sqlite3")
+
+            cache.save_favorite("naver", "id:1001|item:", True)
+            cache.save_favorite("naver", "id:1002|item:2002", True)
+            self.assertEqual(
+                cache.load_favorite_keys("naver"),
+                {"id:1001|item:", "id:1002|item:2002"},
+            )
+
+            cache.save_favorite("naver", "id:1001|item:", False)
+            self.assertEqual(cache.load_favorite_keys("naver"), {"id:1002|item:2002"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -56,6 +56,7 @@ class SortableTableItem(QTableWidgetItem):
 @dataclass
 class FavoriteInventoryRow:
     channel: str
+    cost_key: str
     serial: int
     image_url: str | None
     name: str
@@ -146,8 +147,8 @@ class ChannelTab(QWidget):
         self.worker: ChannelSyncWorker | None = None
         self.rows: List[ChannelProduct] = []
         self.filtered_rows: List[ChannelProduct] = []
-        self.favorite_keys: set[str] = set()
         self.cache = ChannelProductCache()
+        self.favorite_keys: set[str] = self.cache.load_favorite_keys(self.channel_name)
         self.name_overrides = self.cache.load_name_overrides(self.channel_name)
 
         self.image_cache: dict[str, QPixmap] = {}
@@ -415,8 +416,10 @@ class ChannelTab(QWidget):
         key = self._favorite_key(row)
         if key in self.favorite_keys:
             self.favorite_keys.remove(key)
+            self.cache.save_favorite(self.channel_name, key, False)
         else:
             self.favorite_keys.add(key)
+            self.cache.save_favorite(self.channel_name, key, True)
         self._apply_filters()
         self.favorites_changed.emit(self.channel_name)
 
@@ -434,6 +437,7 @@ class ChannelTab(QWidget):
             rows.append(
                 FavoriteInventoryRow(
                     channel=self.channel_name,
+                    cost_key=self._name_override_key(row),
                     serial=row.serial,
                     image_url=row.image_url,
                     name=self._display_name(row),
@@ -997,8 +1001,10 @@ class InventoryManagementTab(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
+        self.cache = ChannelProductCache()
         self.rows: List[FavoriteInventoryRow] = []
         self.filtered_rows: List[FavoriteInventoryRow] = []
+        self.cost_overrides_by_channel: dict[str, dict[str, int]] = {}
         self.image_cache: dict[str, QPixmap] = {}
         self._image_waiters: dict[str, list[tuple[QLabel, int]]] = {}
         self._image_pending: set[str] = set()
@@ -1007,7 +1013,7 @@ class InventoryManagementTab(QWidget):
 
         self.channel_filter = QComboBox()
         self.search_input = QLineEdit()
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 12)
         self.status_label = QLabel("즐겨찾기한 상품이 없습니다.")
         self.note_label = QLabel("네이버/쿠팡 탭에서 ★를 눌러 즐겨찾기하면 여기에 재고가 표시됩니다.")
         self.note_label.setWordWrap(True)
@@ -1043,7 +1049,11 @@ class InventoryManagementTab(QWidget):
                 "재고",
                 "판매량",
                 "품절예상(일)",
-                "가격",
+                "판매가",
+                "원가",
+                "총원가",
+                "총판매가",
+                "예상이익",
             ]
         )
         self.table.verticalHeader().setVisible(False)
@@ -1055,11 +1065,15 @@ class InventoryManagementTab(QWidget):
         self.table.setColumnWidth(0, 80)
         self.table.setColumnWidth(1, 54)
         self.table.setColumnWidth(2, 68)
-        self.table.setColumnWidth(3, 460)
-        self.table.setColumnWidth(4, 96)
-        self.table.setColumnWidth(5, 96)
-        self.table.setColumnWidth(6, 120)
-        self.table.setColumnWidth(7, 110)
+        self.table.setColumnWidth(3, 420)
+        self.table.setColumnWidth(4, 82)
+        self.table.setColumnWidth(5, 82)
+        self.table.setColumnWidth(6, 106)
+        self.table.setColumnWidth(7, 98)
+        self.table.setColumnWidth(8, 98)
+        self.table.setColumnWidth(9, 118)
+        self.table.setColumnWidth(10, 128)
+        self.table.setColumnWidth(11, 118)
         self.table.itemDoubleClicked.connect(self._on_item_double_clicked)
 
         header = self.table.horizontalHeader()
@@ -1072,6 +1086,10 @@ class InventoryManagementTab(QWidget):
         header.setSectionResizeMode(5, QHeaderView.Fixed)
         header.setSectionResizeMode(6, QHeaderView.Fixed)
         header.setSectionResizeMode(7, QHeaderView.Fixed)
+        header.setSectionResizeMode(8, QHeaderView.Fixed)
+        header.setSectionResizeMode(9, QHeaderView.Fixed)
+        header.setSectionResizeMode(10, QHeaderView.Fixed)
+        header.setSectionResizeMode(11, QHeaderView.Fixed)
 
         self.status_label.setStyleSheet("color: #475569;")
         self.note_label.setStyleSheet("color: #64748b;")
@@ -1148,7 +1166,79 @@ class InventoryManagementTab(QWidget):
             item.setData(Qt.UserRole, sort_value)
         return item
 
+    def _ensure_cost_map(self, channel: str) -> dict[str, int]:
+        channel_key = str(channel).strip()
+        overrides = self.cost_overrides_by_channel.get(channel_key)
+        if overrides is None:
+            overrides = self.cache.load_cost_overrides(channel_key)
+            self.cost_overrides_by_channel[channel_key] = overrides
+        return overrides
+
+    def _unit_cost(self, row: FavoriteInventoryRow) -> int | None:
+        overrides = self._ensure_cost_map(row.channel)
+        return overrides.get(row.cost_key)
+
+    @staticmethod
+    def _total_cost(stock: int | None, unit_cost: int | None) -> int | None:
+        if stock is None or unit_cost is None:
+            return None
+        return int(stock) * int(unit_cost)
+
+    @staticmethod
+    def _total_sales_price(stock: int | None, sale_price: int | None) -> int | None:
+        if stock is None or sale_price is None:
+            return None
+        return int(stock) * int(sale_price)
+
+    @staticmethod
+    def _expected_profit(total_sales_price: int | None, total_cost: int | None) -> int | None:
+        if total_sales_price is None or total_cost is None:
+            return None
+        return int(total_sales_price) - int(total_cost)
+
+    def _save_unit_cost(self, channel: str, cost_key: str, unit_cost: int | None) -> None:
+        overrides = self._ensure_cost_map(channel)
+        if unit_cost is None:
+            overrides.pop(cost_key, None)
+        else:
+            overrides[cost_key] = int(unit_cost)
+        self.cache.save_cost_override(channel, cost_key, unit_cost)
+
+    def _edit_unit_cost(self, channel: str, cost_key: str, current_cost: int | None) -> None:
+        initial = "" if current_cost is None else str(current_cost)
+        value, ok = QInputDialog.getText(
+            self,
+            "원가 입력",
+            "원가를 입력하세요. (빈칸 입력 시 원가 삭제)",
+            QLineEdit.Normal,
+            initial,
+        )
+        if not ok:
+            return
+
+        text = value.strip().replace(",", "")
+        if not text:
+            self._save_unit_cost(channel, cost_key, None)
+            self._apply_filters()
+            return
+
+        try:
+            parsed = int(text)
+        except ValueError:
+            QMessageBox.warning(self, "원가 입력 오류", "원가는 숫자만 입력할 수 있습니다.")
+            return
+
+        if parsed < 0:
+            QMessageBox.warning(self, "원가 입력 오류", "원가는 0 이상이어야 합니다.")
+            return
+
+        self._save_unit_cost(channel, cost_key, parsed)
+        self._apply_filters()
+
     def set_rows(self, rows: List[FavoriteInventoryRow]) -> None:
+        channels = {row.channel for row in rows}
+        for channel in channels:
+            self._ensure_cost_map(channel)
         self.rows = list(rows)
         self._apply_filters()
 
@@ -1178,7 +1268,7 @@ class InventoryManagementTab(QWidget):
 
         self.status_label.setText(f"즐겨찾기 재고 {len(filtered)}건 (전체 {len(self.rows)}건)")
         if filtered:
-            self.note_label.setText("이미지 클릭 또는 상품명 더블클릭으로 상품 페이지를 열 수 있습니다.")
+            self.note_label.setText("이미지 클릭/상품명 더블클릭으로 상품 페이지를 열고, 원가 칼럼 더블클릭으로 원가를 입력할 수 있습니다.")
         else:
             self.note_label.setText("네이버/쿠팡 탭에서 ★를 눌러 즐겨찾기한 상품만 표시됩니다.")
 
@@ -1261,6 +1351,50 @@ class InventoryManagementTab(QWidget):
                     self._sortable_none_last(row.price),
                 ),
             )
+            unit_cost = self._unit_cost(row)
+            unit_cost_item = self._table_item(
+                self._fmt_int(unit_cost, "원"),
+                Qt.AlignRight | Qt.AlignVCenter,
+                self._sortable_none_last(unit_cost),
+            )
+            unit_cost_item.setData(Qt.UserRole + 2, row.channel)
+            unit_cost_item.setData(Qt.UserRole + 3, row.cost_key)
+            unit_cost_item.setData(Qt.UserRole + 4, unit_cost)
+            unit_cost_item.setToolTip("더블클릭: 원가 입력/수정")
+            self.table.setItem(index, 8, unit_cost_item)
+
+            total_cost = self._total_cost(row.stock, unit_cost)
+            self.table.setItem(
+                index,
+                9,
+                self._table_item(
+                    self._fmt_int(total_cost, "원"),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    self._sortable_none_last(total_cost),
+                ),
+            )
+
+            total_sales_price = self._total_sales_price(row.stock, row.price)
+            self.table.setItem(
+                index,
+                10,
+                self._table_item(
+                    self._fmt_int(total_sales_price, "원"),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    self._sortable_none_last(total_sales_price),
+                ),
+            )
+
+            expected_profit = self._expected_profit(total_sales_price, total_cost)
+            self.table.setItem(
+                index,
+                11,
+                self._table_item(
+                    self._fmt_int(expected_profit, "원"),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    self._sortable_none_last(expected_profit),
+                ),
+            )
 
         self.table.setSortingEnabled(True)
         if rows:
@@ -1330,6 +1464,14 @@ class InventoryManagementTab(QWidget):
 
     @Slot(QTableWidgetItem)
     def _on_item_double_clicked(self, item: QTableWidgetItem) -> None:
+        if item.column() == 8:
+            channel = item.data(Qt.UserRole + 2)
+            cost_key = item.data(Qt.UserRole + 3)
+            current_cost = item.data(Qt.UserRole + 4)
+            if isinstance(channel, str) and isinstance(cost_key, str):
+                self._edit_unit_cost(channel, cost_key, int(current_cost) if current_cost is not None else None)
+            return
+
         url = item.data(Qt.UserRole + 1)
         if not isinstance(url, str) or not url.strip():
             return

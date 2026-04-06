@@ -69,6 +69,27 @@ class ChannelProductCache:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS product_cost_overrides (
+                    channel TEXT NOT NULL,
+                    product_key TEXT NOT NULL,
+                    unit_cost INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (channel, product_key)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS product_favorites (
+                    channel TEXT NOT NULL,
+                    product_key TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (channel, product_key)
+                )
+                """
+            )
             conn.commit()
 
     def save_rows(self, channel: str, rows: List[ChannelProduct]) -> None:
@@ -188,5 +209,110 @@ class ChannelProductCache:
                     WHERE channel = ? AND product_key = ?
                     """,
                     (channel_key, item_key),
+                )
+            conn.commit()
+
+    def load_favorite_keys(self, channel: str) -> set[str]:
+        channel_key = str(channel).strip().lower()
+        with self._guard, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                SELECT product_key
+                FROM product_favorites
+                WHERE channel = ?
+                """,
+                (channel_key,),
+            )
+            rows = cursor.fetchall()
+
+        keys: set[str] = set()
+        for (product_key,) in rows:
+            key = str(product_key or "").strip()
+            if key:
+                keys.add(key)
+        return keys
+
+    def save_favorite(self, channel: str, product_key: str, is_favorite: bool) -> None:
+        channel_key = str(channel).strip().lower()
+        item_key = str(product_key).strip()
+        if not item_key:
+            return
+
+        with self._guard, self._connect() as conn:
+            if is_favorite:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO product_favorites (
+                        channel, product_key, updated_at
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (
+                        channel_key,
+                        item_key,
+                        datetime.now().isoformat(),
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    DELETE FROM product_favorites
+                    WHERE channel = ? AND product_key = ?
+                    """,
+                    (channel_key, item_key),
+                )
+            conn.commit()
+
+    def load_cost_overrides(self, channel: str) -> Dict[str, int]:
+        channel_key = str(channel).strip().lower()
+        with self._guard, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                SELECT product_key, unit_cost
+                FROM product_cost_overrides
+                WHERE channel = ?
+                """,
+                (channel_key,),
+            )
+            rows = cursor.fetchall()
+
+        overrides: Dict[str, int] = {}
+        for product_key, unit_cost in rows:
+            key = str(product_key or "").strip()
+            if not key:
+                continue
+            try:
+                overrides[key] = int(unit_cost)
+            except (TypeError, ValueError):
+                continue
+        return overrides
+
+    def save_cost_override(self, channel: str, product_key: str, unit_cost: int | None) -> None:
+        channel_key = str(channel).strip().lower()
+        item_key = str(product_key).strip()
+        if not item_key:
+            return
+
+        with self._guard, self._connect() as conn:
+            if unit_cost is None:
+                conn.execute(
+                    """
+                    DELETE FROM product_cost_overrides
+                    WHERE channel = ? AND product_key = ?
+                    """,
+                    (channel_key, item_key),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO product_cost_overrides (
+                        channel, product_key, unit_cost, updated_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        channel_key,
+                        item_key,
+                        int(unit_cost),
+                        datetime.now().isoformat(),
+                    ),
                 )
             conn.commit()
