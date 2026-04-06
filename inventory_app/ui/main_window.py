@@ -2,6 +2,7 @@
 
 import math
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any, Callable, List
 
 import httpx
@@ -50,6 +51,19 @@ class SortableTableItem(QTableWidgetItem):
         if left_value is not None and right_value is not None:
             return left_value < right_value
         return super().__lt__(other)
+
+
+@dataclass
+class FavoriteInventoryRow:
+    channel: str
+    serial: int
+    image_url: str | None
+    name: str
+    stock: int | None
+    sales: int | None
+    stockout_days: int | None
+    price: int | None
+    product_url: str | None
 
 
 class ChannelSyncWorker(QThread):
@@ -112,6 +126,7 @@ class EditableNameLabel(QLabel):
 class ChannelTab(QWidget):
     image_downloaded = Signal(str, object)
     sync_finished = Signal(str, bool)
+    favorites_changed = Signal(str)
 
     def __init__(
         self,
@@ -340,6 +355,7 @@ class ChannelTab(QWidget):
 
         if changed_count > 0:
             self._apply_filters()
+            self.favorites_changed.emit(self.channel_name)
 
         summary = f"{self.channel_name} 동기화 완료: {len(self.rows)}건"
         summary += f" | 변경 {changed_count}건"
@@ -386,14 +402,11 @@ class ChannelTab(QWidget):
 
     @staticmethod
     def _favorite_key(row: ChannelProduct) -> str:
-        return "|".join(
-            [
-                row.product_id,
-                row.product_url or "",
-                row.name,
-                str(row.price) if row.price is not None else "",
-            ]
-        )
+        if row.product_id:
+            return f"id:{row.product_id}|item:{row.item_id or ''}"
+        if row.product_url:
+            return f"url:{row.product_url}"
+        return f"name:{row.name}"
 
     def _is_favorite(self, row: ChannelProduct) -> bool:
         return self._favorite_key(row) in self.favorite_keys
@@ -405,12 +418,33 @@ class ChannelTab(QWidget):
         else:
             self.favorite_keys.add(key)
         self._apply_filters()
+        self.favorites_changed.emit(self.channel_name)
 
     def toggle_current_row_favorite(self) -> None:
         current_index = self.table.currentRow()
         if current_index < 0 or current_index >= len(self.filtered_rows):
             return
         self._toggle_row_favorite(self.filtered_rows[current_index])
+
+    def favorite_inventory_rows(self) -> List[FavoriteInventoryRow]:
+        rows: List[FavoriteInventoryRow] = []
+        for row in self.rows:
+            if not self._is_favorite(row):
+                continue
+            rows.append(
+                FavoriteInventoryRow(
+                    channel=self.channel_name,
+                    serial=row.serial,
+                    image_url=row.image_url,
+                    name=self._display_name(row),
+                    stock=row.stock,
+                    sales=row.sales,
+                    stockout_days=self._stockout_days(row),
+                    price=row.price,
+                    product_url=row.product_url,
+                )
+            )
+        return rows
 
     def _favorite_button(self, row: ChannelProduct) -> QPushButton:
         checked = self._is_favorite(row)
@@ -634,6 +668,7 @@ class ChannelTab(QWidget):
             self.cache.save_name_override(self.channel_name, key, updated)
         self._force_full_render_next = True
         self._apply_filters()
+        self.favorites_changed.emit(self.channel_name)
 
     def _open_product_page(self, url: str) -> None:
         QDesktopServices.openUrl(QUrl(url))
@@ -954,6 +989,353 @@ class ChannelTab(QWidget):
             if not finished:
                 self.worker.terminate()
                 self.worker.wait(2000)
+        self.image_executor.shutdown(wait=False, cancel_futures=True)
+
+
+class InventoryManagementTab(QWidget):
+    image_downloaded = Signal(str, object)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: List[FavoriteInventoryRow] = []
+        self.filtered_rows: List[FavoriteInventoryRow] = []
+        self.image_cache: dict[str, QPixmap] = {}
+        self._image_waiters: dict[str, list[tuple[QLabel, int]]] = {}
+        self._image_pending: set[str] = set()
+        self.image_executor = ThreadPoolExecutor(max_workers=4)
+        self.render_token = 0
+
+        self.channel_filter = QComboBox()
+        self.search_input = QLineEdit()
+        self.table = QTableWidget(0, 8)
+        self.status_label = QLabel("즐겨찾기한 상품이 없습니다.")
+        self.note_label = QLabel("네이버/쿠팡 탭에서 ★를 눌러 즐겨찾기하면 여기에 재고가 표시됩니다.")
+        self.note_label.setWordWrap(True)
+
+        self.image_downloaded.connect(self._on_image_downloaded)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(10, 10, 10, 10)
+        root_layout.setSpacing(10)
+
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(8)
+
+        self.channel_filter.addItems(["전체", "네이버", "쿠팡"])
+        self.channel_filter.currentIndexChanged.connect(self._apply_filters)
+
+        self.search_input.setPlaceholderText("즐겨찾기 상품명 검색")
+        self.search_input.textChanged.connect(self._apply_filters)
+
+        top_bar.addWidget(QLabel("채널"))
+        top_bar.addWidget(self.channel_filter)
+        top_bar.addWidget(QLabel("검색"))
+        top_bar.addWidget(self.search_input, 1)
+
+        self.table.setHorizontalHeaderLabels(
+            [
+                "채널",
+                "연번",
+                "상품이미지",
+                "상품명",
+                "재고",
+                "판매량",
+                "품절예상(일)",
+                "가격",
+            ]
+        )
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setSortingEnabled(True)
+        self.table.setColumnWidth(0, 80)
+        self.table.setColumnWidth(1, 54)
+        self.table.setColumnWidth(2, 68)
+        self.table.setColumnWidth(3, 460)
+        self.table.setColumnWidth(4, 96)
+        self.table.setColumnWidth(5, 96)
+        self.table.setColumnWidth(6, 120)
+        self.table.setColumnWidth(7, 110)
+        self.table.itemDoubleClicked.connect(self._on_item_double_clicked)
+
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.Interactive)
+        header.setSectionResizeMode(4, QHeaderView.Fixed)
+        header.setSectionResizeMode(5, QHeaderView.Fixed)
+        header.setSectionResizeMode(6, QHeaderView.Fixed)
+        header.setSectionResizeMode(7, QHeaderView.Fixed)
+
+        self.status_label.setStyleSheet("color: #475569;")
+        self.note_label.setStyleSheet("color: #64748b;")
+
+        root_layout.addLayout(top_bar)
+        root_layout.addWidget(self.table, 1)
+        root_layout.addWidget(self.status_label)
+        root_layout.addWidget(self.note_label)
+        self._apply_styles()
+
+    def _apply_styles(self) -> None:
+        self.setStyleSheet(
+            """
+            QWidget {
+                font-family: "Segoe UI";
+                font-size: 12px;
+            }
+            QLineEdit, QComboBox, QPushButton {
+                background: #ffffff;
+                border: 1px solid #d0d7de;
+                border-radius: 8px;
+                padding: 4px 8px;
+                color: #1f2937;
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border: 1px solid #7aa7e0;
+            }
+            QTableWidget {
+                background: #ffffff;
+                alternate-background-color: #edf2f7;
+                border: 1px solid #d8dee4;
+                gridline-color: #e5e7eb;
+                selection-background-color: #bbf7d0;
+                selection-color: #14532d;
+            }
+            QTableWidget::item:selected {
+                background: #bbf7d0;
+                color: #14532d;
+            }
+            QHeaderView::section {
+                background: #f1f5f9;
+                border: none;
+                border-bottom: 1px solid #d8dee4;
+                border-right: 1px solid #e5e7eb;
+                color: #111827;
+                font-weight: 600;
+                padding: 6px;
+            }
+            """
+        )
+
+    @staticmethod
+    def _fmt_int(value: int | None, suffix: str = "") -> str:
+        if value is None:
+            return "-"
+        return f"{int(value):,}{suffix}"
+
+    @staticmethod
+    def _sortable_none_last(value: int | None) -> tuple[int, int]:
+        if value is None:
+            return (1, 0)
+        return (0, int(value))
+
+    @staticmethod
+    def _table_item(
+        text: str,
+        align: Qt.AlignmentFlag,
+        sort_value: Any | None = None,
+    ) -> QTableWidgetItem:
+        item = SortableTableItem(text)
+        item.setTextAlignment(align)
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        if sort_value is not None:
+            item.setData(Qt.UserRole, sort_value)
+        return item
+
+    def set_rows(self, rows: List[FavoriteInventoryRow]) -> None:
+        self.rows = list(rows)
+        self._apply_filters()
+
+    @Slot()
+    def _apply_filters(self) -> None:
+        selected_channel = self.channel_filter.currentText()
+        keyword = self.search_input.text().strip().lower()
+
+        filtered: List[FavoriteInventoryRow] = []
+        for row in self.rows:
+            if selected_channel != "전체" and row.channel != selected_channel:
+                continue
+            if keyword and keyword not in row.name.lower():
+                continue
+            filtered.append(row)
+
+        filtered.sort(
+            key=lambda row: (
+                row.stock is None,
+                int(row.stock or 0),
+                row.channel,
+                row.serial,
+            )
+        )
+        self.filtered_rows = filtered
+        self._render_rows(filtered)
+
+        self.status_label.setText(f"즐겨찾기 재고 {len(filtered)}건 (전체 {len(self.rows)}건)")
+        if filtered:
+            self.note_label.setText("이미지 클릭 또는 상품명 더블클릭으로 상품 페이지를 열 수 있습니다.")
+        else:
+            self.note_label.setText("네이버/쿠팡 탭에서 ★를 눌러 즐겨찾기한 상품만 표시됩니다.")
+
+    def _image_cell(self, row: FavoriteInventoryRow) -> tuple[QWidget, ProductImageLabel]:
+        container = QWidget()
+        container.setFixedWidth(62)
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(0)
+        label = ProductImageLabel()
+        label.set_product_url(row.product_url)
+        label.clicked.connect(self._open_product_page)
+        layout.addWidget(label, 0, Qt.AlignCenter)
+        return container, label
+
+    def _render_rows(self, rows: List[FavoriteInventoryRow]) -> None:
+        self.render_token += 1
+        token = self.render_token
+        self._image_waiters.clear()
+
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(rows))
+
+        for index, row in enumerate(rows):
+            self.table.setRowHeight(index, 56)
+            self.table.setItem(
+                index,
+                0,
+                self._table_item(row.channel, Qt.AlignCenter, row.channel),
+            )
+            self.table.setItem(
+                index,
+                1,
+                self._table_item(str(row.serial), Qt.AlignCenter, row.serial),
+            )
+
+            image_cell, image_label = self._image_cell(row)
+            self.table.setCellWidget(index, 2, image_cell)
+            self.table.setItem(index, 2, self._table_item("", Qt.AlignCenter, 0))
+            self._queue_image(image_label, row.image_url, token)
+
+            name_item = self._table_item(row.name, Qt.AlignVCenter | Qt.AlignLeft, row.name.lower())
+            if row.product_url:
+                name_item.setData(Qt.UserRole + 1, row.product_url)
+                name_item.setToolTip("더블클릭: 상품 페이지 열기")
+            self.table.setItem(index, 3, name_item)
+            self.table.setItem(
+                index,
+                4,
+                self._table_item(
+                    self._fmt_int(row.stock),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    self._sortable_none_last(row.stock),
+                ),
+            )
+            self.table.setItem(
+                index,
+                5,
+                self._table_item(
+                    self._fmt_int(row.sales),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    self._sortable_none_last(row.sales),
+                ),
+            )
+            self.table.setItem(
+                index,
+                6,
+                self._table_item(
+                    self._fmt_int(row.stockout_days),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    self._sortable_none_last(row.stockout_days),
+                ),
+            )
+            self.table.setItem(
+                index,
+                7,
+                self._table_item(
+                    self._fmt_int(row.price, "원"),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    self._sortable_none_last(row.price),
+                ),
+            )
+
+        self.table.setSortingEnabled(True)
+        if rows:
+            self.table.sortItems(4, Qt.AscendingOrder)
+
+    def _queue_image(self, label: QLabel, image_url: str | None, token: int) -> None:
+        normalized_url = ChannelTab._normalize_image_url(image_url)
+        if not normalized_url:
+            return
+
+        cached = self.image_cache.get(normalized_url)
+        if cached is not None:
+            self._set_label_pixmap(label, cached)
+            return
+
+        waiters = self._image_waiters.setdefault(normalized_url, [])
+        waiters.append((label, token))
+        if normalized_url in self._image_pending:
+            return
+
+        self._image_pending.add(normalized_url)
+        future = self.image_executor.submit(ChannelTab._download_image_bytes, normalized_url)
+        future.add_done_callback(
+            lambda f, url=normalized_url: self._emit_image_downloaded(url, f)
+        )
+
+    def _emit_image_downloaded(self, url: str, future: Future[bytes | None]) -> None:
+        data: bytes | None
+        try:
+            data = future.result()
+        except Exception:  # noqa: BLE001
+            data = None
+        self.image_downloaded.emit(url, data)
+
+    @Slot(str, object)
+    def _on_image_downloaded(self, url: str, data: object) -> None:
+        self._image_pending.discard(url)
+        waiters = self._image_waiters.pop(url, [])
+        if not waiters:
+            return
+
+        pixmap: QPixmap | None = None
+        if isinstance(data, (bytes, bytearray)):
+            candidate = QPixmap()
+            if candidate.loadFromData(bytes(data)):
+                pixmap = candidate
+                self.image_cache[url] = candidate
+        if pixmap is None:
+            return
+
+        for label, token in waiters:
+            if token != self.render_token:
+                continue
+            try:
+                self._set_label_pixmap(label, pixmap)
+            except RuntimeError:
+                continue
+
+    def _set_label_pixmap(self, label: QLabel, pixmap: QPixmap) -> None:
+        scaled = pixmap.scaled(42, 42, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        label.setPixmap(scaled)
+        label.setText("")
+        label.setStyleSheet("border: 1px solid #d0d7de; border-radius: 6px;")
+
+    def _open_product_page(self, url: str) -> None:
+        QDesktopServices.openUrl(QUrl(url))
+
+    @Slot(QTableWidgetItem)
+    def _on_item_double_clicked(self, item: QTableWidgetItem) -> None:
+        url = item.data(Qt.UserRole + 1)
+        if not isinstance(url, str) or not url.strip():
+            return
+        QDesktopServices.openUrl(QUrl(url))
+
+    def shutdown(self) -> None:
         self.image_executor.shutdown(wait=False, cancel_futures=True)
 
 
@@ -1860,6 +2242,7 @@ class MainWindow(QMainWindow):
             fetch_fn=self.coupang_service.fetch,
             initial_fetch_fn=self.coupang_service.fetch_cached,
         )
+        self.inventory_tab = InventoryManagementTab()
         self.revenue_tab = RevenueTab(
             fetch_fn=self.revenue_service.fetch,
             default_days=sales_days,
@@ -1891,10 +2274,17 @@ class MainWindow(QMainWindow):
         self.tab_shortcut_4.setContext(Qt.ApplicationShortcut)
         self.tab_shortcut_4.activated.connect(lambda: self._activate_tab_shortcut(3))
 
+        self.tab_shortcut_5 = QShortcut(QKeySequence("5"), self)
+        self.tab_shortcut_5.setContext(Qt.ApplicationShortcut)
+        self.tab_shortcut_5.activated.connect(lambda: self._activate_tab_shortcut(4))
+
         self.naver_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.coupang_tab.sync_finished.connect(self._on_sub_sync_finished)
+        self.naver_tab.favorites_changed.connect(self._refresh_inventory_tab)
+        self.coupang_tab.favorites_changed.connect(self._refresh_inventory_tab)
         self.revenue_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.keyword_tab.sync_finished.connect(self._on_sub_sync_finished)
+        self._refresh_inventory_tab()
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -1912,6 +2302,7 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(self.naver_tab, "네이버")
         self.tabs.addTab(self.coupang_tab, "쿠팡")
+        self.tabs.addTab(self.inventory_tab, "재고관리")
         self.tabs.addTab(self.revenue_tab, "매출비교")
         self.tabs.addTab(self.keyword_tab, "키워드매출")
         corner = QWidget()
@@ -2020,6 +2411,23 @@ class MainWindow(QMainWindow):
         else:
             self.sync_progress.setFormat(f"동기화 진행 중... {percent}%")
 
+    def _collect_favorite_inventory_rows(self) -> List[FavoriteInventoryRow]:
+        rows: List[FavoriteInventoryRow] = []
+        rows.extend(self.naver_tab.favorite_inventory_rows())
+        rows.extend(self.coupang_tab.favorite_inventory_rows())
+        rows.sort(
+            key=lambda row: (
+                row.stock is None,
+                int(row.stock or 0),
+                row.channel,
+                row.serial,
+            )
+        )
+        return rows
+
+    def _refresh_inventory_tab(self, *_args: object) -> None:
+        self.inventory_tab.set_rows(self._collect_favorite_inventory_rows())
+
     @Slot()
     def sync_now(self) -> None:
         started_sources: set[str] = set()
@@ -2064,6 +2472,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         self.naver_tab.shutdown()
         self.coupang_tab.shutdown()
+        self.inventory_tab.shutdown()
         self.revenue_tab.shutdown()
         self.keyword_tab.shutdown()
         super().closeEvent(event)
