@@ -287,11 +287,11 @@ class ChannelTab(QWidget):
                 border: 1px solid #d8dee4;
                 gridline-color: #e5e7eb;
                 selection-background-color: #bbf7d0;
-                selection-color: #14532d;
+                selection-color: #111827;
             }
             QTableWidget::item:selected {
                 background: #bbf7d0;
-                color: #14532d;
+                color: #111827;
             }
             QHeaderView::section {
                 background: #f1f5f9;
@@ -1123,11 +1123,11 @@ class InventoryManagementTab(QWidget):
                 border: 1px solid #d8dee4;
                 gridline-color: #e5e7eb;
                 selection-background-color: #bbf7d0;
-                selection-color: #14532d;
+                selection-color: #111827;
             }
             QTableWidget::item:selected {
                 background: #bbf7d0;
-                color: #14532d;
+                color: #111827;
             }
             QHeaderView::section {
                 background: #f1f5f9;
@@ -1654,11 +1654,11 @@ class RevenueTab(QWidget):
                 border: 1px solid #d8dee4;
                 gridline-color: #e5e7eb;
                 selection-background-color: #bbf7d0;
-                selection-color: #14532d;
+                selection-color: #111827;
             }
             QTableWidget::item:selected {
                 background: #bbf7d0;
-                color: #14532d;
+                color: #111827;
             }
             QHeaderView::section {
                 background: #f1f5f9;
