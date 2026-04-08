@@ -2592,18 +2592,29 @@ class SalesDailyTab(QWidget):
         summary = data.get("summary", {})
         sales = data.get("sales", [])
 
-        # 요약
-        total_qty = summary.get("total_qty", 0)
-        total_rev = summary.get("total_revenue", 0)
-        channels = summary.get("channels", [])
-        ch_text = " / ".join(
-            ("네이버" if c == "naver" else "쿠팡") for c in channels
-        ) or "없음"
+        # 채널별 분리 집계
+        naver_qty = sum(s.get("qty_sold", 0) for s in sales if s.get("channel") == "naver")
+        coupang_qty = sum(s.get("qty_sold", 0) for s in sales if s.get("channel") == "coupang")
+        naver_rev = sum(
+            s.get("qty_sold", 0) * s["price"] for s in sales
+            if s.get("channel") == "naver" and s.get("price")
+        )
+        coupang_rev = sum(
+            s.get("qty_sold", 0) * s["price"] for s in sales
+            if s.get("channel") == "coupang" and s.get("price")
+        )
+        total_qty = naver_qty + coupang_qty
+        total_rev = naver_rev + coupang_rev
+
+        naver_line = f"네이버: <b>{naver_qty}건</b> / ₩{naver_rev:,.0f}" if naver_qty else ""
+        coupang_line = f"쿠팡: <b>{coupang_qty}건</b> / ₩{coupang_rev:,.0f}" if coupang_qty else ""
+        channel_lines = "<br>".join(l for l in [naver_line, coupang_line] if l) or "판매 없음"
+
         self.summary_label.setText(
             f"<b>{date_str} 판매일보</b><br>"
-            f"채널: {ch_text}<br>"
-            f"총 판매: <b>{total_qty}건</b><br>"
-            f"추정 매출: <b>₩{total_rev:,.0f}</b>"
+            f"{channel_lines}<br>"
+            f"─────────────<br>"
+            f"합계: <b>{total_qty}건</b> / ₩{total_rev:,.0f}"
         )
 
         # 테이블
@@ -2759,10 +2770,6 @@ class MainWindow(QMainWindow):
         self.favorite_shortcut = QShortcut(QKeySequence(Qt.Key_QuoteLeft), self)
         self.favorite_shortcut.setContext(Qt.ApplicationShortcut)
         self.favorite_shortcut.activated.connect(self._toggle_favorite_on_current_tab)
-        # ₩ 키 (한국 키보드) 즐겨찾기
-        self.favorite_shortcut_krw = QShortcut(QKeySequence(0x20A9), self)
-        self.favorite_shortcut_krw.setContext(Qt.ApplicationShortcut)
-        self.favorite_shortcut_krw.activated.connect(self._toggle_favorite_on_current_tab)
 
         self.tab_shortcut_1 = QShortcut(QKeySequence("1"), self)
         self.tab_shortcut_1.setContext(Qt.ApplicationShortcut)
@@ -3017,6 +3024,16 @@ class MainWindow(QMainWindow):
         if not succeeded:
             self._sync_failed_sources.add(source)
         self._update_sync_progress()
+
+    def keyPressEvent(self, event: Any) -> None:
+        # ₩ 키 (한국 키보드) — text()로 체크해서 어떤 키코드든 잡음
+        if event.text() in ("₩", "`", "~"):
+            focused = QApplication.focusWidget()
+            if not isinstance(focused, QLineEdit):
+                self._toggle_favorite_on_current_tab()
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     @Slot()
     def _toggle_favorite_on_current_tab(self) -> None:
