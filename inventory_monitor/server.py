@@ -47,14 +47,8 @@ class Handler(BaseHTTPRequestHandler):
                 naver = db.get_latest_snapshot("naver")
                 coupang = db.get_latest_snapshot("coupang")
                 self._send_json({
-                    "naver": [
-                        {"product_id": r[0], "name": r[1], "stock": r[2], "recorded_at": r[3]}
-                        for r in naver
-                    ],
-                    "coupang": [
-                        {"product_id": r[0], "name": r[1], "stock": r[2], "recorded_at": r[3]}
-                        for r in coupang
-                    ],
+                    "naver": naver,
+                    "coupang": coupang,
                 })
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)

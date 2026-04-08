@@ -29,13 +29,13 @@ def _fetch_from_monitor(url: str, channel: str, timeout: int) -> List[ChannelPro
             result.append(ChannelProduct(
                 serial=i,
                 product_id=str(r.get("product_id", "")),
-                item_id=None,
+                item_id=r.get("item_id"),
                 name=str(r.get("name", "")),
-                image_url=None,
-                product_url=None,
+                image_url=r.get("image_url"),
+                product_url=r.get("product_url"),
                 stock=r.get("stock"),
-                sales=None,
-                price=None,
+                sales=r.get("sales"),
+                price=r.get("price"),
                 synced_at=synced,
             ))
         return result
@@ -172,7 +172,7 @@ class NaverChannelService:
             rows = _fetch_from_monitor(self.config.monitor_url, "naver", self.config.timeout_seconds)
             if rows is not None:
                 _assign_serial_by_sales(rows)
-                return rows, []
+                return rows, ["__pi__"]
 
         synced_at = datetime.now()
         warnings: List[str] = []
@@ -255,7 +255,7 @@ class CoupangChannelService:
             rows = _fetch_from_monitor(self.config.monitor_url, "coupang", self.config.timeout_seconds)
             if rows is not None:
                 _assign_serial_by_sales(rows)
-                return rows, []
+                return rows, ["__pi__"]
 
         synced_at = datetime.now()
         warnings: List[str] = []

@@ -44,6 +44,8 @@ class InventoryHistoryDB:
                     product_id TEXT NOT NULL,
                     item_id TEXT,
                     name TEXT NOT NULL,
+                    image_url TEXT,
+                    product_url TEXT,
                     stock INTEGER,
                     sales INTEGER,
                     price INTEGER,
@@ -51,6 +53,12 @@ class InventoryHistoryDB:
                 )
                 """
             )
+            # 기존 DB 마이그레이션 (image_url, product_url 컬럼 추가)
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(inventory_history)")}
+            if "image_url" not in existing:
+                conn.execute("ALTER TABLE inventory_history ADD COLUMN image_url TEXT")
+            if "product_url" not in existing:
+                conn.execute("ALTER TABLE inventory_history ADD COLUMN product_url TEXT")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_history_recorded
@@ -66,7 +74,6 @@ class InventoryHistoryDB:
             conn.commit()
 
     def _load_last_stocks(self, conn: sqlite3.Connection, channel: str) -> dict[str, int | None]:
-        """channel의 상품별 마지막 재고량 반환 {product_id: stock}"""
         cursor = conn.execute(
             """
             SELECT product_id, stock
@@ -100,19 +107,21 @@ class InventoryHistoryDB:
                 current_stock = row.get("stock")
                 last_stock = last_stocks.get(product_id, "__NEW__")
 
-                # 처음 보는 상품이거나 재고가 변했을 때만 INSERT
                 if last_stock == "__NEW__" or last_stock != current_stock:
                     conn.execute(
                         """
                         INSERT INTO inventory_history
-                            (channel, product_id, item_id, name, stock, sales, price, recorded_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            (channel, product_id, item_id, name, image_url, product_url,
+                             stock, sales, price, recorded_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             channel,
                             product_id,
                             row.get("item_id"),
                             str(row.get("name", "")),
+                            row.get("image_url"),
+                            row.get("product_url"),
                             current_stock,
                             row.get("sales"),
                             row.get("price"),
@@ -124,23 +133,25 @@ class InventoryHistoryDB:
             conn.commit()
         return inserted
 
-    def get_latest_snapshot(
-        self, channel: str
-    ) -> List[Tuple[str, str, int | None, str]]:
+    def get_latest_snapshot(self, channel: str) -> List[dict]:
         with self._guard, self._connection() as conn:
             cursor = conn.execute(
                 """
-                SELECT product_id, name, stock, recorded_at
-                FROM inventory_history
+                SELECT product_id, item_id, name, image_url, product_url,
+                       stock, sales, price, recorded_at
+                FROM inventory_history h1
                 WHERE channel = ?
-                  AND recorded_at = (
-                      SELECT MAX(recorded_at) FROM inventory_history WHERE channel = ?
+                  AND id = (
+                      SELECT MAX(id) FROM inventory_history h2
+                      WHERE h2.channel = h1.channel AND h2.product_id = h1.product_id
                   )
                 ORDER BY name
                 """,
-                (channel, channel),
+                (channel,),
             )
-            return cursor.fetchall()
+            cols = ["product_id", "item_id", "name", "image_url", "product_url",
+                    "stock", "sales", "price", "recorded_at"]
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
     def count_records(self) -> int:
         with self._guard, self._connection() as conn:

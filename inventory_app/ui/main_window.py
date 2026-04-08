@@ -362,12 +362,16 @@ class ChannelTab(QWidget):
             self._apply_filters()
             self.favorites_changed.emit(self.channel_name)
 
-        summary = f"{self.channel_name} 동기화 완료: {len(self.rows)}건"
+        pi_source = "__pi__" in warning_messages
+        real_warnings = [w for w in warning_messages if w != "__pi__"]
+
+        prefix = "📡 라즈베리파이 | " if pi_source else ""
+        summary = f"{prefix}{self.channel_name} 동기화 완료: {len(self.rows)}건"
         summary += f" | 변경 {changed_count}건"
-        if warning_messages:
-            summary += f" | 경고 {len(warning_messages)}건"
+        if real_warnings:
+            summary += f" | 경고 {len(real_warnings)}건"
         self.status_label.setText(summary)
-        self.status_label.setToolTip("\n".join(warning_messages) if warning_messages else "")
+        self.status_label.setToolTip("\n".join(real_warnings) if real_warnings else "")
         self.sync_finished.emit(self.channel_name, True)
 
     @Slot(str)
