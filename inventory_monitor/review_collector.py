@@ -73,8 +73,8 @@ def _collect_naver_reviews(db: InventoryHistoryDB) -> int:
             })
             log.info("  네이버 [%s] 리뷰: %d", name[:30], review_count)
 
-        # 429 방지 딜레이
-        time.sleep(3)
+        # 429 방지 딜레이 (10초 — 30개 상품 기준 약 5분)
+        time.sleep(10)
 
     if results:
         n = db.insert_reviews("naver", results)
@@ -96,12 +96,16 @@ def _naver_mobile_review_count(product_url: str) -> int | None:
         try:
             resp = httpx.get(
                 mobile_url,
-                headers={"User-Agent": _MOBILE_UA},
+                headers={
+                    "User-Agent": _MOBILE_UA,
+                    "Accept": "text/html,application/xhtml+xml",
+                    "Accept-Language": "ko-KR,ko;q=0.9",
+                },
                 follow_redirects=True,
                 timeout=15,
             )
             if resp.status_code == 429:
-                wait = 10 * (attempt + 1)
+                wait = 30 * (attempt + 1)
                 log.info("  429 rate limit, %d초 대기 후 재시도...", wait)
                 time.sleep(wait)
                 continue
@@ -181,7 +185,7 @@ def _collect_coupang_reviews(db: InventoryHistoryDB) -> int:
             })
             log.info("  쿠팡 [%s] 리뷰: %d", name[:30], review_count)
 
-        time.sleep(1)
+        time.sleep(5)
 
     if driver:
         driver.quit()
