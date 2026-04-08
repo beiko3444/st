@@ -40,8 +40,19 @@ def _handle_signal(signum, frame):
     _running = False
 
 
-def _fetch_naver(connector: SmartStoreConnector, max_items: int) -> list[dict]:
+def _fetch_naver(
+    connector: SmartStoreConnector,
+    stats_connector: SmartStoreConnector,
+    max_items: int,
+) -> list[dict]:
     raw = connector.fetch_products(max_items=max_items)
+
+    today_sales_map: dict[str, int] = {}
+    try:
+        today_sales_map = stats_connector.fetch_product_sales_counts(days=1)
+    except Exception:
+        log.warning("오늘 판매량 조회 실패 (무시)")
+
     return [
         {
             "product_id": str(r.get("product_id", "")),
@@ -51,6 +62,7 @@ def _fetch_naver(connector: SmartStoreConnector, max_items: int) -> list[dict]:
             "product_url": r.get("product_url"),
             "stock": r.get("stock"),
             "sales": None,
+            "today_sales": today_sales_map.get(str(r.get("product_id", ""))) if today_sales_map else None,
             "price": r.get("price"),
         }
         for r in raw
@@ -68,6 +80,7 @@ def _fetch_coupang(connector: CoupangRocketConnector, max_items: int) -> list[di
             "product_url": r.get("product_url"),
             "stock": r.get("stock"),
             "sales": r.get("sales"),
+            "today_sales": None,
             "price": r.get("price"),
         }
         for r in raw
@@ -76,6 +89,7 @@ def _fetch_coupang(connector: CoupangRocketConnector, max_items: int) -> list[di
 
 def _collect_once(
     ss: SmartStoreConnector,
+    ss_stats: SmartStoreConnector,
     cp: CoupangRocketConnector,
     db: InventoryHistoryDB,
     max_items: int,
@@ -84,7 +98,7 @@ def _collect_once(
 
     # 스마트스토어
     try:
-        naver_rows = _fetch_naver(ss, max_items)
+        naver_rows = _fetch_naver(ss, ss_stats, max_items)
         n_naver = db.insert_rows("naver", naver_rows, recorded_at=now)
         log.info("스마트스토어: %d개 변동 저장 (전체 %d개)", n_naver, len(naver_rows))
     except Exception:
@@ -116,6 +130,12 @@ def main() -> None:
         token_type=cfg.smartstore_token_type,
         timeout_seconds=cfg.timeout_seconds,
     )
+    ss_stats = SmartStoreConnector(
+        client_id=cfg.smartstore_stats_client_id,
+        client_secret=cfg.smartstore_stats_client_secret,
+        token_type=cfg.smartstore_stats_token_type,
+        timeout_seconds=cfg.timeout_seconds,
+    )
     cp = CoupangRocketConnector(
         vendor_id=cfg.coupang_vendor_id,
         access_key=cfg.coupang_access_key,
@@ -125,17 +145,16 @@ def main() -> None:
     db = InventoryHistoryDB()
 
     # 시작 즉시 1회 수집
-    _collect_once(ss, cp, db, cfg.max_products)
+    _collect_once(ss, ss_stats, cp, db, cfg.max_products)
 
     while _running:
-        # sleep을 1초 단위로 쪼개서 SIGTERM 시 빠르게 반응
         for _ in range(INTERVAL_SECONDS):
             if not _running:
                 break
             time.sleep(1)
 
         if _running:
-            _collect_once(ss, cp, db, cfg.max_products)
+            _collect_once(ss, ss_stats, cp, db, cfg.max_products)
 
     log.info("=== 재고 모니터링 종료 ===")
 

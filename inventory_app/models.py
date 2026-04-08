@@ -17,6 +17,7 @@ class ChannelProduct:
     sales: Optional[int]
     price: Optional[int]
     synced_at: datetime
+    today_sales: Optional[int] = None
 
 
 @dataclass

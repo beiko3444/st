@@ -165,7 +165,7 @@ class ChannelTab(QWidget):
         self.favorite_filter = QComboBox()
         self.search_input = QLineEdit()
         self.status_label = QLabel("준비 완료")
-        self.table = QTableWidget(0, 9)
+        self.table = QTableWidget(0, 10)
 
         self.image_downloaded.connect(self._on_image_downloaded)
         self._build_ui()
@@ -205,6 +205,7 @@ class ChannelTab(QWidget):
                 "상품이미지",
                 "상품명",
                 "재고",
+                "오늘판매",
                 self.sales_header,
                 "품절예상(일)",
                 "예측 한달매출",
@@ -232,16 +233,18 @@ class ChannelTab(QWidget):
         header.setSectionResizeMode(6, QHeaderView.Fixed)
         header.setSectionResizeMode(7, QHeaderView.Fixed)
         header.setSectionResizeMode(8, QHeaderView.Fixed)
+        header.setSectionResizeMode(9, QHeaderView.Fixed)
 
         self.table.setColumnWidth(0, 36)
         self.table.setColumnWidth(1, 44)
         self.table.setColumnWidth(2, 64)
         self.table.setColumnWidth(3, 360)
         self.table.setColumnWidth(4, 78)
-        self.table.setColumnWidth(5, 88)
-        self.table.setColumnWidth(6, 90)
-        self.table.setColumnWidth(7, 118)
-        self.table.setColumnWidth(8, 98)
+        self.table.setColumnWidth(5, 72)
+        self.table.setColumnWidth(6, 88)
+        self.table.setColumnWidth(7, 90)
+        self.table.setColumnWidth(8, 118)
+        self.table.setColumnWidth(9, 98)
 
         self.status_label.setStyleSheet("color: #475569;")
 
@@ -813,12 +816,14 @@ class ChannelTab(QWidget):
         if col == 4:
             return self._sort_nullable_numeric(rows, lambda row: row.stock, descending)
         if col == 5:
-            return self._sort_nullable_numeric(rows, lambda row: row.sales, descending)
+            return self._sort_nullable_numeric(rows, lambda row: row.today_sales, descending)
         if col == 6:
-            return self._sort_nullable_numeric(rows, self._stockout_days, descending)
+            return self._sort_nullable_numeric(rows, lambda row: row.sales, descending)
         if col == 7:
-            return self._sort_nullable_numeric(rows, self._predicted_monthly_revenue, descending)
+            return self._sort_nullable_numeric(rows, self._stockout_days, descending)
         if col == 8:
+            return self._sort_nullable_numeric(rows, self._predicted_monthly_revenue, descending)
+        if col == 9:
             return self._sort_nullable_numeric(rows, lambda row: row.price, descending)
         return list(rows)
 
@@ -879,6 +884,16 @@ class ChannelTab(QWidget):
             index,
             5,
             self._table_item(
+                self._fmt_int(row.today_sales),
+                Qt.AlignRight | Qt.AlignVCenter,
+                sort_value=self._sortable_none_last(row.today_sales),
+            ),
+        )
+
+        self.table.setItem(
+            index,
+            6,
+            self._table_item(
                 self._fmt_int(row.sales),
                 Qt.AlignRight | Qt.AlignVCenter,
                 sort_value=self._sortable_none_last(row.sales),
@@ -887,7 +902,7 @@ class ChannelTab(QWidget):
 
         self.table.setItem(
             index,
-            6,
+            7,
             self._table_item(
                 self._fmt_int(self._stockout_days(row)),
                 Qt.AlignRight | Qt.AlignVCenter,
@@ -897,7 +912,7 @@ class ChannelTab(QWidget):
 
         self.table.setItem(
             index,
-            7,
+            8,
             self._table_item(
                 self._fmt_int(self._predicted_monthly_revenue(row), "원"),
                 Qt.AlignRight | Qt.AlignVCenter,
@@ -907,7 +922,7 @@ class ChannelTab(QWidget):
 
         self.table.setItem(
             index,
-            8,
+            9,
             self._table_item(
                 self._fmt_int(row.price, "원"),
                 Qt.AlignRight | Qt.AlignVCenter,
@@ -916,6 +931,14 @@ class ChannelTab(QWidget):
         )
 
         self._queue_image(image_label, row.image_url, token)
+
+        # 품절 행 빨간 배경
+        is_soldout = row.stock is not None and int(row.stock) == 0
+        bg = QColor("#fee2e2") if is_soldout else QColor(0, 0, 0, 0)
+        for col in range(5, 10):
+            item = self.table.item(index, col)
+            if item:
+                item.setBackground(bg)
 
     def _render_table(self, rows: List[ChannelProduct]) -> None:
         self.render_token += 1
@@ -2434,6 +2457,9 @@ class MainWindow(QMainWindow):
 
         self.sync_all_button = QPushButton("전체 동기화")
         self.sync_all_button.setObjectName("primarySyncButton")
+        self.pi_status_button = QPushButton("📡 라즈베리파이")
+        self.pi_status_button.setObjectName("piStatusButton")
+        self.pi_status_button.setVisible(bool(config.monitor_url))
         self.sync_progress = QProgressBar()
         self.tabs = QTabWidget()
         self._sync_expected_sources: set[str] = set()
@@ -2523,6 +2549,8 @@ class MainWindow(QMainWindow):
         corner_layout = QHBoxLayout(corner)
         corner_layout.setContentsMargins(0, 0, 0, 0)
         corner_layout.setSpacing(0)
+        self.pi_status_button.clicked.connect(self._check_pi_status)
+        corner_layout.addWidget(self.pi_status_button)
         corner_layout.addWidget(self.sync_all_button)
         self.tabs.setCornerWidget(corner, Qt.TopRightCorner)
 
@@ -2537,6 +2565,18 @@ class MainWindow(QMainWindow):
             """
             QMainWindow {
                 background: #f3f6fb;
+            }
+            #piStatusButton {
+                background: #16a34a;
+                color: white;
+                border: 1px solid #16a34a;
+                border-radius: 9px;
+                padding: 6px 12px;
+                font-weight: 600;
+                margin-right: 6px;
+            }
+            #piStatusButton:hover {
+                background: #15803d;
             }
             #primarySyncButton {
                 background: #2f6fb2;
@@ -2643,6 +2683,37 @@ class MainWindow(QMainWindow):
         self.inventory_tab.set_rows(self._collect_favorite_inventory_rows())
 
     @Slot()
+    def _check_pi_status(self) -> None:
+        import httpx as _httpx
+        url = self.config.monitor_url
+        if not url:
+            return
+        try:
+            resp = _httpx.get(f"{url.rstrip('/')}/status", timeout=8)
+            resp.raise_for_status()
+            data = resp.json()
+            naver_ts = data.get("naver_last_updated") or "-"
+            coupang_ts = data.get("coupang_last_updated") or "-"
+            records = data.get("records", 0)
+
+            def _fmt(ts: str) -> str:
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(ts)
+                    return dt.strftime("%m/%d %H:%M")
+                except Exception:
+                    return ts
+
+            msg = (
+                f"✅ 정상 작동 중\n\n"
+                f"네이버 마지막 수집: {_fmt(naver_ts)}\n"
+                f"쿠팡 마지막 수집:   {_fmt(coupang_ts)}\n"
+                f"총 누적 레코드:     {records:,}건"
+            )
+        except Exception as e:
+            msg = f"❌ 연결 실패\n\n{e}"
+        QMessageBox.information(self, "📡 라즈베리파이 상태", msg)
+
     def sync_now(self) -> None:
         started_sources: set[str] = set()
         if self.naver_tab.sync_now():

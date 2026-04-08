@@ -53,8 +53,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
-        elif self.path == "/health":
-            self._send_json({"status": "ok", "records": db.count_records()})
+        elif self.path in ("/health", "/status"):
+            self._send_json({
+                "status": "ok",
+                "records": db.count_records(),
+                "naver_last_updated": db.get_last_updated("naver"),
+                "coupang_last_updated": db.get_last_updated("coupang"),
+            })
 
         else:
             self._send_json({"error": "not found"}, 404)

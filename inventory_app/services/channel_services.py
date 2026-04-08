@@ -37,6 +37,7 @@ def _fetch_from_monitor(url: str, channel: str, timeout: int) -> List[ChannelPro
                 sales=r.get("sales"),
                 price=r.get("price"),
                 synced_at=synced,
+                today_sales=r.get("today_sales"),
             ))
         return result
     except Exception:
