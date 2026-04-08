@@ -20,6 +20,7 @@ class AppConfig:
     coupang_secret_key: str
     timeout_seconds: int
     max_products: int
+    monitor_url: str | None = None  # 라즈베리파이 재고 API URL
 
 
 def _get(config: Dict[str, Any], *keys: str) -> Any:
@@ -70,4 +71,5 @@ def load_config(path: Path | None = None) -> AppConfig:
         coupang_secret_key=str(_get(raw, "coupang", "secret_key")),
         timeout_seconds=int(_get(raw, "request", "timeout_seconds")),
         max_products=int(_get(raw, "request", "max_products")),
+        monitor_url=str(_get_optional(raw, None, "monitor", "url")) or None,
     )

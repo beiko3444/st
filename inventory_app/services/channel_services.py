@@ -3,11 +3,44 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Dict, List, Tuple
 
+import httpx
+
 from inventory_app.config import AppConfig
 from inventory_app.connectors.coupang import CoupangRocketConnector
 from inventory_app.connectors.smartstore import SmartStoreConnector
 from inventory_app.models import ChannelProduct
 from inventory_app.services.local_cache import ChannelProductCache
+
+
+def _fetch_from_monitor(url: str, channel: str, timeout: int) -> List[ChannelProduct] | None:
+    """라즈베리파이 API에서 최신 재고 조회. 실패 시 None 반환."""
+    try:
+        resp = httpx.get(f"{url.rstrip('/')}/inventory", timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        rows = data.get(channel, [])
+        now = datetime.now()
+        result: List[ChannelProduct] = []
+        for i, r in enumerate(rows, start=1):
+            try:
+                synced = datetime.fromisoformat(r["recorded_at"])
+            except Exception:
+                synced = now
+            result.append(ChannelProduct(
+                serial=i,
+                product_id=str(r.get("product_id", "")),
+                item_id=None,
+                name=str(r.get("name", "")),
+                image_url=None,
+                product_url=None,
+                stock=r.get("stock"),
+                sales=None,
+                price=None,
+                synced_at=synced,
+            ))
+        return result
+    except Exception:
+        return None
 
 
 def _to_int(value: object) -> int | None:
@@ -134,6 +167,13 @@ class NaverChannelService:
         return rows, []
 
     def fetch(self) -> Tuple[List[ChannelProduct], List[str]]:
+        # 라즈베리파이 API 우선 시도
+        if self.config.monitor_url:
+            rows = _fetch_from_monitor(self.config.monitor_url, "naver", self.config.timeout_seconds)
+            if rows is not None:
+                _assign_serial_by_sales(rows)
+                return rows, []
+
         synced_at = datetime.now()
         warnings: List[str] = []
 
@@ -210,6 +250,13 @@ class CoupangChannelService:
         return rows, []
 
     def fetch(self) -> Tuple[List[ChannelProduct], List[str]]:
+        # 라즈베리파이 API 우선 시도
+        if self.config.monitor_url:
+            rows = _fetch_from_monitor(self.config.monitor_url, "coupang", self.config.timeout_seconds)
+            if rows is not None:
+                _assign_serial_by_sales(rows)
+                return rows, []
+
         synced_at = datetime.now()
         warnings: List[str] = []
 
