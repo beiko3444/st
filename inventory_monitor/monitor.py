@@ -48,10 +48,15 @@ def _fetch_naver(
     raw = connector.fetch_products(max_items=max_items)
 
     today_sales_map: dict[str, int] = {}
+    sales_30d_map: dict[str, int] = {}
     try:
         today_sales_map = stats_connector.fetch_product_sales_counts(days=1)
     except Exception:
         log.warning("오늘 판매량 조회 실패 (무시)")
+    try:
+        sales_30d_map = stats_connector.fetch_product_sales_counts(days=30)
+    except Exception:
+        log.warning("30일 판매량 조회 실패 (무시)")
 
     return [
         {
@@ -61,7 +66,7 @@ def _fetch_naver(
             "image_url": r.get("image_url"),
             "product_url": r.get("product_url"),
             "stock": r.get("stock"),
-            "sales": None,
+            "sales": sales_30d_map.get(str(r.get("product_id", ""))) if sales_30d_map else None,
             "today_sales": today_sales_map.get(str(r.get("product_id", ""))) if today_sales_map else None,
             "price": r.get("price"),
         }

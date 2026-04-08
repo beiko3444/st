@@ -39,7 +39,7 @@ def main() -> int:
     dist_dir = root / "dist"
     dist_dir.mkdir(parents=True, exist_ok=True)
 
-    build_name = _next_build_name(dist_dir, prefix="SmartInventory_v")
+    build_name = "SmartInventory"
     print(f"Building {build_name} ...")
 
     command = [

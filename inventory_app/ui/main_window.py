@@ -289,11 +289,11 @@ class ChannelTab(QWidget):
                 alternate-background-color: #edf2f7;
                 border: 1px solid #d8dee4;
                 gridline-color: #e5e7eb;
-                selection-background-color: #bbf7d0;
+                selection-background-color: rgba(59, 130, 246, 0.18);
                 selection-color: #111827;
             }
             QTableWidget::item:selected {
-                background: #bbf7d0;
+                background: rgba(59, 130, 246, 0.18);
                 color: #111827;
             }
             QHeaderView::section {
@@ -932,13 +932,26 @@ class ChannelTab(QWidget):
 
         self._queue_image(image_label, row.image_url, token)
 
-        # 품절 행 빨간 배경
+        # 품절 행 전체 빨간 배경
         is_soldout = row.stock is not None and int(row.stock) == 0
-        bg = QColor("#fee2e2") if is_soldout else QColor(0, 0, 0, 0)
-        for col in range(5, 10):
+        bg_color = QColor("#fee2e2") if is_soldout else QColor(0, 0, 0, 0)
+        # setItem 기반 컬럼 (4~9)
+        for col in range(4, 10):
             item = self.table.item(index, col)
             if item:
-                item.setBackground(bg)
+                item.setBackground(bg_color)
+        # setCellWidget 기반 컬럼 (0~3): QPalette로 배경색 지정
+        for col in range(0, 4):
+            widget = self.table.cellWidget(index, col)
+            if widget:
+                if is_soldout:
+                    p = widget.palette()
+                    p.setColor(widget.backgroundRole(), QColor("#fee2e2"))
+                    widget.setPalette(p)
+                    widget.setAutoFillBackground(True)
+                else:
+                    widget.setAutoFillBackground(False)
+                    widget.setPalette(self.table.palette())
 
     def _render_table(self, rows: List[ChannelProduct]) -> None:
         self.render_token += 1
@@ -1205,11 +1218,11 @@ class InventoryManagementTab(QWidget):
                 alternate-background-color: #edf2f7;
                 border: 1px solid #d8dee4;
                 gridline-color: #e5e7eb;
-                selection-background-color: #bbf7d0;
+                selection-background-color: rgba(59, 130, 246, 0.18);
                 selection-color: #111827;
             }
             QTableWidget::item:selected {
-                background: #bbf7d0;
+                background: rgba(59, 130, 246, 0.18);
                 color: #111827;
             }
             QHeaderView::section {
@@ -1748,11 +1761,11 @@ class RevenueTab(QWidget):
                 alternate-background-color: #edf2f7;
                 border: 1px solid #d8dee4;
                 gridline-color: #e5e7eb;
-                selection-background-color: #bbf7d0;
+                selection-background-color: rgba(59, 130, 246, 0.18);
                 selection-color: #111827;
             }
             QTableWidget::item:selected {
-                background: #bbf7d0;
+                background: rgba(59, 130, 246, 0.18);
                 color: #111827;
             }
             QHeaderView::section {
@@ -2203,11 +2216,11 @@ class KeywordRevenueTab(QWidget):
                 alternate-background-color: #edf2f7;
                 border: 1px solid #d8dee4;
                 gridline-color: #e5e7eb;
-                selection-background-color: #bbf7d0;
+                selection-background-color: rgba(59, 130, 246, 0.18);
                 selection-color: #14532d;
             }
             QTableWidget::item:selected {
-                background: #bbf7d0;
+                background: rgba(59, 130, 246, 0.18);
                 color: #14532d;
             }
             QHeaderView::section {
@@ -2497,6 +2510,10 @@ class MainWindow(QMainWindow):
         self.favorite_shortcut = QShortcut(QKeySequence(Qt.Key_QuoteLeft), self)
         self.favorite_shortcut.setContext(Qt.ApplicationShortcut)
         self.favorite_shortcut.activated.connect(self._toggle_favorite_on_current_tab)
+        # ₩ 키 (한국 키보드) 즐겨찾기
+        self.favorite_shortcut_krw = QShortcut(QKeySequence(0x20A9), self)
+        self.favorite_shortcut_krw.setContext(Qt.ApplicationShortcut)
+        self.favorite_shortcut_krw.activated.connect(self._toggle_favorite_on_current_tab)
 
         self.tab_shortcut_1 = QShortcut(QKeySequence("1"), self)
         self.tab_shortcut_1.setContext(Qt.ApplicationShortcut)
@@ -2704,10 +2721,12 @@ class MainWindow(QMainWindow):
                 except Exception:
                     return ts
 
+            naver_cnt = data.get("naver_collections", 0)
+            coupang_cnt = data.get("coupang_collections", 0)
             msg = (
                 f"✅ 정상 작동 중\n\n"
-                f"네이버 마지막 수집: {_fmt(naver_ts)}\n"
-                f"쿠팡 마지막 수집:   {_fmt(coupang_ts)}\n"
+                f"네이버 마지막 수집: {_fmt(naver_ts)}  ({naver_cnt:,}회)\n"
+                f"쿠팡 마지막 수집:   {_fmt(coupang_ts)}  ({coupang_cnt:,}회)\n"
                 f"총 누적 레코드:     {records:,}건"
             )
         except Exception as e:

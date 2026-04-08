@@ -59,6 +59,8 @@ class Handler(BaseHTTPRequestHandler):
                 "records": db.count_records(),
                 "naver_last_updated": db.get_last_updated("naver"),
                 "coupang_last_updated": db.get_last_updated("coupang"),
+                "naver_collections": db.get_collection_count("naver"),
+                "coupang_collections": db.get_collection_count("coupang"),
             })
 
         else:

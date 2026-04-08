@@ -177,6 +177,14 @@ class InventoryHistoryDB:
             result = cursor.fetchone()
             return result[0] if result else None
 
+    def get_collection_count(self, channel: str) -> int:
+        with self._guard, self._connection() as conn:
+            cursor = conn.execute(
+                "SELECT COUNT(DISTINCT recorded_at) FROM inventory_history WHERE channel = ?",
+                (channel,),
+            )
+            return cursor.fetchone()[0]
+
     def count_records(self) -> int:
         with self._guard, self._connection() as conn:
             cursor = conn.execute("SELECT COUNT(*) FROM inventory_history")
