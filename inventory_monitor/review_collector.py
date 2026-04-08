@@ -53,7 +53,7 @@ def _create_driver():
 
 
 def _collect_naver_reviews(db: InventoryHistoryDB) -> int:
-    """스마트스토어 리뷰 수 수집 — 비공개 API 시도 후 Selenium 폴백."""
+    """스마트스토어 리뷰 수 수집 — Selenium으로 상품 페이지 스크래핑."""
     products = db.get_latest_snapshot("naver")
     if not products:
         log.info("네이버 상품 없음, 건너뜀")
@@ -62,28 +62,29 @@ def _collect_naver_reviews(db: InventoryHistoryDB) -> int:
     results: list[dict] = []
     driver = None
 
+    naver_patterns = [
+        r'리뷰\s*[\(（]?\s*([\d,]+)\s*[\)）]?',
+        r'구매후기\s*[\(（]\s*([\d,]+)\s*[\)）]',
+        r'review.*?(\d[\d,]*)',
+    ]
+
     for p in products:
         product_url = p.get("product_url") or ""
         product_id = p.get("product_id", "")
         name = p.get("name", "")
         image_url = p.get("image_url")
 
-        # 비공개 API 시도
-        review_count = _naver_api_review_count(product_url)
+        if not product_url:
+            continue
 
-        # Selenium 폴백
-        if review_count is None and product_url:
-            if driver is None:
-                try:
-                    driver = _create_driver()
-                except Exception as e:
-                    log.error("Selenium 드라이버 생성 실패: %s", e)
-                    break
-            review_count = _selenium_review_count(driver, product_url, [
-                r'리뷰\s*[\(（]?\s*([\d,]+)\s*[\)）]?',
-                r'구매후기\s*[\(（]\s*([\d,]+)\s*[\)）]',
-                r'review.*?(\d[\d,]*)',
-            ])
+        if driver is None:
+            try:
+                driver = _create_driver()
+            except Exception as e:
+                log.error("Selenium 드라이버 생성 실패: %s", e)
+                break
+
+        review_count = _selenium_review_count(driver, product_url, naver_patterns)
 
         if review_count is not None:
             results.append({
@@ -103,45 +104,6 @@ def _collect_naver_reviews(db: InventoryHistoryDB) -> int:
         log.info("네이버 리뷰 %d건 저장", n)
         return n
     return 0
-
-
-def _naver_api_review_count(product_url: str) -> int | None:
-    """네이버 비공개 API로 리뷰 수 조회 시도."""
-    import httpx
-
-    if not product_url:
-        return None
-
-    match = re.search(r"/products/(\d+)", product_url)
-    if not match:
-        return None
-    product_no = match.group(1)
-
-    urls_to_try = [
-        f"https://smartstore.naver.com/i/v1/contents/reviews/total-count?originProductNo={product_no}",
-    ]
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Referer": product_url,
-    }
-
-    for url in urls_to_try:
-        try:
-            resp = httpx.get(url, headers=headers, timeout=10, follow_redirects=True)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, dict):
-                    for key in ("totalCount", "reviewCount", "count", "totalReviewCount"):
-                        if key in data:
-                            return int(data[key])
-                    if "data" in data and isinstance(data["data"], dict):
-                        for key in ("totalCount", "reviewCount", "count"):
-                            if key in data["data"]:
-                                return int(data["data"][key])
-        except Exception:
-            continue
-    return None
 
 
 def _selenium_review_count(driver, url: str, patterns: list[str]) -> int | None:
