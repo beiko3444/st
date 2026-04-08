@@ -315,7 +315,10 @@ class ChannelTab(QWidget):
         if not rows:
             return
         self.rows = list(rows)
+        migrated = self._migrate_legacy_favorite_keys()
         self._apply_filters()
+        if migrated:
+            self.favorites_changed.emit(self.channel_name)
         summary = f"{self.channel_name} 캐시 로드: {len(self.rows)}건"
         if warnings:
             summary += f" | 경고 {len(warnings)}건"
@@ -353,8 +356,9 @@ class ChannelTab(QWidget):
         self.rows = list(rows) if isinstance(rows, list) else []
         warning_messages = list(warnings) if isinstance(warnings, list) else []
         changed_count = self._changed_row_count(previous_rows, self.rows)
+        migrated = self._migrate_legacy_favorite_keys()
 
-        if changed_count > 0:
+        if changed_count > 0 or migrated:
             self._apply_filters()
             self.favorites_changed.emit(self.channel_name)
 
@@ -408,6 +412,58 @@ class ChannelTab(QWidget):
         if row.product_url:
             return f"url:{row.product_url}"
         return f"name:{row.name}"
+
+    @staticmethod
+    def _legacy_favorite_key(row: ChannelProduct) -> str:
+        return "|".join(
+            [
+                row.product_id,
+                row.product_url or "",
+                row.name,
+                str(row.price) if row.price is not None else "",
+            ]
+        )
+
+    def _find_legacy_favorite_key(self, row: ChannelProduct) -> str | None:
+        legacy_exact = self._legacy_favorite_key(row)
+        if legacy_exact in self.favorite_keys:
+            return legacy_exact
+
+        # Backward compatibility for old favorite keys that started with product_id.
+        if row.product_id:
+            prefix = f"{row.product_id}|"
+            for key in self.favorite_keys:
+                if key.startswith(prefix) and key.count("|") >= 3:
+                    return key
+
+        # Fallback for old keys that can be identified by product_url.
+        if row.product_url:
+            marker = f"|{row.product_url}|"
+            for key in self.favorite_keys:
+                if marker in key and key.count("|") >= 3:
+                    return key
+        return None
+
+    def _migrate_legacy_favorite_keys(self) -> bool:
+        if not self.favorite_keys or not self.rows:
+            return False
+
+        migrated = False
+        for row in self.rows:
+            canonical_key = self._favorite_key(row)
+            if canonical_key in self.favorite_keys:
+                continue
+
+            legacy_key = self._find_legacy_favorite_key(row)
+            if not legacy_key:
+                continue
+
+            self.favorite_keys.discard(legacy_key)
+            self.favorite_keys.add(canonical_key)
+            self.cache.save_favorite(self.channel_name, legacy_key, False)
+            self.cache.save_favorite(self.channel_name, canonical_key, True)
+            migrated = True
+        return migrated
 
     def _is_favorite(self, row: ChannelProduct) -> bool:
         return self._favorite_key(row) in self.favorite_keys
@@ -1166,6 +1222,14 @@ class InventoryManagementTab(QWidget):
             item.setData(Qt.UserRole, sort_value)
         return item
 
+    @staticmethod
+    def _channel_cell_colors(channel: str) -> tuple[QColor, QColor]:
+        if channel == "쿠팡":
+            return QColor("#dbeafe"), QColor("#1d4ed8")
+        if channel == "네이버":
+            return QColor("#dcfce7"), QColor("#15803d")
+        return QColor("#f1f5f9"), QColor("#334155")
+
     def _ensure_cost_map(self, channel: str) -> dict[str, int]:
         channel_key = str(channel).strip()
         overrides = self.cost_overrides_by_channel.get(channel_key)
@@ -1294,10 +1358,14 @@ class InventoryManagementTab(QWidget):
 
         for index, row in enumerate(rows):
             self.table.setRowHeight(index, 56)
+            channel_bg, channel_fg = self._channel_cell_colors(row.channel)
+            channel_item = self._table_item(row.channel, Qt.AlignCenter, row.channel)
+            channel_item.setBackground(channel_bg)
+            channel_item.setForeground(channel_fg)
             self.table.setItem(
                 index,
                 0,
-                self._table_item(row.channel, Qt.AlignCenter, row.channel),
+                channel_item,
             )
             self.table.setItem(
                 index,

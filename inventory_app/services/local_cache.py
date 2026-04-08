@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -31,8 +32,16 @@ class ChannelProductCache:
         conn.execute("PRAGMA synchronous=NORMAL;")
         return conn
 
+    @contextmanager
+    def _connection(self) -> sqlite3.Connection:
+        conn = self._connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
+
     def _ensure_schema(self) -> None:
-        with self._guard, self._connect() as conn:
+        with self._guard, self._connection() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS channel_products (
@@ -94,7 +103,7 @@ class ChannelProductCache:
 
     def save_rows(self, channel: str, rows: List[ChannelProduct]) -> None:
         channel_key = str(channel).strip().lower()
-        with self._guard, self._connect() as conn:
+        with self._guard, self._connection() as conn:
             conn.execute("DELETE FROM channel_products WHERE channel = ?", (channel_key,))
             for row_no, row in enumerate(rows, start=1):
                 conn.execute(
@@ -123,7 +132,7 @@ class ChannelProductCache:
 
     def load_rows(self, channel: str) -> List[ChannelProduct]:
         channel_key = str(channel).strip().lower()
-        with self._guard, self._connect() as conn:
+        with self._guard, self._connection() as conn:
             cursor = conn.execute(
                 """
                 SELECT
@@ -161,7 +170,7 @@ class ChannelProductCache:
 
     def load_name_overrides(self, channel: str) -> Dict[str, str]:
         channel_key = str(channel).strip().lower()
-        with self._guard, self._connect() as conn:
+        with self._guard, self._connection() as conn:
             cursor = conn.execute(
                 """
                 SELECT product_key, custom_name
@@ -187,7 +196,7 @@ class ChannelProductCache:
         if not item_key:
             return
 
-        with self._guard, self._connect() as conn:
+        with self._guard, self._connection() as conn:
             if value:
                 conn.execute(
                     """
@@ -214,7 +223,7 @@ class ChannelProductCache:
 
     def load_favorite_keys(self, channel: str) -> set[str]:
         channel_key = str(channel).strip().lower()
-        with self._guard, self._connect() as conn:
+        with self._guard, self._connection() as conn:
             cursor = conn.execute(
                 """
                 SELECT product_key
@@ -238,7 +247,7 @@ class ChannelProductCache:
         if not item_key:
             return
 
-        with self._guard, self._connect() as conn:
+        with self._guard, self._connection() as conn:
             if is_favorite:
                 conn.execute(
                     """
@@ -264,7 +273,7 @@ class ChannelProductCache:
 
     def load_cost_overrides(self, channel: str) -> Dict[str, int]:
         channel_key = str(channel).strip().lower()
-        with self._guard, self._connect() as conn:
+        with self._guard, self._connection() as conn:
             cursor = conn.execute(
                 """
                 SELECT product_key, unit_cost
@@ -292,7 +301,7 @@ class ChannelProductCache:
         if not item_key:
             return
 
-        with self._guard, self._connect() as conn:
+        with self._guard, self._connection() as conn:
             if unit_cost is None:
                 conn.execute(
                     """
