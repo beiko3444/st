@@ -1,0 +1,17 @@
+[Unit]
+Description=Smart Inventory Monitor (10분 간격 재고 수집)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/pi/st
+ExecStart=/usr/bin/python3 /home/pi/st/inventory_monitor/monitor.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
