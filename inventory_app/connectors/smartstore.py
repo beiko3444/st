@@ -446,19 +446,18 @@ class SmartStoreConnector:
                 channel_products = group.get("channelProducts") or []
                 for product in channel_products:
                     image_data = product.get("representativeImage") or {}
+                    origin_no = product.get("originProductNo")
+                    channel_no = product.get("channelProductNo")
                     results.append(
                         {
                             "channel": "스마트스토어",
-                            "product_id": str(
-                                product.get("channelProductNo")
-                                or product.get("originProductNo")
-                                or ""
-                            ),
+                            # stats API는 originProductNo 기준 → 판매량 매칭을 위해 우선 사용
+                            "product_id": str(origin_no or channel_no or ""),
                             "item_id": None,
                             "name": str(product.get("name") or ""),
                             "image_url": self._normalize_image_url(image_data.get("url")),
                             "product_url": self._build_product_url(
-                                product.get("channelProductNo"),
+                                origin_no or channel_no,
                                 str(product.get("name") or ""),
                             ),
                             "stock": self._to_int(product.get("stockQuantity")),
