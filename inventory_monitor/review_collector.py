@@ -74,7 +74,7 @@ def _collect_naver_reviews(db: InventoryHistoryDB) -> int:
             log.info("  네이버 [%s] 리뷰: %d", name[:30], review_count)
 
         # 429 방지 딜레이
-        time.sleep(1)
+        time.sleep(3)
 
     if results:
         n = db.insert_reviews("naver", results)
@@ -86,35 +86,43 @@ def _collect_naver_reviews(db: InventoryHistoryDB) -> int:
 def _naver_mobile_review_count(product_url: str) -> int | None:
     """모바일 스마트스토어 페이지에서 meta 태그로 리뷰 수 파싱.
     <meta name="review_count" content="123">
+    429 발생 시 최대 2회 재시도 (대기 후).
     """
-    # PC URL → 모바일 URL 변환
     mobile_url = product_url.replace(
         "://smartstore.naver.com/", "://m.smartstore.naver.com/"
     )
 
-    try:
-        resp = httpx.get(
-            mobile_url,
-            headers={"User-Agent": _MOBILE_UA},
-            follow_redirects=True,
-            timeout=15,
-        )
-        if resp.status_code != 200:
+    for attempt in range(3):
+        try:
+            resp = httpx.get(
+                mobile_url,
+                headers={"User-Agent": _MOBILE_UA},
+                follow_redirects=True,
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                wait = 10 * (attempt + 1)
+                log.info("  429 rate limit, %d초 대기 후 재시도...", wait)
+                time.sleep(wait)
+                continue
+
+            if resp.status_code != 200:
+                return None
+
+            html = resp.text
+            match = re.search(r'name=["\']review_count["\'][^>]*content=["\'](\d+)["\']', html)
+            if match:
+                return int(match.group(1))
+
+            match = re.search(r'review_count["\'][^>]*content=["\'](\d+)', html)
+            if match:
+                return int(match.group(1))
+
             return None
 
-        html = resp.text
-        # <meta name="review_count" content="3">
-        match = re.search(r'name=["\']review_count["\'][^>]*content=["\'](\d+)["\']', html)
-        if match:
-            return int(match.group(1))
-
-        # review_rating + review_count (순서 바뀔 수 있음)
-        match = re.search(r'review_count["\'][^>]*content=["\'](\d+)', html)
-        if match:
-            return int(match.group(1))
-
-    except Exception as e:
-        log.warning("네이버 모바일 실패 [%s]: %s", product_url[:50], e)
+        except Exception as e:
+            log.warning("네이버 모바일 실패 [%s]: %s", product_url[:50], e)
+            return None
     return None
 
 
