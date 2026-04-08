@@ -451,8 +451,8 @@ class SmartStoreConnector:
                     results.append(
                         {
                             "channel": "스마트스토어",
-                            # stats API는 originProductNo 기준 → 판매량 매칭을 위해 우선 사용
-                            "product_id": str(origin_no or channel_no or ""),
+                            # stats API는 channelProductNo 기준 → 판매량 매칭을 위해 channelProductNo 우선
+                            "product_id": str(channel_no or origin_no or ""),
                             "item_id": None,
                             "name": str(product.get("name") or ""),
                             "image_url": self._normalize_image_url(image_data.get("url")),
