@@ -70,6 +70,25 @@ class InventoryHistoryDB:
                 """CREATE INDEX IF NOT EXISTS idx_history_product
                    ON inventory_history(channel, product_id, item_id, recorded_at)"""
             )
+            # 리뷰 이력 테이블
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS review_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel TEXT NOT NULL,
+                    product_id TEXT NOT NULL,
+                    name TEXT,
+                    image_url TEXT,
+                    review_count INTEGER,
+                    review_score REAL,
+                    recorded_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_review_product
+                   ON review_history(channel, product_id, recorded_at)"""
+            )
             conn.commit()
 
     def _load_last_data(self, conn: sqlite3.Connection, channel: str) -> dict[tuple, dict]:
@@ -189,3 +208,140 @@ class InventoryHistoryDB:
         with self._guard, self._connection() as conn:
             cursor = conn.execute("SELECT COUNT(*) FROM inventory_history")
             return cursor.fetchone()[0]
+
+    # ── 판매일보 관련 ──
+
+    def get_sales_for_date(self, date_str: str) -> List[dict]:
+        """특정 날짜의 판매 내역 (재고 감소분) 반환.
+        date_str: 'YYYY-MM-DD'
+        """
+        with self._guard, self._connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT
+                    a.channel,
+                    a.product_id,
+                    a.item_id,
+                    a.name,
+                    a.image_url,
+                    a.product_url,
+                    a.price,
+                    a.recorded_at,
+                    b.stock AS stock_before,
+                    a.stock AS stock_after,
+                    (b.stock - a.stock) AS qty_sold
+                FROM inventory_history a
+                JOIN inventory_history b
+                    ON a.channel = b.channel
+                    AND a.product_id = b.product_id
+                    AND (a.item_id = b.item_id OR (a.item_id IS NULL AND b.item_id IS NULL))
+                    AND b.id = (
+                        SELECT MAX(id) FROM inventory_history c
+                        WHERE c.channel = a.channel
+                          AND c.product_id = a.product_id
+                          AND (c.item_id = a.item_id OR (c.item_id IS NULL AND a.item_id IS NULL))
+                          AND c.id < a.id
+                    )
+                WHERE DATE(a.recorded_at) = ?
+                  AND a.stock < b.stock
+                ORDER BY a.recorded_at DESC
+                """,
+                (date_str,),
+            )
+            cols = [
+                "channel", "product_id", "item_id", "name", "image_url",
+                "product_url", "price", "recorded_at",
+                "stock_before", "stock_after", "qty_sold",
+            ]
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    def get_sales_dates(self) -> dict[str, int]:
+        """판매(재고 감소)가 있었던 날짜별 건수 반환. {'2026-04-08': 5, ...}"""
+        with self._guard, self._connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT DATE(a.recorded_at) AS sale_date, COUNT(*) AS cnt
+                FROM inventory_history a
+                JOIN inventory_history b
+                    ON a.channel = b.channel
+                    AND a.product_id = b.product_id
+                    AND (a.item_id = b.item_id OR (a.item_id IS NULL AND b.item_id IS NULL))
+                    AND b.id = (
+                        SELECT MAX(id) FROM inventory_history c
+                        WHERE c.channel = a.channel
+                          AND c.product_id = a.product_id
+                          AND (c.item_id = a.item_id OR (c.item_id IS NULL AND a.item_id IS NULL))
+                          AND c.id < a.id
+                    )
+                WHERE a.stock < b.stock
+                GROUP BY sale_date
+                ORDER BY sale_date DESC
+                """
+            )
+            return {row[0]: row[1] for row in cursor.fetchall()}
+
+    def get_daily_summary(self, date_str: str) -> dict:
+        """특정 날짜의 판매 요약 (총 건수, 추정매출)."""
+        rows = self.get_sales_for_date(date_str)
+        total_qty = sum(r["qty_sold"] for r in rows)
+        total_revenue = sum(
+            r["qty_sold"] * r["price"]
+            for r in rows
+            if r["price"] is not None
+        )
+        channels = set(r["channel"] for r in rows)
+        return {
+            "date": date_str,
+            "total_events": len(rows),
+            "total_qty": total_qty,
+            "total_revenue": total_revenue,
+            "channels": sorted(channels),
+        }
+
+    # ── 리뷰 이력 관련 ──
+
+    def insert_reviews(self, channel: str, rows: List[dict], recorded_at: datetime | None = None) -> int:
+        if recorded_at is None:
+            recorded_at = datetime.now()
+        ts = recorded_at.isoformat()
+        inserted = 0
+        with self._guard, self._connection() as conn:
+            for row in rows:
+                conn.execute(
+                    """
+                    INSERT INTO review_history
+                        (channel, product_id, name, image_url, review_count, review_score, recorded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        channel,
+                        str(row.get("product_id", "")),
+                        row.get("name"),
+                        row.get("image_url"),
+                        row.get("review_count"),
+                        row.get("review_score"),
+                        ts,
+                    ),
+                )
+                inserted += 1
+            conn.commit()
+        return inserted
+
+    def get_latest_reviews(self, channel: str) -> List[dict]:
+        with self._guard, self._connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT product_id, name, image_url, review_count, review_score, recorded_at
+                FROM review_history r1
+                WHERE channel = ?
+                  AND id = (
+                      SELECT MAX(id) FROM review_history r2
+                      WHERE r2.channel = r1.channel
+                        AND r2.product_id = r1.product_id
+                  )
+                ORDER BY review_count DESC
+                """,
+                (channel,),
+            )
+            cols = ["product_id", "name", "image_url", "review_count", "review_score", "recorded_at"]
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]

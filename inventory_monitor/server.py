@@ -42,7 +42,13 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/inventory":
+        from urllib.parse import urlparse, parse_qs
+
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+
+        if path == "/inventory":
             try:
                 naver = db.get_latest_snapshot("naver")
                 coupang = db.get_latest_snapshot("coupang")
@@ -53,7 +59,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
-        elif self.path in ("/health", "/status"):
+        elif path in ("/health", "/status"):
             self._send_json({
                 "status": "ok",
                 "records": db.count_records(),
@@ -62,6 +68,36 @@ class Handler(BaseHTTPRequestHandler):
                 "naver_collections": db.get_collection_count("naver"),
                 "coupang_collections": db.get_collection_count("coupang"),
             })
+
+        elif path == "/sales":
+            # /sales?date=2026-04-08
+            date_str = qs.get("date", [None])[0]
+            if not date_str:
+                self._send_json({"error": "date parameter required"}, 400)
+                return
+            try:
+                sales = db.get_sales_for_date(date_str)
+                summary = db.get_daily_summary(date_str)
+                self._send_json({"summary": summary, "sales": sales})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/sales/dates":
+            # 판매가 있었던 날짜 목록
+            try:
+                dates = db.get_sales_dates()
+                self._send_json({"dates": dates})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/reviews":
+            # 최신 리뷰 수
+            try:
+                naver = db.get_latest_reviews("naver")
+                coupang = db.get_latest_reviews("coupang")
+                self._send_json({"naver": naver, "coupang": coupang})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
 
         else:
             self._send_json({"error": "not found"}, 404)

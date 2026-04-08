@@ -172,8 +172,21 @@ class NaverChannelService:
         if self.config.monitor_url:
             rows = _fetch_from_monitor(self.config.monitor_url, "naver", self.config.timeout_seconds)
             if rows is not None:
+                warnings: List[str] = ["__pi__"]
+                # 판매량은 실시간 API에서 직접 조회
+                sales_map = self._fetch_sales_map(warnings)
+                if sales_map is not None:
+                    for row in rows:
+                        row.sales = sales_map.get(row.product_id, 0)
+                # 오늘 판매량도 실시간 API에서 조회
+                try:
+                    today_map = self.smartstore_stats.fetch_product_sales_counts(days=1)
+                    for row in rows:
+                        row.today_sales = today_map.get(row.product_id)
+                except Exception:
+                    pass
                 _assign_serial_by_sales(rows)
-                return rows, ["__pi__"]
+                return rows, warnings
 
         synced_at = datetime.now()
         warnings: List[str] = []

@@ -6,10 +6,19 @@ from dataclasses import dataclass
 from typing import Any, Callable, List
 
 import httpx
-from PySide6.QtCore import QEvent, QObject, QThread, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QCloseEvent, QColor, QDesktopServices, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QDate, QEvent, QObject, QThread, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import (
+    QCloseEvent,
+    QColor,
+    QDesktopServices,
+    QKeySequence,
+    QPixmap,
+    QShortcut,
+    QTextCharFormat,
+)
 from PySide6.QtWidgets import (
     QApplication,
+    QCalendarWidget,
     QComboBox,
     QHeaderView,
     QHBoxLayout,
@@ -2455,6 +2464,242 @@ class KeywordRevenueTab(QWidget):
                 self.worker.wait(2000)
 
 
+class SalesDailyTab(QWidget):
+    """판매일보 탭 — 캘린더에서 날짜 클릭 시 해당 일자 판매 내역을 표시."""
+
+    image_downloaded = Signal(str, object)
+
+    def __init__(self, monitor_url: str | None = None, timeout: int = 30) -> None:
+        super().__init__()
+        self.monitor_url = monitor_url
+        self.timeout = timeout
+        self.image_cache: dict[str, QPixmap] = {}
+        self._image_pending: set[str] = set()
+        self._image_waiters: dict[str, list[tuple[QLabel, int]]] = {}
+        self.render_token = 0
+        self.image_executor = ThreadPoolExecutor(max_workers=6)
+        self.image_downloaded.connect(self._on_image_downloaded)
+
+        self._sales_dates: dict[str, int] = {}
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(12)
+
+        # 왼쪽: 캘린더 + 요약
+        left = QVBoxLayout()
+        self.calendar = QCalendarWidget()
+        self.calendar.setGridVisible(True)
+        self.calendar.setFixedWidth(320)
+        self.calendar.setFixedHeight(260)
+        self.calendar.clicked.connect(self._on_date_selected)
+        left.addWidget(self.calendar)
+
+        self.summary_label = QLabel("날짜를 선택하세요")
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setStyleSheet(
+            "font-size: 13px; padding: 8px; background: #f8fafc; "
+            "border: 1px solid #e2e8f0; border-radius: 8px;"
+        )
+        left.addWidget(self.summary_label)
+        left.addStretch(1)
+        layout.addLayout(left, 0)
+
+        # 오른쪽: 판매 테이블
+        right = QVBoxLayout()
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            ["이미지", "상품명", "채널", "판매수량", "단가", "추정매출", "시각"]
+        )
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        for c, w in [(0, 52), (2, 60), (3, 72), (4, 80), (5, 90), (6, 130)]:
+            self.table.setColumnWidth(c, w)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setStyleSheet(
+            """
+            QTableWidget {
+                gridline-color: #e8ecf0;
+                font-size: 12px;
+                selection-background-color: rgba(59, 130, 246, 0.18);
+            }
+            QHeaderView::section {
+                background: #f1f5f9;
+                border: none;
+                border-bottom: 2px solid #d0d7de;
+                padding: 6px;
+                font-weight: 700;
+            }
+            """
+        )
+        right.addWidget(self.table, 1)
+        layout.addLayout(right, 1)
+
+        # 초기 로드: 판매 날짜 목록
+        self._load_sales_dates()
+
+    def _load_sales_dates(self) -> None:
+        if not self.monitor_url:
+            return
+        try:
+            resp = httpx.get(
+                f"{self.monitor_url.rstrip('/')}/sales/dates",
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            self._sales_dates = resp.json().get("dates", {})
+            self._highlight_calendar()
+        except Exception:
+            pass
+
+    def _highlight_calendar(self) -> None:
+        """판매 이벤트가 있는 날짜에 마커 표시."""
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor("#dbeafe"))
+        fmt.setForeground(QColor("#1e40af"))
+        for date_str in self._sales_dates:
+            try:
+                parts = date_str.split("-")
+                qd = QDate(int(parts[0]), int(parts[1]), int(parts[2]))
+                self.calendar.setDateTextFormat(qd, fmt)
+            except Exception:
+                continue
+
+    def _on_date_selected(self, qdate: QDate) -> None:
+        date_str = qdate.toString("yyyy-MM-dd")
+        self.render_token += 1
+        self.table.setRowCount(0)
+        self.summary_label.setText(f"{date_str} 조회 중...")
+
+        if not self.monitor_url:
+            self.summary_label.setText("라즈베리파이 미연결")
+            return
+
+        try:
+            resp = httpx.get(
+                f"{self.monitor_url.rstrip('/')}/sales?date={date_str}",
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            self.summary_label.setText(f"조회 실패: {e}")
+            return
+
+        summary = data.get("summary", {})
+        sales = data.get("sales", [])
+
+        # 요약
+        total_qty = summary.get("total_qty", 0)
+        total_rev = summary.get("total_revenue", 0)
+        channels = summary.get("channels", [])
+        ch_text = " / ".join(
+            ("네이버" if c == "naver" else "쿠팡") for c in channels
+        ) or "없음"
+        self.summary_label.setText(
+            f"<b>{date_str} 판매일보</b><br>"
+            f"채널: {ch_text}<br>"
+            f"총 판매: <b>{total_qty}건</b><br>"
+            f"추정 매출: <b>₩{total_rev:,.0f}</b>"
+        )
+
+        # 테이블
+        self.table.setRowCount(len(sales))
+        token = self.render_token
+        for i, s in enumerate(sales):
+            self.table.setRowHeight(i, 50)
+
+            # 이미지
+            img_label = ProductImageLabel()
+            img_url = s.get("image_url")
+            if img_url:
+                img_label.set_product_url(s.get("product_url"))
+                self._request_image(img_label, img_url, token)
+            self.table.setCellWidget(i, 0, img_label)
+
+            # 상품명
+            name = s.get("name", "")
+            ch = "N" if s.get("channel") == "naver" else "C"
+            qty = s.get("qty_sold", 0)
+            price = s.get("price")
+            rev = (qty * price) if price else None
+            recorded = s.get("recorded_at", "")
+            time_part = recorded[11:16] if len(recorded) >= 16 else recorded
+
+            items = [
+                (1, name, name),
+                (2, ch, ch),
+                (3, f"{qty}", qty),
+                (4, f"₩{price:,}" if price else "-", price or 0),
+                (5, f"₩{rev:,}" if rev else "-", rev or 0),
+                (6, time_part, recorded),
+            ]
+            for col, text, sort_val in items:
+                item = SortableTableItem(text)
+                item.setData(Qt.UserRole, sort_val)
+                item.setTextAlignment(Qt.AlignCenter if col != 1 else Qt.AlignVCenter | Qt.AlignLeft)
+                self.table.setItem(i, col, item)
+
+        self.table.setSortingEnabled(True)
+
+    def _request_image(self, label: QLabel, url: str, token: int) -> None:
+        normalized = url.strip()
+        if not normalized:
+            return
+        cached = self.image_cache.get(normalized)
+        if cached:
+            self._set_label_pixmap(label, cached)
+            return
+        self._image_waiters.setdefault(normalized, []).append((label, token))
+        if normalized in self._image_pending:
+            return
+        self._image_pending.add(normalized)
+        future = self.image_executor.submit(ChannelTab._download_image_bytes, normalized)
+        future.add_done_callback(
+            lambda f, u=normalized: self._emit_image_downloaded(u, f)
+        )
+
+    def _emit_image_downloaded(self, url: str, future: Future[bytes | None]) -> None:
+        try:
+            data = future.result()
+        except Exception:
+            data = None
+        self.image_downloaded.emit(url, data)
+
+    @Slot(str, object)
+    def _on_image_downloaded(self, url: str, data: object) -> None:
+        self._image_pending.discard(url)
+        waiters = self._image_waiters.pop(url, [])
+        if not waiters:
+            return
+        pixmap: QPixmap | None = None
+        if isinstance(data, (bytes, bytearray)):
+            candidate = QPixmap()
+            if candidate.loadFromData(bytes(data)):
+                pixmap = candidate
+                self.image_cache[url] = candidate
+        if pixmap is None:
+            return
+        for label, token in waiters:
+            if token != self.render_token:
+                continue
+            try:
+                self._set_label_pixmap(label, pixmap)
+            except RuntimeError:
+                continue
+
+    @staticmethod
+    def _set_label_pixmap(label: QLabel, pixmap: QPixmap) -> None:
+        scaled = pixmap.scaled(42, 42, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        label.setPixmap(scaled)
+
+    def shutdown(self) -> None:
+        self.image_executor.shutdown(wait=False)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
@@ -2496,6 +2741,10 @@ class MainWindow(QMainWindow):
             initial_fetch_fn=self.coupang_service.fetch_cached,
         )
         self.inventory_tab = InventoryManagementTab()
+        self.sales_daily_tab = SalesDailyTab(
+            monitor_url=config.monitor_url,
+            timeout=config.timeout_seconds,
+        )
         self.revenue_tab = RevenueTab(
             fetch_fn=self.revenue_service.fetch,
             default_days=sales_days,
@@ -2535,6 +2784,14 @@ class MainWindow(QMainWindow):
         self.tab_shortcut_5.setContext(Qt.ApplicationShortcut)
         self.tab_shortcut_5.activated.connect(lambda: self._activate_tab_shortcut(4))
 
+        self.tab_shortcut_6 = QShortcut(QKeySequence("6"), self)
+        self.tab_shortcut_6.setContext(Qt.ApplicationShortcut)
+        self.tab_shortcut_6.activated.connect(lambda: self._activate_tab_shortcut(5))
+
+        self.tab_shortcut_7 = QShortcut(QKeySequence("7"), self)
+        self.tab_shortcut_7.setContext(Qt.ApplicationShortcut)
+        self.tab_shortcut_7.activated.connect(lambda: self._activate_tab_shortcut(6))
+
         self.naver_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.coupang_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.naver_tab.favorites_changed.connect(self._refresh_inventory_tab)
@@ -2560,6 +2817,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.naver_tab, "네이버")
         self.tabs.addTab(self.coupang_tab, "쿠팡")
         self.tabs.addTab(self.inventory_tab, "재고관리")
+        self.tabs.addTab(self.sales_daily_tab, "판매일보")
         self.tabs.addTab(self.revenue_tab, "매출비교")
         self.tabs.addTab(self.keyword_tab, "키워드매출")
         corner = QWidget()
@@ -2777,6 +3035,7 @@ class MainWindow(QMainWindow):
         self.naver_tab.shutdown()
         self.coupang_tab.shutdown()
         self.inventory_tab.shutdown()
+        self.sales_daily_tab.shutdown()
         self.revenue_tab.shutdown()
         self.keyword_tab.shutdown()
         super().closeEvent(event)
