@@ -65,6 +65,22 @@ class InventoryHistoryDB:
             )
             conn.commit()
 
+    def _load_last_stocks(self, conn: sqlite3.Connection, channel: str) -> dict[str, int | None]:
+        """channel의 상품별 마지막 재고량 반환 {product_id: stock}"""
+        cursor = conn.execute(
+            """
+            SELECT product_id, stock
+            FROM inventory_history h1
+            WHERE channel = ?
+              AND id = (
+                  SELECT MAX(id) FROM inventory_history h2
+                  WHERE h2.channel = h1.channel AND h2.product_id = h1.product_id
+              )
+            """,
+            (channel,),
+        )
+        return {row[0]: row[1] for row in cursor.fetchall()}
+
     def insert_rows(
         self,
         channel: str,
@@ -74,28 +90,39 @@ class InventoryHistoryDB:
         if recorded_at is None:
             recorded_at = datetime.now()
         ts = recorded_at.isoformat()
+        inserted = 0
 
         with self._guard, self._connection() as conn:
+            last_stocks = self._load_last_stocks(conn, channel)
+
             for row in rows:
-                conn.execute(
-                    """
-                    INSERT INTO inventory_history
-                        (channel, product_id, item_id, name, stock, sales, price, recorded_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        channel,
-                        str(row.get("product_id", "")),
-                        row.get("item_id"),
-                        str(row.get("name", "")),
-                        row.get("stock"),
-                        row.get("sales"),
-                        row.get("price"),
-                        ts,
-                    ),
-                )
+                product_id = str(row.get("product_id", ""))
+                current_stock = row.get("stock")
+                last_stock = last_stocks.get(product_id, "__NEW__")
+
+                # 처음 보는 상품이거나 재고가 변했을 때만 INSERT
+                if last_stock == "__NEW__" or last_stock != current_stock:
+                    conn.execute(
+                        """
+                        INSERT INTO inventory_history
+                            (channel, product_id, item_id, name, stock, sales, price, recorded_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            channel,
+                            product_id,
+                            row.get("item_id"),
+                            str(row.get("name", "")),
+                            current_stock,
+                            row.get("sales"),
+                            row.get("price"),
+                            ts,
+                        ),
+                    )
+                    inserted += 1
+
             conn.commit()
-        return len(rows)
+        return inserted
 
     def get_latest_snapshot(
         self, channel: str

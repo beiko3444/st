@@ -82,7 +82,7 @@ def _collect_once(
     try:
         naver_rows = _fetch_naver(ss, max_items)
         n_naver = db.insert_rows("naver", naver_rows, recorded_at=now)
-        log.info("스마트스토어: %d개 상품 저장", n_naver)
+        log.info("스마트스토어: %d개 변동 저장 (전체 %d개)", n_naver, len(naver_rows))
     except Exception:
         log.exception("스마트스토어 조회 실패")
 
@@ -90,7 +90,7 @@ def _collect_once(
     try:
         coupang_rows = _fetch_coupang(cp, max_items)
         n_coupang = db.insert_rows("coupang", coupang_rows, recorded_at=now)
-        log.info("쿠팡: %d개 상품 저장", n_coupang)
+        log.info("쿠팡: %d개 변동 저장 (전체 %d개)", n_coupang, len(coupang_rows))
     except Exception:
         log.exception("쿠팡 조회 실패")
 
