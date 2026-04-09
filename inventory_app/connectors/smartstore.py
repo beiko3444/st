@@ -21,19 +21,31 @@ class SmartStoreConnector:
         self.client_id = client_id
         self.client_secret = client_secret
         self.token_type = token_type
-
-        self.api_client = httpx.Client(
-            base_url="https://api.commerce.naver.com/external",
-            timeout=timeout_seconds,
-        )
-        self.partner_client = httpx.Client(
-            base_url="https://api.commerce.naver.com/partner",
-            timeout=timeout_seconds,
-        )
+        self.timeout_seconds = max(3, int(timeout_seconds))
+        self._api_client: Optional[httpx.Client] = None
+        self._partner_client: Optional[httpx.Client] = None
 
         self._access_token: Optional[str] = None
         self._token_expire_at: Optional[datetime] = None
         self._channel_no_cache: Optional[str] = None
+
+    @property
+    def api_client(self) -> httpx.Client:
+        if self._api_client is None:
+            self._api_client = httpx.Client(
+                base_url="https://api.commerce.naver.com/external",
+                timeout=self.timeout_seconds,
+            )
+        return self._api_client
+
+    @property
+    def partner_client(self) -> httpx.Client:
+        if self._partner_client is None:
+            self._partner_client = httpx.Client(
+                base_url="https://api.commerce.naver.com/partner",
+                timeout=self.timeout_seconds,
+            )
+        return self._partner_client
 
     def _create_signature(self, timestamp_ms: int) -> str:
         password = f"{self.client_id}_{timestamp_ms}".encode("utf-8")

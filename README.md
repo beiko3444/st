@@ -92,8 +92,8 @@ macOS/Linux:
 
 빌드 결과:
 
-- Windows: `dist\SmartInventory_v###\SmartInventory_v###.exe`
-- macOS: `dist/SmartInventory_v###.app`
+- Windows: `dist\SmartInventory\SmartInventory.exe`
+- macOS: `dist/SmartInventory.app`
 
 ## 참고
 

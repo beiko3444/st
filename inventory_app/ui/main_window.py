@@ -8,11 +8,12 @@ from typing import Any, Callable, Dict, List
 from urllib.parse import quote_plus
 
 import httpx
-from PySide6.QtCore import QDate, QEvent, QObject, QThread, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QDate, QEvent, QObject, QSettings, QThread, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import (
     QCloseEvent,
     QColor,
     QDesktopServices,
+    QFont,
     QKeySequence,
     QPixmap,
     QShortcut,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCalendarWidget,
     QComboBox,
+    QFontDialog,
     QHeaderView,
     QHBoxLayout,
     QInputDialog,
@@ -63,6 +65,33 @@ class SortableTableItem(QTableWidgetItem):
         if left_value is not None and right_value is not None:
             return left_value < right_value
         return super().__lt__(other)
+
+
+SEARCH_DEBOUNCE_MS = 180
+APP_SETTINGS_ORG = "SmartInventory"
+APP_SETTINGS_APP = "SmartInventory"
+APP_FONT_KEY = "ui/font"
+
+
+def _base_widget_font_css() -> str:
+    app = QApplication.instance()
+    if app is None:
+        return ""
+    font = app.font()
+    family = str(font.family() or "").replace("\\", "\\\\").replace('"', '\\"')
+    point_size = font.pointSizeF()
+    if point_size <= 0:
+        point_size = float(font.pointSize()) if font.pointSize() > 0 else 10.0
+    parts: list[str] = []
+    if family:
+        parts.append(f'font-family: "{family}";')
+    if point_size > 0:
+        parts.append(f"font-size: {point_size:g}pt;")
+    return " ".join(parts)
+
+
+def _with_base_widget_font(stylesheet: str) -> str:
+    return stylesheet.replace("__BASE_WIDGET_FONT_CSS__", _base_widget_font_css())
 
 
 def _normalize_web_url(url: str | None) -> str | None:
@@ -137,6 +166,31 @@ class ChannelSyncWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class StartupSharedStockSyncWorker(QThread):
+    completed = Signal(object, int)
+
+    def __init__(
+        self,
+        flush_fn: Callable[[], int],
+        fetch_fn: Callable[[], Dict[str, SharedStockRule]],
+    ) -> None:
+        super().__init__()
+        self.flush_fn = flush_fn
+        self.fetch_fn = fetch_fn
+
+    def run(self) -> None:
+        synced_pending = 0
+        try:
+            synced_pending = int(self.flush_fn() or 0)
+        except Exception:
+            synced_pending = 0
+        try:
+            remote_rules = self.fetch_fn()
+        except Exception:
+            remote_rules = None
+        self.completed.emit(remote_rules, synced_pending)
+
+
 class ProductImageLabel(QLabel):
     clicked = Signal(str)
 
@@ -162,6 +216,30 @@ class ProductImageLabel(QLabel):
             event.accept()
             return
         super().mousePressEvent(event)
+
+
+class ClickableImageContainer(QWidget):
+    clicked = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._product_url: str | None = None
+
+    def set_product_url(self, url: str | None) -> None:
+        self._product_url = _normalize_web_url(url)
+        if self._product_url:
+            self.setCursor(Qt.PointingHandCursor)
+            self.setToolTip("이미지 클릭 시 상품페이지 열기")
+        else:
+            self.setCursor(Qt.ArrowCursor)
+            self.setToolTip("")
+
+    def mouseReleaseEvent(self, event: Any) -> None:
+        if event.button() == Qt.LeftButton and self._product_url:
+            self.clicked.emit(self._product_url)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class EditableNameLabel(QLabel):
@@ -210,6 +288,8 @@ class ChannelTab(QWidget):
         self.channel_code = self._resolve_channel_code(self.channel_name)
 
         self.worker: ChannelSyncWorker | None = None
+        self.startup_shared_stock_worker: StartupSharedStockSyncWorker | None = None
+        self._initial_rows_loaded = False
         self.rows: List[ChannelProduct] = []
         self.filtered_rows: List[ChannelProduct] = []
         self.cache = ChannelProductCache()
@@ -226,6 +306,10 @@ class ChannelTab(QWidget):
 
         self.sort_column = 5
         self.sort_order = Qt.DescendingOrder
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(SEARCH_DEBOUNCE_MS)
+        self._filter_timer.timeout.connect(self._apply_filters)
 
         self.sync_button = QPushButton("동기화")
         self.favorite_filter = QComboBox()
@@ -239,15 +323,21 @@ class ChannelTab(QWidget):
         self._today_detail_date: str | None = None
         self._today_sales_events_by_exact: Dict[str, List[dict]] = {}
         self._today_sales_events_by_product: Dict[str, List[dict]] = {}
+        self._defer_detail_fetch_until_focus = True
 
         self.image_downloaded.connect(self._on_image_downloaded)
         self._build_ui()
-        self._load_initial_rows()
-        self._sync_shared_stock_rules_on_startup()
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
         self._set_busy(False)
+
+    def load_initial_rows_if_needed(self) -> None:
+        if self._initial_rows_loaded:
+            return
+        self._initial_rows_loaded = True
+        self._load_initial_rows()
+        QTimer.singleShot(1200, self._start_startup_shared_stock_sync)
 
     def _build_ui(self) -> None:
         root_layout = QVBoxLayout(self)
@@ -265,7 +355,7 @@ class ChannelTab(QWidget):
         self.search_input.setPlaceholderText(f"{self.channel_name} 상품명 검색")
         self.search_input.setFocusPolicy(Qt.ClickFocus)
         self.search_input.setFixedWidth(220)
-        self.search_input.textChanged.connect(self._apply_filters)
+        self.search_input.textChanged.connect(self._schedule_filter_refresh)
         self.today_sales_amount_label.setStyleSheet("color: #065f46; font-weight: 600;")
 
         top_bar.addWidget(self.sync_button)
@@ -300,6 +390,7 @@ class ChannelTab(QWidget):
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._open_table_context_menu)
         self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
+        self.table.itemClicked.connect(self._on_table_item_clicked)
 
         header = self.table.horizontalHeader()
         header.setSortIndicatorShown(True)
@@ -374,10 +465,10 @@ class ChannelTab(QWidget):
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
-            """
+            _with_base_widget_font(
+                """
             QWidget {
-                font-family: "Segoe UI";
-                font-size: 12px;
+                __BASE_WIDGET_FONT_CSS__
             }
             QLineEdit, QComboBox, QPushButton {
                 background: #ffffff;
@@ -426,6 +517,7 @@ class ChannelTab(QWidget):
                 border-radius: 8px;
             }
             """
+            )
         )
 
     def _load_initial_rows(self) -> None:
@@ -439,12 +531,9 @@ class ChannelTab(QWidget):
             return
         self.rows = list(rows)
         migrated = self._migrate_legacy_favorite_keys()
-        self._fetch_today_sales_events(force=True)
         self._apply_filters()
         self._update_today_sales_amount_label()
-        self._on_table_selection_changed()
-        if migrated:
-            self.favorites_changed.emit(self.channel_name)
+        self.favorites_changed.emit(self.channel_name)
         summary = f"{self.channel_name} 캐시 로드: {len(self.rows)}건"
         if warnings:
             summary += f" | 경고 {len(warnings)}건"
@@ -634,11 +723,21 @@ class ChannelTab(QWidget):
 
     @Slot()
     def _on_table_selection_changed(self) -> None:
+        if self._defer_detail_fetch_until_focus and not self.table.hasFocus():
+            self._update_detail_for_row(None)
+            return
+        self._defer_detail_fetch_until_focus = False
         current = self.table.currentRow()
         if 0 <= current < len(self.filtered_rows):
             self._update_detail_for_row(self.filtered_rows[current])
             return
         self._update_detail_for_row(None)
+
+    @Slot(QTableWidgetItem)
+    def _on_table_item_clicked(self, _item: QTableWidgetItem) -> None:
+        if self._defer_detail_fetch_until_focus:
+            self._defer_detail_fetch_until_focus = False
+        self._on_table_selection_changed()
 
     @Slot(str)
     def _on_sync_failed(self, error: str) -> None:
@@ -963,17 +1062,29 @@ class ChannelTab(QWidget):
                 continue
         return synced
 
-    def _sync_shared_stock_rules_on_startup(self) -> None:
+    def _start_startup_shared_stock_sync(self) -> None:
         if not self.monitor_url:
             return
+        if self.startup_shared_stock_worker and self.startup_shared_stock_worker.isRunning():
+            return
+        self.startup_shared_stock_worker = StartupSharedStockSyncWorker(
+            flush_fn=self._flush_shared_stock_pending_ops,
+            fetch_fn=self._fetch_remote_shared_stock_rules,
+        )
+        self.startup_shared_stock_worker.completed.connect(
+            self._on_startup_shared_stock_sync_completed
+        )
+        self.startup_shared_stock_worker.start()
 
-        synced_pending = self._flush_shared_stock_pending_ops()
-        try:
-            remote_rules = self._fetch_remote_shared_stock_rules()
-        except Exception:
-            remote_rules = None
+    @Slot(object, int)
+    def _on_startup_shared_stock_sync_completed(
+        self,
+        remote_rules: object,
+        synced_pending: int,
+    ) -> None:
+        self.startup_shared_stock_worker = None
 
-        if remote_rules is None:
+        if not isinstance(remote_rules, dict):
             if synced_pending > 0:
                 self.status_label.setText(
                     f"{self.channel_name} 공유재고 오프라인 큐 {synced_pending}건 동기화"
@@ -1080,7 +1191,7 @@ class ChannelTab(QWidget):
         return label
 
     def _image_cell(self, row: ChannelProduct) -> tuple[QWidget, ProductImageLabel]:
-        container = QWidget()
+        container = ClickableImageContainer()
         container.setFixedWidth(58)
 
         layout = QHBoxLayout(container)
@@ -1088,7 +1199,11 @@ class ChannelTab(QWidget):
         layout.setSpacing(0)
 
         label = self._image_label()
-        label.set_product_url(self._row_product_url(row))
+        product_url = self._row_product_url(row)
+        label.set_product_url(product_url)
+        label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        container.set_product_url(product_url)
+        container.clicked.connect(self._open_product_page)
         layout.addWidget(label, 0, Qt.AlignCenter)
         return container, label
 
@@ -1530,6 +1645,9 @@ class ChannelTab(QWidget):
             return
         QDesktopServices.openUrl(QUrl(normalized))
 
+    def _schedule_filter_refresh(self, *_args: object) -> None:
+        self._filter_timer.start()
+
     @Slot()
     def _apply_filters(self) -> None:
         force_full_render = self._force_full_render_next
@@ -1649,6 +1767,12 @@ class ChannelTab(QWidget):
             if previous is not current
         ]
 
+    def _selected_row_identity_key(self) -> tuple[str, str] | None:
+        current = self.table.currentRow()
+        if 0 <= current < len(self.filtered_rows):
+            return self._row_identity_key(self.filtered_rows[current])
+        return None
+
     def _render_row(self, index: int, row: ChannelProduct, token: int) -> None:
         today_sales = self._effective_today_sales(row)
         period_sales = self._effective_sales(row)
@@ -1756,23 +1880,50 @@ class ChannelTab(QWidget):
                     widget.setPalette(self.table.palette())
 
     def _render_table(self, rows: List[ChannelProduct]) -> None:
+        selected_key = self._selected_row_identity_key()
         self.render_token += 1
         token = self.render_token
 
         self._image_waiters.clear()
-        self.table.setRowCount(len(rows))
+        self.table.setUpdatesEnabled(False)
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(len(rows))
+            for index, row in enumerate(rows):
+                self._render_row(index, row, token)
+        finally:
+            self.table.blockSignals(False)
+            self.table.setUpdatesEnabled(True)
 
-        for index, row in enumerate(rows):
-            self._render_row(index, row, token)
+        target_index = -1
+        if selected_key is not None:
+            for index, row in enumerate(rows):
+                if self._row_identity_key(row) == selected_key:
+                    target_index = index
+                    break
+        if target_index < 0 and rows:
+            target_index = 0
 
-        if rows and self.table.currentRow() < 0:
-            self.table.setCurrentCell(0, 1)
+        if target_index >= 0:
+            self.table.setCurrentCell(target_index, 1)
+        else:
+            self._update_detail_for_row(None)
 
     def _patch_table_rows(self, rows: List[ChannelProduct], changed_indexes: list[int]) -> None:
         token = self.render_token
-        for index in changed_indexes:
-            if 0 <= index < len(rows):
-                self._render_row(index, rows[index], token)
+        self.table.setUpdatesEnabled(False)
+        self.table.blockSignals(True)
+        try:
+            for index in changed_indexes:
+                if 0 <= index < len(rows):
+                    self._render_row(index, rows[index], token)
+        finally:
+            self.table.blockSignals(False)
+            self.table.setUpdatesEnabled(True)
+
+        current = self.table.currentRow()
+        if 0 <= current < len(rows):
+            self._update_detail_for_row(rows[current])
 
 
     @staticmethod
@@ -1883,9 +2034,15 @@ class ChannelTab(QWidget):
         return super().eventFilter(watched, event)
 
     def shutdown(self) -> None:
+        self._filter_timer.stop()
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
+        if self.startup_shared_stock_worker and self.startup_shared_stock_worker.isRunning():
+            finished = self.startup_shared_stock_worker.wait(60000)
+            if not finished:
+                self.startup_shared_stock_worker.terminate()
+                self.startup_shared_stock_worker.wait(2000)
         if self.worker and self.worker.isRunning():
             finished = self.worker.wait(60000)
             if not finished:
@@ -1908,6 +2065,10 @@ class InventoryManagementTab(QWidget):
         self._image_pending: set[str] = set()
         self.image_executor = ThreadPoolExecutor(max_workers=4)
         self.render_token = 0
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(SEARCH_DEBOUNCE_MS)
+        self._filter_timer.timeout.connect(self._apply_filters)
 
         self.channel_filter = QComboBox()
         self.search_input = QLineEdit()
@@ -1931,7 +2092,7 @@ class InventoryManagementTab(QWidget):
         self.channel_filter.currentIndexChanged.connect(self._apply_filters)
 
         self.search_input.setPlaceholderText("즐겨찾기 상품명 검색")
-        self.search_input.textChanged.connect(self._apply_filters)
+        self.search_input.textChanged.connect(self._schedule_filter_refresh)
 
         top_bar.addWidget(QLabel("채널"))
         top_bar.addWidget(self.channel_filter)
@@ -2000,10 +2161,10 @@ class InventoryManagementTab(QWidget):
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
-            """
+            _with_base_widget_font(
+                """
             QWidget {
-                font-family: "Segoe UI";
-                font-size: 12px;
+                __BASE_WIDGET_FONT_CSS__
             }
             QLineEdit, QComboBox, QPushButton {
                 background: #ffffff;
@@ -2037,6 +2198,7 @@ class InventoryManagementTab(QWidget):
                 padding: 6px;
             }
             """
+            )
         )
 
     @staticmethod
@@ -2148,6 +2310,9 @@ class InventoryManagementTab(QWidget):
         self.rows = list(rows)
         self._apply_filters()
 
+    def _schedule_filter_refresh(self, *_args: object) -> None:
+        self._filter_timer.start()
+
     @Slot()
     def _apply_filters(self) -> None:
         selected_channel = self.channel_filter.currentText()
@@ -2179,14 +2344,16 @@ class InventoryManagementTab(QWidget):
             self.note_label.setText("네이버/쿠팡 탭에서 ★를 눌러 즐겨찾기한 상품만 표시됩니다.")
 
     def _image_cell(self, row: FavoriteInventoryRow) -> tuple[QWidget, ProductImageLabel]:
-        container = QWidget()
+        container = ClickableImageContainer()
         container.setFixedWidth(62)
         layout = QHBoxLayout(container)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(0)
         label = ProductImageLabel()
         label.set_product_url(row.product_url)
-        label.clicked.connect(self._open_product_page)
+        label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        container.set_product_url(row.product_url)
+        container.clicked.connect(self._open_product_page)
         layout.addWidget(label, 0, Qt.AlignCenter)
         return container, label
 
@@ -2196,117 +2363,123 @@ class InventoryManagementTab(QWidget):
         self._image_waiters.clear()
 
         self.table.setSortingEnabled(False)
-        self.table.setRowCount(len(rows))
+        self.table.setUpdatesEnabled(False)
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(len(rows))
 
-        for index, row in enumerate(rows):
-            self.table.setRowHeight(index, 56)
-            channel_bg, channel_fg = self._channel_cell_colors(row.channel)
-            channel_item = self._table_item(row.channel, Qt.AlignCenter, row.channel)
-            channel_item.setBackground(channel_bg)
-            channel_item.setForeground(channel_fg)
-            self.table.setItem(
-                index,
-                0,
-                channel_item,
-            )
-            self.table.setItem(
-                index,
-                1,
-                self._table_item(str(row.serial), Qt.AlignCenter, row.serial),
-            )
+            for index, row in enumerate(rows):
+                self.table.setRowHeight(index, 56)
+                channel_bg, channel_fg = self._channel_cell_colors(row.channel)
+                channel_item = self._table_item(row.channel, Qt.AlignCenter, row.channel)
+                channel_item.setBackground(channel_bg)
+                channel_item.setForeground(channel_fg)
+                self.table.setItem(
+                    index,
+                    0,
+                    channel_item,
+                )
+                self.table.setItem(
+                    index,
+                    1,
+                    self._table_item(str(row.serial), Qt.AlignCenter, row.serial),
+                )
 
-            image_cell, image_label = self._image_cell(row)
-            self.table.setCellWidget(index, 2, image_cell)
-            self.table.setItem(index, 2, self._table_item("", Qt.AlignCenter, 0))
-            self._queue_image(image_label, row.image_url, token)
+                image_cell, image_label = self._image_cell(row)
+                self.table.setCellWidget(index, 2, image_cell)
+                self.table.setItem(index, 2, self._table_item("", Qt.AlignCenter, 0))
+                self._queue_image(image_label, row.image_url, token)
 
-            name_item = self._table_item(row.name, Qt.AlignVCenter | Qt.AlignLeft, row.name.lower())
-            if row.product_url:
-                name_item.setData(Qt.UserRole + 1, row.product_url)
-                name_item.setToolTip("더블클릭: 상품 페이지 열기")
-            self.table.setItem(index, 3, name_item)
-            self.table.setItem(
-                index,
-                4,
-                self._table_item(
-                    self._fmt_int(row.stock),
+                name_item = self._table_item(row.name, Qt.AlignVCenter | Qt.AlignLeft, row.name.lower())
+                if row.product_url:
+                    name_item.setData(Qt.UserRole + 1, row.product_url)
+                    name_item.setToolTip("더블클릭: 상품 페이지 열기")
+                self.table.setItem(index, 3, name_item)
+                self.table.setItem(
+                    index,
+                    4,
+                    self._table_item(
+                        self._fmt_int(row.stock),
+                        Qt.AlignRight | Qt.AlignVCenter,
+                        self._sortable_none_last(row.stock),
+                    ),
+                )
+                self.table.setItem(
+                    index,
+                    5,
+                    self._table_item(
+                        self._fmt_int(row.sales),
+                        Qt.AlignRight | Qt.AlignVCenter,
+                        self._sortable_none_last(row.sales),
+                    ),
+                )
+                self.table.setItem(
+                    index,
+                    6,
+                    self._table_item(
+                        self._fmt_int(row.stockout_days),
+                        Qt.AlignRight | Qt.AlignVCenter,
+                        self._sortable_none_last(row.stockout_days),
+                    ),
+                )
+                self.table.setItem(
+                    index,
+                    7,
+                    self._table_item(
+                        self._fmt_int(row.price, "원"),
+                        Qt.AlignRight | Qt.AlignVCenter,
+                        self._sortable_none_last(row.price),
+                    ),
+                )
+                unit_cost = self._unit_cost(row)
+                unit_cost_item = self._table_item(
+                    self._fmt_int(unit_cost, "원"),
                     Qt.AlignRight | Qt.AlignVCenter,
-                    self._sortable_none_last(row.stock),
-                ),
-            )
-            self.table.setItem(
-                index,
-                5,
-                self._table_item(
-                    self._fmt_int(row.sales),
-                    Qt.AlignRight | Qt.AlignVCenter,
-                    self._sortable_none_last(row.sales),
-                ),
-            )
-            self.table.setItem(
-                index,
-                6,
-                self._table_item(
-                    self._fmt_int(row.stockout_days),
-                    Qt.AlignRight | Qt.AlignVCenter,
-                    self._sortable_none_last(row.stockout_days),
-                ),
-            )
-            self.table.setItem(
-                index,
-                7,
-                self._table_item(
-                    self._fmt_int(row.price, "원"),
-                    Qt.AlignRight | Qt.AlignVCenter,
-                    self._sortable_none_last(row.price),
-                ),
-            )
-            unit_cost = self._unit_cost(row)
-            unit_cost_item = self._table_item(
-                self._fmt_int(unit_cost, "원"),
-                Qt.AlignRight | Qt.AlignVCenter,
-                self._sortable_none_last(unit_cost),
-            )
-            unit_cost_item.setData(Qt.UserRole + 2, row.channel)
-            unit_cost_item.setData(Qt.UserRole + 3, row.cost_key)
-            unit_cost_item.setData(Qt.UserRole + 4, unit_cost)
-            unit_cost_item.setToolTip("더블클릭: 원가 입력/수정")
-            self.table.setItem(index, 8, unit_cost_item)
+                    self._sortable_none_last(unit_cost),
+                )
+                unit_cost_item.setData(Qt.UserRole + 2, row.channel)
+                unit_cost_item.setData(Qt.UserRole + 3, row.cost_key)
+                unit_cost_item.setData(Qt.UserRole + 4, unit_cost)
+                unit_cost_item.setToolTip("더블클릭: 원가 입력/수정")
+                self.table.setItem(index, 8, unit_cost_item)
 
-            total_cost = self._total_cost(row.stock, unit_cost)
-            self.table.setItem(
-                index,
-                9,
-                self._table_item(
-                    self._fmt_int(total_cost, "원"),
-                    Qt.AlignRight | Qt.AlignVCenter,
-                    self._sortable_none_last(total_cost),
-                ),
-            )
+                total_cost = self._total_cost(row.stock, unit_cost)
+                self.table.setItem(
+                    index,
+                    9,
+                    self._table_item(
+                        self._fmt_int(total_cost, "원"),
+                        Qt.AlignRight | Qt.AlignVCenter,
+                        self._sortable_none_last(total_cost),
+                    ),
+                )
 
-            total_sales_price = self._total_sales_price(row.stock, row.price)
-            self.table.setItem(
-                index,
-                10,
-                self._table_item(
-                    self._fmt_int(total_sales_price, "원"),
-                    Qt.AlignRight | Qt.AlignVCenter,
-                    self._sortable_none_last(total_sales_price),
-                ),
-            )
+                total_sales_price = self._total_sales_price(row.stock, row.price)
+                self.table.setItem(
+                    index,
+                    10,
+                    self._table_item(
+                        self._fmt_int(total_sales_price, "원"),
+                        Qt.AlignRight | Qt.AlignVCenter,
+                        self._sortable_none_last(total_sales_price),
+                    ),
+                )
 
-            expected_profit = self._expected_profit(total_sales_price, total_cost)
-            self.table.setItem(
-                index,
-                11,
-                self._table_item(
-                    self._fmt_int(expected_profit, "원"),
-                    Qt.AlignRight | Qt.AlignVCenter,
-                    self._sortable_none_last(expected_profit),
-                ),
-            )
+                expected_profit = self._expected_profit(total_sales_price, total_cost)
+                self.table.setItem(
+                    index,
+                    11,
+                    self._table_item(
+                        self._fmt_int(expected_profit, "원"),
+                        Qt.AlignRight | Qt.AlignVCenter,
+                        self._sortable_none_last(expected_profit),
+                    ),
+                )
+        finally:
+            self.table.blockSignals(False)
+            self.table.setUpdatesEnabled(True)
+            self.table.setSortingEnabled(True)
 
-        self.table.setSortingEnabled(True)
         if rows:
             self.table.sortItems(4, Qt.AscendingOrder)
 
@@ -2396,6 +2569,7 @@ class InventoryManagementTab(QWidget):
         QDesktopServices.openUrl(QUrl(normalized))
 
     def shutdown(self) -> None:
+        self._filter_timer.stop()
         self.image_executor.shutdown(wait=False, cancel_futures=True)
 
 
@@ -2541,10 +2715,10 @@ class RevenueTab(QWidget):
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
-            """
+            _with_base_widget_font(
+                """
             QWidget {
-                font-family: "Segoe UI";
-                font-size: 12px;
+                __BASE_WIDGET_FONT_CSS__
             }
             QLineEdit, QComboBox, QPushButton {
                 background: #ffffff;
@@ -2588,6 +2762,7 @@ class RevenueTab(QWidget):
                 padding: 6px;
             }
             """
+            )
         )
 
     def _select_default_period(self) -> None:
@@ -2996,10 +3171,10 @@ class KeywordRevenueTab(QWidget):
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
-            """
+            _with_base_widget_font(
+                """
             QWidget {
-                font-family: "Segoe UI";
-                font-size: 12px;
+                __BASE_WIDGET_FONT_CSS__
             }
             QLineEdit, QComboBox, QPushButton {
                 background: #ffffff;
@@ -3043,6 +3218,7 @@ class KeywordRevenueTab(QWidget):
                 padding: 6px;
             }
             """
+            )
         )
 
     def _select_default_period(self) -> None:
@@ -3274,6 +3450,7 @@ class SalesDailyTab(QWidget):
         super().__init__()
         self.monitor_url = monitor_url
         self.timeout = timeout
+        self._loaded_once = False
         self.image_cache: dict[str, QPixmap] = {}
         self._image_pending: set[str] = set()
         self._image_waiters: dict[str, list[tuple[QLabel, int]]] = {}
@@ -3299,10 +3476,6 @@ class SalesDailyTab(QWidget):
 
         self.summary_label = QLabel("날짜를 선택하세요")
         self.summary_label.setWordWrap(True)
-        self.summary_label.setStyleSheet(
-            "font-size: 13px; padding: 8px; background: #f8fafc; "
-            "border: 1px solid #e2e8f0; border-radius: 8px;"
-        )
         left.addWidget(self.summary_label)
         left.addStretch(1)
         layout.addLayout(left, 0)
@@ -3321,27 +3494,44 @@ class SalesDailyTab(QWidget):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
-        self.table.setStyleSheet(
-            """
-            QTableWidget {
-                gridline-color: #e8ecf0;
-                font-size: 12px;
-                selection-background-color: rgba(59, 130, 246, 0.18);
-            }
-            QHeaderView::section {
-                background: #f1f5f9;
-                border: none;
-                border-bottom: 2px solid #d0d7de;
-                padding: 6px;
-                font-weight: 700;
-            }
-            """
-        )
         right.addWidget(self.table, 1)
         layout.addLayout(right, 1)
 
-        # 초기 로드: 판매 날짜 목록 + 최신 판매일 자동 조회
-        self.reload(preserve_selection=False)
+        self._apply_styles()
+        self.summary_label.setText("판매일보 탭을 열면 데이터를 불러옵니다.")
+
+    def _apply_styles(self) -> None:
+        self.summary_label.setStyleSheet(
+            _with_base_widget_font(
+                """
+                QLabel {
+                    __BASE_WIDGET_FONT_CSS__
+                    padding: 8px;
+                    background: #f8fafc;
+                    border: 1px solid #e2e8f0;
+                    border-radius: 8px;
+                }
+                """
+            )
+        )
+        self.table.setStyleSheet(
+            _with_base_widget_font(
+                """
+                QTableWidget {
+                    __BASE_WIDGET_FONT_CSS__
+                    gridline-color: #e8ecf0;
+                    selection-background-color: rgba(59, 130, 246, 0.18);
+                }
+                QHeaderView::section {
+                    background: #f1f5f9;
+                    border: none;
+                    border-bottom: 2px solid #d0d7de;
+                    padding: 6px;
+                    font-weight: 700;
+                }
+                """
+            )
+        )
 
     @staticmethod
     def _qdate_from_iso(date_str: str) -> QDate | None:
@@ -3355,6 +3545,7 @@ class SalesDailyTab(QWidget):
         return None
 
     def reload(self, preserve_selection: bool = True) -> None:
+        self._loaded_once = True
         self._load_sales_dates(preserve_selection=preserve_selection)
 
     def _load_sales_dates(self, preserve_selection: bool = True) -> None:
@@ -3512,14 +3703,21 @@ class SalesDailyTab(QWidget):
             self.table.setRowHeight(i, 50)
 
             # 이미지
+            img_container = ClickableImageContainer()
             img_label = ProductImageLabel()
-            img_label.clicked.connect(self._open_sale_product_page)
             img_url = s.get("image_url")
             product_url = self._sale_product_url(s)
             img_label.set_product_url(product_url)
+            img_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            img_container.set_product_url(product_url)
+            img_container.clicked.connect(self._open_sale_product_page)
+            img_layout = QHBoxLayout(img_container)
+            img_layout.setContentsMargins(3, 3, 3, 3)
+            img_layout.setSpacing(0)
+            img_layout.addWidget(img_label, 0, Qt.AlignCenter)
             if img_url:
                 self._request_image(img_label, img_url, token)
-            self.table.setCellWidget(i, 0, img_label)
+            self.table.setCellWidget(i, 0, img_container)
 
             # 상품명
             name = s.get("name", "")
@@ -3605,6 +3803,10 @@ class MainWindow(QMainWindow):
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
         self.config = config
+        self.settings = QSettings(APP_SETTINGS_ORG, APP_SETTINGS_APP)
+        app = QApplication.instance()
+        self._default_app_font = QFont(app.font()) if app is not None else QFont()
+        self._restore_saved_app_font()
 
         self.naver_service = NaverChannelService(config)
         self.coupang_service = CoupangChannelService(config)
@@ -3616,6 +3818,8 @@ class MainWindow(QMainWindow):
 
         self.sync_all_button = QPushButton("전체 동기화")
         self.sync_all_button.setObjectName("primarySyncButton")
+        self.font_button = QPushButton("글꼴")
+        self.font_button.setObjectName("fontMenuButton")
         self.pi_status_button = QPushButton("📡 라즈베리파이")
         self.pi_status_button.setObjectName("piStatusButton")
         self.pi_status_button.setVisible(bool(config.monitor_url))
@@ -3700,6 +3904,7 @@ class MainWindow(QMainWindow):
         self.revenue_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.keyword_tab.sync_finished.connect(self._on_sub_sync_finished)
         self._refresh_inventory_tab()
+        QTimer.singleShot(0, self._load_initial_visible_channel_tab)
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -3726,7 +3931,13 @@ class MainWindow(QMainWindow):
         corner_layout = QHBoxLayout(corner)
         corner_layout.setContentsMargins(0, 0, 0, 0)
         corner_layout.setSpacing(0)
+        font_menu = QMenu(self.font_button)
+        font_menu.addAction("글꼴 선택...", self._choose_app_font)
+        font_menu.addAction("기본 글꼴로 복원", self._reset_app_font)
+        self.font_button.setMenu(font_menu)
+        self._update_font_button_state()
         self.pi_status_button.clicked.connect(self._check_pi_status)
+        corner_layout.addWidget(self.font_button)
         corner_layout.addWidget(self.pi_status_button)
         corner_layout.addWidget(self.sync_all_button)
         self.tabs.setCornerWidget(corner, Qt.TopRightCorner)
@@ -3742,6 +3953,18 @@ class MainWindow(QMainWindow):
             """
             QMainWindow {
                 background: #f3f6fb;
+            }
+            #fontMenuButton {
+                background: #ffffff;
+                color: #334155;
+                border: 1px solid #cbd5e1;
+                border-radius: 9px;
+                padding: 6px 12px;
+                font-weight: 600;
+                margin-right: 6px;
+            }
+            #fontMenuButton:hover {
+                background: #f8fafc;
             }
             #piStatusButton {
                 background: #16a34a;
@@ -3803,6 +4026,74 @@ class MainWindow(QMainWindow):
             }
             """
         )
+
+    def _restore_saved_app_font(self) -> None:
+        saved_font = self.settings.value(APP_FONT_KEY, "", type=str)
+        if not saved_font:
+            return
+        restored = QFont(self._default_app_font)
+        if restored.fromString(saved_font):
+            self._apply_app_font(restored, persist=False)
+
+    def _apply_app_font(self, font: QFont, persist: bool = True) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        applied = QFont(font)
+        if applied.pointSize() <= 0 and self._default_app_font.pointSize() > 0:
+            applied.setPointSize(self._default_app_font.pointSize())
+        app.setFont(applied)
+        self.setFont(applied)
+        for widget in self.findChildren(QWidget):
+            widget.setFont(applied)
+        self._refresh_font_sensitive_ui()
+        for table in self.findChildren(QTableWidget):
+            table.viewport().update()
+            table.update()
+            header = table.horizontalHeader()
+            if header is not None:
+                header.viewport().update()
+        if persist:
+            self.settings.setValue(APP_FONT_KEY, applied.toString())
+        self._update_font_button_state()
+
+    def _update_font_button_state(self) -> None:
+        if not hasattr(self, "font_button"):
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        current = app.font()
+        size_label = f"{current.pointSize()}pt" if current.pointSize() > 0 else "기본 크기"
+        self.font_button.setToolTip(f"현재 글꼴: {current.family()} {size_label}")
+
+    def _choose_app_font(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        selected, ok = QFontDialog.getFont(app.font(), self, "앱 글꼴 선택")
+        if not ok:
+            return
+        self._apply_app_font(selected, persist=True)
+
+    def _reset_app_font(self) -> None:
+        self.settings.remove(APP_FONT_KEY)
+        self._apply_app_font(self._default_app_font, persist=False)
+
+    def _refresh_font_sensitive_ui(self) -> None:
+        self._apply_styles()
+        for attr_name in (
+            "naver_tab",
+            "coupang_tab",
+            "inventory_tab",
+            "revenue_tab",
+            "keyword_tab",
+            "sales_daily_tab",
+        ):
+            widget = getattr(self, attr_name, None)
+            apply_styles = getattr(widget, "_apply_styles", None)
+            if callable(apply_styles):
+                apply_styles()
 
     def _start_sync_session(self, sources: set[str]) -> None:
         self._sync_expected_sources = set(sources)
@@ -3945,8 +4236,17 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _on_tab_changed(self, index: int) -> None:
-        if self.tabs.widget(index) is self.sales_daily_tab:
+        widget = self.tabs.widget(index)
+        if isinstance(widget, ChannelTab):
+            widget.load_initial_rows_if_needed()
+            return
+        if widget is self.sales_daily_tab and not self.sales_daily_tab._loaded_once:
             self.sales_daily_tab.reload()
+
+    def _load_initial_visible_channel_tab(self) -> None:
+        current = self.tabs.currentWidget()
+        if isinstance(current, ChannelTab):
+            current.load_initial_rows_if_needed()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.naver_tab.shutdown()

@@ -28,9 +28,16 @@ class CoupangRocketConnector:
         self.access_key = access_key
         self.secret_key = secret_key
         self.base_url = "https://api-gateway.coupang.com"
-        self.client = httpx.Client(base_url=self.base_url, timeout=timeout_seconds)
+        self.timeout_seconds = max(3, int(timeout_seconds))
+        self._client: Optional[httpx.Client] = None
         self.max_retry_attempts = 6
         self.detail_sleep_seconds = 0.15
+
+    @property
+    def client(self) -> httpx.Client:
+        if self._client is None:
+            self._client = httpx.Client(base_url=self.base_url, timeout=self.timeout_seconds)
+        return self._client
 
     @staticmethod
     def _sanitize_query_text(text: str | None) -> str:

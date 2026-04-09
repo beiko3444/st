@@ -2,12 +2,24 @@
 
 import sys
 
-from PySide6.QtCore import QTimer
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from inventory_app.config import load_config
 from inventory_app.ui.main_window import MainWindow
+
+
+def _configure_app_font(app: QApplication) -> None:
+    font = QFont(app.font())
+    if sys.platform.startswith("win"):
+        font.setFamily("Malgun Gothic")
+        font.setPointSize(10)
+        font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+    elif sys.platform == "darwin":
+        font.setFamily("Apple SD Gothic Neo")
+        font.setPointSize(12)
+    app.setFont(font)
 
 
 def _apply_light_theme(app: QApplication) -> None:
@@ -30,7 +42,11 @@ def _apply_light_theme(app: QApplication) -> None:
 
 
 def main() -> int:
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
     app = QApplication(sys.argv)
+    _configure_app_font(app)
     _apply_light_theme(app)
 
     try:
@@ -41,7 +57,6 @@ def main() -> int:
 
     window = MainWindow(config)
     window.show()
-    QTimer.singleShot(0, window.sync_now)
     return app.exec()
 
 
