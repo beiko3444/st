@@ -89,13 +89,32 @@ class InventoryHistoryDB:
                 """CREATE INDEX IF NOT EXISTS idx_review_product
                    ON review_history(channel, product_id, recorded_at)"""
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS shared_stock_rules (
+                    channel TEXT NOT NULL,
+                    product_key TEXT NOT NULL,
+                    group_id TEXT NOT NULL,
+                    pack_size INTEGER NOT NULL DEFAULT 1,
+                    is_master INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (channel, product_key)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_shared_stock_group
+                ON shared_stock_rules(group_id)
+                """
+            )
             conn.commit()
 
     def _load_last_data(self, conn: sqlite3.Connection, channel: str) -> dict[tuple, dict]:
         """상품별 최신 데이터 반환. 키: (product_id, item_id)"""
         cursor = conn.execute(
             """
-            SELECT product_id, item_id, stock, image_url
+            SELECT product_id, item_id, stock, image_url, product_url
             FROM inventory_history h1
             WHERE channel = ?
               AND id = (
@@ -108,7 +127,7 @@ class InventoryHistoryDB:
             (channel,),
         )
         return {
-            (row[0], row[1]): {"stock": row[2], "image_url": row[3]}
+            (row[0], row[1]): {"stock": row[2], "image_url": row[3], "product_url": row[4]}
             for row in cursor.fetchall()
         }
 
@@ -132,13 +151,15 @@ class InventoryHistoryDB:
                 key = (product_id, item_id)
                 current_stock = row.get("stock")
                 current_image = row.get("image_url")
+                current_product_url = row.get("product_url")
 
                 last = last_data.get(key)
                 is_new = last is None
                 stock_changed = (not is_new) and (last["stock"] != current_stock)
                 image_missing = (not is_new) and (not last["image_url"]) and current_image
+                product_url_missing = (not is_new) and (not last["product_url"]) and current_product_url
 
-                if is_new or stock_changed or image_missing:
+                if is_new or stock_changed or image_missing or product_url_missing:
                     conn.execute(
                         """
                         INSERT INTO inventory_history
@@ -345,3 +366,89 @@ class InventoryHistoryDB:
             )
             cols = ["product_id", "name", "image_url", "review_count", "review_score", "recorded_at"]
             return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    # ── 공유재고 규칙 관련 ──
+
+    def get_shared_stock_rules(self, channel: str | None = None) -> List[dict]:
+        with self._guard, self._connection() as conn:
+            if channel:
+                cursor = conn.execute(
+                    """
+                    SELECT channel, product_key, group_id, pack_size, is_master, updated_at
+                    FROM shared_stock_rules
+                    WHERE channel = ?
+                    ORDER BY updated_at DESC, product_key ASC
+                    """,
+                    (str(channel).strip().lower(),),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    SELECT channel, product_key, group_id, pack_size, is_master, updated_at
+                    FROM shared_stock_rules
+                    ORDER BY updated_at DESC, product_key ASC
+                    """
+                )
+            rows = cursor.fetchall()
+
+        cols = ["channel", "product_key", "group_id", "pack_size", "is_master", "updated_at"]
+        return [dict(zip(cols, row)) for row in rows]
+
+    def upsert_shared_stock_rule(
+        self,
+        channel: str,
+        product_key: str,
+        group_id: str,
+        pack_size: int,
+        is_master: bool,
+    ) -> None:
+        channel_key = str(channel or "").strip().lower()
+        item_key = str(product_key or "").strip()
+        group_key = str(group_id or "").strip()
+        if not channel_key or not item_key or not group_key:
+            raise ValueError("channel/product_key/group_id are required")
+        qty = max(1, int(pack_size))
+        now = datetime.now().isoformat()
+
+        with self._guard, self._connection() as conn:
+            if is_master:
+                conn.execute(
+                    """
+                    UPDATE shared_stock_rules
+                    SET is_master = 0, updated_at = ?
+                    WHERE group_id = ?
+                    """,
+                    (now, group_key),
+                )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO shared_stock_rules (
+                    channel, product_key, group_id, pack_size, is_master, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    channel_key,
+                    item_key,
+                    group_key,
+                    qty,
+                    1 if is_master else 0,
+                    now,
+                ),
+            )
+            conn.commit()
+
+    def delete_shared_stock_rule(self, channel: str, product_key: str) -> None:
+        channel_key = str(channel or "").strip().lower()
+        item_key = str(product_key or "").strip()
+        if not channel_key or not item_key:
+            raise ValueError("channel and product_key are required")
+
+        with self._guard, self._connection() as conn:
+            conn.execute(
+                """
+                DELETE FROM shared_stock_rules
+                WHERE channel = ? AND product_key = ?
+                """,
+                (channel_key, item_key),
+            )
+            conn.commit()

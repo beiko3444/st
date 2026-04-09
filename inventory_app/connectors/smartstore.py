@@ -41,6 +41,13 @@ class SmartStoreConnector:
         return base64.b64encode(hashed).decode("utf-8")
 
     @staticmethod
+    def _sanitize_query_text(text: str | None) -> str:
+        if not isinstance(text, str):
+            return ""
+        cleaned = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+        return " ".join(cleaned.split())
+
+    @staticmethod
     def _extract_error_detail(response: httpx.Response) -> str:
         try:
             payload = response.json()
@@ -189,8 +196,9 @@ class SmartStoreConnector:
         numeric_id = SmartStoreConnector._to_int(product_id)
         if numeric_id is not None:
             return f"https://smartstore.naver.com/main/products/{numeric_id}"
-        if product_name:
-            return f"https://search.shopping.naver.com/search/all?query={quote_plus(product_name)}"
+        query = SmartStoreConnector._sanitize_query_text(product_name)
+        if query:
+            return f"https://search.shopping.naver.com/search/all?query={quote_plus(query)}"
         return None
 
     def fetch_primary_channel_no(self) -> str:

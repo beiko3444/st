@@ -1,9 +1,11 @@
 ﻿from __future__ import annotations
 
 import math
+import re
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Callable, List
+from typing import Any, Callable, Dict, List
+from urllib.parse import quote_plus
 
 import httpx
 from PySide6.QtCore import QDate, QEvent, QObject, QThread, Qt, QUrl, Signal, Slot
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -37,7 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 from inventory_app.config import AppConfig
-from inventory_app.models import ChannelProduct
+from inventory_app.models import ChannelProduct, SharedStockRule
 from inventory_app.services.channel_services import CoupangChannelService, NaverChannelService
 from inventory_app.services.keyword_services import (
     KeywordRevenueRow,
@@ -60,6 +63,45 @@ class SortableTableItem(QTableWidgetItem):
         if left_value is not None and right_value is not None:
             return left_value < right_value
         return super().__lt__(other)
+
+
+def _normalize_web_url(url: str | None) -> str | None:
+    if not isinstance(url, str):
+        return None
+    text = url.strip()
+    if not text:
+        return None
+    text = re.sub(r"[\r\n\t]+", " ", text)
+    text = re.sub(r"(?i)%0d|%0a", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if text.startswith("//"):
+        text = f"https:{text}"
+    elif text.startswith("/"):
+        return None
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", text):
+        text = f"https://{text.lstrip('/')}"
+    qurl = QUrl.fromUserInput(text)
+    if not qurl.isValid():
+        return None
+    if qurl.scheme() not in {"http", "https"}:
+        if not qurl.host():
+            return None
+        qurl.setScheme("https")
+    if not qurl.host():
+        return None
+    return qurl.toString()
+
+
+def _build_search_url(channel_name: str, product_name: str) -> str | None:
+    query = re.sub(r"\s+", " ", str(product_name or "").strip())
+    if not query:
+        return None
+    channel = str(channel_name).strip().lower()
+    if channel in {"naver", "네이버"}:
+        return f"https://search.shopping.naver.com/search/all?query={quote_plus(query)}"
+    if channel in {"coupang", "쿠팡"}:
+        return f"https://www.coupang.com/np/search?q={quote_plus(query)}"
+    return None
 
 
 @dataclass
@@ -106,8 +148,8 @@ class ProductImageLabel(QLabel):
         self.setStyleSheet("border: 1px solid #d0d7de; color: #94a3b8; border-radius: 6px;")
 
     def set_product_url(self, url: str | None) -> None:
-        self._product_url = url
-        if url:
+        self._product_url = _normalize_web_url(url)
+        if self._product_url:
             self.setCursor(Qt.PointingHandCursor)
             self.setToolTip("이미지 클릭 시 상품페이지 열기")
         else:
@@ -138,6 +180,15 @@ class ChannelTab(QWidget):
     sync_finished = Signal(str, bool)
     favorites_changed = Signal(str)
 
+    @staticmethod
+    def _resolve_channel_code(channel_name: str) -> str:
+        text = str(channel_name or "").strip().lower()
+        if text in {"네이버", "naver"}:
+            return "naver"
+        if text in {"쿠팡", "coupang"}:
+            return "coupang"
+        return text
+
     def __init__(
         self,
         channel_name: str,
@@ -145,6 +196,8 @@ class ChannelTab(QWidget):
         sales_period_days: int | None,
         fetch_fn: Callable[[], tuple[List[ChannelProduct], List[str]]],
         initial_fetch_fn: Callable[[], tuple[List[ChannelProduct], List[str]]] | None = None,
+        monitor_url: str | None = None,
+        timeout_seconds: int = 30,
     ) -> None:
         super().__init__()
         self.channel_name = channel_name
@@ -152,6 +205,9 @@ class ChannelTab(QWidget):
         self.sales_period_days = max(1, int(sales_period_days)) if sales_period_days else None
         self.fetch_fn = fetch_fn
         self.initial_fetch_fn = initial_fetch_fn
+        self.monitor_url = str(monitor_url).strip() if monitor_url else None
+        self.timeout_seconds = max(3, int(timeout_seconds))
+        self.channel_code = self._resolve_channel_code(self.channel_name)
 
         self.worker: ChannelSyncWorker | None = None
         self.rows: List[ChannelProduct] = []
@@ -159,6 +215,7 @@ class ChannelTab(QWidget):
         self.cache = ChannelProductCache()
         self.favorite_keys: set[str] = self.cache.load_favorite_keys(self.channel_name)
         self.name_overrides = self.cache.load_name_overrides(self.channel_name)
+        self.shared_stock_rules = self.cache.load_shared_stock_rules(self.channel_name)
 
         self.image_cache: dict[str, QPixmap] = {}
         self._image_waiters: dict[str, list[tuple[QLabel, int]]] = {}
@@ -167,18 +224,26 @@ class ChannelTab(QWidget):
         self.render_token = 0
         self._force_full_render_next = False
 
-        self.sort_column = 1
-        self.sort_order = Qt.AscendingOrder
+        self.sort_column = 5
+        self.sort_order = Qt.DescendingOrder
 
         self.sync_button = QPushButton("동기화")
         self.favorite_filter = QComboBox()
         self.search_input = QLineEdit()
+        self.today_sales_amount_label = QLabel("오늘 총 판매금액: 0원")
         self.status_label = QLabel("준비 완료")
         self.table = QTableWidget(0, 10)
+        self.detail_title_label = QLabel("선택 상품 판매 로그")
+        self.detail_meta_label = QLabel("상품을 클릭하면 오늘 판매 이력이 표시됩니다.")
+        self.detail_table = QTableWidget(0, 3)
+        self._today_detail_date: str | None = None
+        self._today_sales_events_by_exact: Dict[str, List[dict]] = {}
+        self._today_sales_events_by_product: Dict[str, List[dict]] = {}
 
         self.image_downloaded.connect(self._on_image_downloaded)
         self._build_ui()
         self._load_initial_rows()
+        self._sync_shared_stock_rules_on_startup()
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
@@ -199,13 +264,18 @@ class ChannelTab(QWidget):
 
         self.search_input.setPlaceholderText(f"{self.channel_name} 상품명 검색")
         self.search_input.setFocusPolicy(Qt.ClickFocus)
+        self.search_input.setFixedWidth(220)
         self.search_input.textChanged.connect(self._apply_filters)
+        self.today_sales_amount_label.setStyleSheet("color: #065f46; font-weight: 600;")
 
         top_bar.addWidget(self.sync_button)
         top_bar.addWidget(QLabel("필터"))
         top_bar.addWidget(self.favorite_filter)
         top_bar.addWidget(QLabel("검색"))
-        top_bar.addWidget(self.search_input, 1)
+        top_bar.addWidget(self.search_input, 0)
+        top_bar.addSpacing(8)
+        top_bar.addWidget(self.today_sales_amount_label)
+        top_bar.addStretch(1)
 
         self.table.setHorizontalHeaderLabels(
             [
@@ -214,19 +284,22 @@ class ChannelTab(QWidget):
                 "상품이미지",
                 "상품명",
                 "재고",
-                "오늘판매",
-                self.sales_header,
-                "품절예상(일)",
-                "예측 한달매출",
-                "가격",
+                "판매",
+                "30일",
+                "품절예상",
+                "예상월매출",
+                "판매가",
             ]
         )
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.table.setSortingEnabled(False)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._open_table_context_menu)
+        self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
 
         header = self.table.horizontalHeader()
         header.setSortIndicatorShown(True)
@@ -248,17 +321,50 @@ class ChannelTab(QWidget):
         self.table.setColumnWidth(1, 44)
         self.table.setColumnWidth(2, 64)
         self.table.setColumnWidth(3, 360)
-        self.table.setColumnWidth(4, 78)
-        self.table.setColumnWidth(5, 72)
-        self.table.setColumnWidth(6, 88)
-        self.table.setColumnWidth(7, 90)
-        self.table.setColumnWidth(8, 118)
-        self.table.setColumnWidth(9, 98)
+        self.table.setColumnWidth(4, 68)
+        self.table.setColumnWidth(5, 66)
+        self.table.setColumnWidth(6, 66)
+        self.table.setColumnWidth(7, 84)
+        self.table.setColumnWidth(8, 106)
+        self.table.setColumnWidth(9, 86)
+
+        self.detail_title_label.setStyleSheet("color: #0f172a; font-weight: 700;")
+        self.detail_meta_label.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.detail_meta_label.setWordWrap(True)
+
+        self.detail_table.setHorizontalHeaderLabels(["시간", "수량", "매출"])
+        self.detail_table.verticalHeader().setVisible(False)
+        self.detail_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.detail_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.detail_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.detail_table.setAlternatingRowColors(True)
+        self.detail_table.setSortingEnabled(False)
+        detail_header = self.detail_table.horizontalHeader()
+        detail_header.setStretchLastSection(False)
+        detail_header.setSectionResizeMode(0, QHeaderView.Fixed)
+        detail_header.setSectionResizeMode(1, QHeaderView.Fixed)
+        detail_header.setSectionResizeMode(2, QHeaderView.Stretch)
+        self.detail_table.setColumnWidth(0, 80)
+        self.detail_table.setColumnWidth(1, 56)
+
+        detail_panel = QWidget()
+        detail_panel.setObjectName("channelDetailPanel")
+        detail_panel.setFixedWidth(340)
+        detail_layout = QVBoxLayout(detail_panel)
+        detail_layout.setContentsMargins(10, 10, 10, 10)
+        detail_layout.setSpacing(8)
+        detail_layout.addWidget(self.detail_title_label)
+        detail_layout.addWidget(self.detail_meta_label)
+        detail_layout.addWidget(self.detail_table, 1)
 
         self.status_label.setStyleSheet("color: #475569;")
 
         root_layout.addLayout(top_bar)
-        root_layout.addWidget(self.table, 1)
+        content_layout = QHBoxLayout()
+        content_layout.setSpacing(8)
+        content_layout.addWidget(self.table, 1)
+        content_layout.addWidget(detail_panel, 0)
+        root_layout.addLayout(content_layout, 1)
         root_layout.addWidget(self.status_label)
 
         self.search_input.clearFocus()
@@ -314,6 +420,11 @@ class ChannelTab(QWidget):
                 font-weight: 600;
                 padding: 6px;
             }
+            #channelDetailPanel {
+                background: #ffffff;
+                border: 1px solid #d8dee4;
+                border-radius: 8px;
+            }
             """
         )
 
@@ -328,7 +439,10 @@ class ChannelTab(QWidget):
             return
         self.rows = list(rows)
         migrated = self._migrate_legacy_favorite_keys()
+        self._fetch_today_sales_events(force=True)
         self._apply_filters()
+        self._update_today_sales_amount_label()
+        self._on_table_selection_changed()
         if migrated:
             self.favorites_changed.emit(self.channel_name)
         summary = f"{self.channel_name} 캐시 로드: {len(self.rows)}건"
@@ -373,6 +487,9 @@ class ChannelTab(QWidget):
         if changed_count > 0 or migrated:
             self._apply_filters()
             self.favorites_changed.emit(self.channel_name)
+        self._fetch_today_sales_events(force=True)
+        self._update_today_sales_amount_label()
+        self._on_table_selection_changed()
 
         pi_source = "__pi__" in warning_messages
         real_warnings = [w for w in warning_messages if w != "__pi__"]
@@ -385,6 +502,143 @@ class ChannelTab(QWidget):
         self.status_label.setText(summary)
         self.status_label.setToolTip("\n".join(real_warnings) if real_warnings else "")
         self.sync_finished.emit(self.channel_name, True)
+
+    def _update_today_sales_amount_label(self) -> None:
+        total_amount = 0
+        for row in self.rows:
+            qty = int(self._effective_today_sales(row) or 0)
+            price = int(row.price or 0)
+            if qty <= 0 or price <= 0:
+                continue
+            total_amount += qty * price
+        self.today_sales_amount_label.setText(f"오늘 총 판매금액: {total_amount:,}원")
+
+    @staticmethod
+    def _monitor_item_key(product_id: str, item_id: str | None) -> str:
+        return f"{product_id}|{item_id or ''}"
+
+    def _fetch_today_sales_events(self, force: bool = False) -> None:
+        if not self.monitor_url:
+            self._today_sales_events_by_exact = {}
+            self._today_sales_events_by_product = {}
+            self._today_detail_date = None
+            return
+
+        today = QDate.currentDate().toString("yyyy-MM-dd")
+        if not force and self._today_detail_date == today and self._today_sales_events_by_exact:
+            return
+
+        self._today_sales_events_by_exact = {}
+        self._today_sales_events_by_product = {}
+        self._today_detail_date = today
+
+        try:
+            response = httpx.get(
+                f"{self.monitor_url.rstrip('/')}/sales",
+                params={"date": today},
+                timeout=self.timeout_seconds,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception:
+            return
+
+        sales = payload.get("sales", []) if isinstance(payload, dict) else []
+        if not isinstance(sales, list):
+            return
+
+        for event in sales:
+            if not isinstance(event, dict):
+                continue
+            if str(event.get("channel") or "").strip().lower() != self.channel_code:
+                continue
+            product_id = str(event.get("product_id") or "").strip()
+            if not product_id:
+                continue
+            item_id = str(event.get("item_id")) if event.get("item_id") else None
+            exact_key = self._monitor_item_key(product_id, item_id)
+            self._today_sales_events_by_exact.setdefault(exact_key, []).append(event)
+            self._today_sales_events_by_product.setdefault(product_id, []).append(event)
+
+        for rows in self._today_sales_events_by_exact.values():
+            rows.sort(key=lambda r: str(r.get("recorded_at") or ""), reverse=True)
+        for rows in self._today_sales_events_by_product.values():
+            rows.sort(key=lambda r: str(r.get("recorded_at") or ""), reverse=True)
+
+    def _update_detail_for_row(self, row: ChannelProduct | None) -> None:
+        if row is None:
+            self.detail_title_label.setText("선택 상품 판매 로그")
+            self.detail_meta_label.setText("상품을 클릭하면 오늘 판매 이력이 표시됩니다.")
+            self.detail_table.setRowCount(0)
+            return
+
+        self._fetch_today_sales_events()
+
+        product_id = str(row.product_id or "").strip()
+        item_id = str(row.item_id) if row.item_id else None
+        exact_key = self._monitor_item_key(product_id, item_id)
+
+        events = list(self._today_sales_events_by_exact.get(exact_key, []))
+        if not events and product_id:
+            events = list(self._today_sales_events_by_product.get(product_id, []))
+
+        self.detail_title_label.setText(f"{self._display_name(row)} 판매 로그")
+        if not events:
+            self.detail_meta_label.setText("오늘 판매 로그가 없습니다.")
+            self.detail_table.setRowCount(0)
+            return
+
+        total_qty = sum(int(event.get("qty_sold") or 0) for event in events)
+        total_amount = 0
+        for event in events:
+            qty = int(event.get("qty_sold") or 0)
+            price = event.get("price")
+            if price is not None:
+                try:
+                    total_amount += qty * int(price)
+                except (TypeError, ValueError):
+                    continue
+
+        self.detail_meta_label.setText(
+            f"오늘 {len(events)}건 · 총 {total_qty:,}개 · ₩{total_amount:,}"
+        )
+
+        self.detail_table.setRowCount(len(events))
+        for index, event in enumerate(events):
+            recorded = str(event.get("recorded_at") or "")
+            time_text = recorded[11:16] if len(recorded) >= 16 else "-"
+            qty = int(event.get("qty_sold") or 0)
+            price_value = event.get("price")
+            amount_text = "-"
+            if price_value is not None:
+                try:
+                    amount_text = f"{qty * int(price_value):,}원"
+                except (TypeError, ValueError):
+                    amount_text = "-"
+
+            self.detail_table.setItem(
+                index,
+                0,
+                self._table_item(time_text, Qt.AlignCenter | Qt.AlignVCenter),
+            )
+            self.detail_table.setItem(
+                index,
+                1,
+                self._table_item(f"{qty:,}", Qt.AlignRight | Qt.AlignVCenter),
+            )
+            self.detail_table.setItem(
+                index,
+                2,
+                self._table_item(amount_text, Qt.AlignRight | Qt.AlignVCenter),
+            )
+
+    @Slot()
+    def _on_table_selection_changed(self) -> None:
+        current = self.table.currentRow()
+        if 0 <= current < len(self.filtered_rows):
+            self._update_detail_for_row(self.filtered_rows[current])
+            return
+        self._update_detail_for_row(None)
 
     @Slot(str)
     def _on_sync_failed(self, error: str) -> None:
@@ -517,7 +771,7 @@ class ChannelTab(QWidget):
                     sales=row.sales,
                     stockout_days=self._stockout_days(row),
                     price=row.price,
-                    product_url=row.product_url,
+                    product_url=self._row_product_url(row),
                 )
             )
         return rows
@@ -571,23 +825,247 @@ class ChannelTab(QWidget):
         key = self._name_override_key(row)
         return self.name_overrides.get(key, row.name)
 
+    def _row_product_url(self, row: ChannelProduct) -> str | None:
+        direct = _normalize_web_url(row.product_url)
+        if direct:
+            return direct
+
+        if self.channel_code == "naver":
+            product_id = str(row.product_id or "").strip()
+            if product_id.isdigit():
+                generated = _normalize_web_url(
+                    f"https://smartstore.naver.com/main/products/{product_id}"
+                )
+                if generated:
+                    return generated
+
+        return _normalize_web_url(_build_search_url(self.channel_name, self._display_name(row)))
+
+    @staticmethod
+    def _guess_pack_size(name: str) -> int:
+        text = str(name or "")
+        matches = re.findall(r"(\d+)\s*(?:개|팩|세트|입)", text)
+        if not matches:
+            return 1
+        try:
+            return max(1, int(matches[-1]))
+        except (TypeError, ValueError):
+            return 1
+
+    def _shared_stock_rule(self, row: ChannelProduct) -> SharedStockRule | None:
+        return self.shared_stock_rules.get(self._name_override_key(row))
+
+    def _shared_stock_api_url(self) -> str | None:
+        if not self.monitor_url:
+            return None
+        return f"{self.monitor_url.rstrip('/')}/shared-stock"
+
+    def _fetch_remote_shared_stock_rules(self) -> Dict[str, SharedStockRule] | None:
+        url = self._shared_stock_api_url()
+        if not url:
+            return None
+        resp = httpx.get(
+            url,
+            params={"channel": self.channel_code},
+            timeout=self.timeout_seconds,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        rows = payload.get("rules", []) if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            return {}
+
+        rules: Dict[str, SharedStockRule] = {}
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            product_key = str(raw.get("product_key") or "").strip()
+            group_id = str(raw.get("group_id") or "").strip()
+            if not product_key or not group_id:
+                continue
+            try:
+                pack_size = max(1, int(raw.get("pack_size") or 1))
+            except (TypeError, ValueError):
+                pack_size = 1
+            is_master = bool(int(raw.get("is_master") or 0))
+            rules[product_key] = SharedStockRule(
+                group_id=group_id,
+                pack_size=pack_size,
+                is_master=is_master,
+            )
+        return rules
+
+    def _push_remote_shared_stock_rule(
+        self,
+        product_key: str,
+        group_id: str,
+        pack_size: int,
+        is_master: bool,
+    ) -> None:
+        url = self._shared_stock_api_url()
+        if not url:
+            return
+        response = httpx.post(
+            url,
+            json={
+                "channel": self.channel_code,
+                "product_key": product_key,
+                "group_id": group_id,
+                "pack_size": int(pack_size),
+                "is_master": bool(is_master),
+            },
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+
+    def _delete_remote_shared_stock_rule(self, product_key: str) -> None:
+        url = self._shared_stock_api_url()
+        if not url:
+            return
+        response = httpx.delete(
+            url,
+            params={"channel": self.channel_code, "product_key": product_key},
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+
+    def _flush_shared_stock_pending_ops(self) -> int:
+        if not self.monitor_url:
+            return 0
+        pending = self.cache.load_shared_stock_pending_ops(self.channel_name)
+        if not pending:
+            return 0
+
+        synced = 0
+        for op in pending:
+            try:
+                op_type = str(op.get("op_type") or "")
+                product_key = str(op.get("product_key") or "")
+                if not product_key:
+                    self.cache.delete_shared_stock_pending_op(int(op["id"]))
+                    continue
+                if op_type == "upsert":
+                    group_id = str(op.get("group_id") or "").strip()
+                    if not group_id:
+                        self.cache.delete_shared_stock_pending_op(int(op["id"]))
+                        continue
+                    pack_size = int(op.get("pack_size") or 1)
+                    is_master = bool(op.get("is_master"))
+                    self._push_remote_shared_stock_rule(product_key, group_id, pack_size, is_master)
+                elif op_type == "delete":
+                    self._delete_remote_shared_stock_rule(product_key)
+                else:
+                    self.cache.delete_shared_stock_pending_op(int(op["id"]))
+                    continue
+                self.cache.delete_shared_stock_pending_op(int(op["id"]))
+                synced += 1
+            except Exception:
+                continue
+        return synced
+
+    def _sync_shared_stock_rules_on_startup(self) -> None:
+        if not self.monitor_url:
+            return
+
+        synced_pending = self._flush_shared_stock_pending_ops()
+        try:
+            remote_rules = self._fetch_remote_shared_stock_rules()
+        except Exception:
+            remote_rules = None
+
+        if remote_rules is None:
+            if synced_pending > 0:
+                self.status_label.setText(
+                    f"{self.channel_name} 공유재고 오프라인 큐 {synced_pending}건 동기화"
+                )
+            return
+
+        self.shared_stock_rules = remote_rules
+        self.cache.replace_shared_stock_rules(self.channel_name, remote_rules)
+        self._force_full_render_next = True
+        self._apply_filters()
+        self._update_today_sales_amount_label()
+        if synced_pending > 0:
+            self.status_label.setText(
+                f"{self.channel_name} 공유재고 서버 동기화 완료 ({synced_pending}건 재전송)"
+            )
+
+    def _save_shared_stock_rule_with_sync(
+        self,
+        product_key: str,
+        group_id: str,
+        pack_size: int,
+        is_master: bool,
+    ) -> None:
+        self.cache.save_shared_stock_rule(
+            self.channel_name,
+            product_key,
+            group_id,
+            int(pack_size),
+            bool(is_master),
+        )
+        if not self.monitor_url:
+            return
+        try:
+            self._push_remote_shared_stock_rule(product_key, group_id, int(pack_size), bool(is_master))
+            self._flush_shared_stock_pending_ops()
+        except Exception:
+            self.cache.enqueue_shared_stock_pending_op(
+                self.channel_name,
+                product_key,
+                "upsert",
+                group_id=group_id,
+                pack_size=int(pack_size),
+                is_master=bool(is_master),
+            )
+
+    def _delete_shared_stock_rule_with_sync(self, product_key: str) -> None:
+        self.cache.delete_shared_stock_rule(self.channel_name, product_key)
+        if not self.monitor_url:
+            return
+        try:
+            self._delete_remote_shared_stock_rule(product_key)
+            self._flush_shared_stock_pending_ops()
+        except Exception:
+            self.cache.enqueue_shared_stock_pending_op(
+                self.channel_name,
+                product_key,
+                "delete",
+            )
+
+    def _effective_sales(self, row: ChannelProduct) -> int | None:
+        rule = self._shared_stock_rule(row)
+        if rule and not rule.is_master:
+            return 0
+        if row.sales is None:
+            return None
+        return max(0, int(row.sales))
+
+    def _effective_today_sales(self, row: ChannelProduct) -> int | None:
+        rule = self._shared_stock_rule(row)
+        if rule and not rule.is_master:
+            return 0
+        if row.today_sales is None:
+            return None
+        return max(0, int(row.today_sales))
+
     def _predicted_monthly_revenue(self, row: ChannelProduct) -> int | None:
-        if row.sales is None or row.price is None:
+        sales = self._effective_sales(row)
+        if sales is None or row.price is None:
             return None
         if not self.sales_period_days:
             return None
 
         period = max(1, int(self.sales_period_days))
-        sales = max(0, int(row.sales))
         price = max(0, int(row.price))
         estimated_qty = sales * (30.0 / float(period))
         return int(round(estimated_qty * price))
 
     def _stockout_days(self, row: ChannelProduct) -> int | None:
-        if row.stock is None or row.sales is None or not self.sales_period_days:
+        sales = self._effective_sales(row)
+        if row.stock is None or sales is None or not self.sales_period_days:
             return None
         stock = max(0, int(row.stock))
-        sales = max(0, int(row.sales))
         if sales <= 0:
             return None
         period = max(1, int(self.sales_period_days))
@@ -610,7 +1088,7 @@ class ChannelTab(QWidget):
         layout.setSpacing(0)
 
         label = self._image_label()
-        label.set_product_url(row.product_url)
+        label.set_product_url(self._row_product_url(row))
         layout.addWidget(label, 0, Qt.AlignCenter)
         return container, label
 
@@ -620,7 +1098,7 @@ class ChannelTab(QWidget):
             return 0, "#94a3b8", "판매 기준일 정보 없음"
 
         stock = row.stock
-        sales = row.sales
+        sales = self._effective_sales(row)
         if stock is None or sales is None:
             return 0, "#94a3b8", f"재고/판매 데이터 부족 ({period_days}일 기준)"
 
@@ -691,21 +1169,79 @@ class ChannelTab(QWidget):
         original_name = row.name
         is_customized = display_name != original_name
         is_zero_stock = row.stock is not None and int(row.stock) == 0
+        shared_rule = self._shared_stock_rule(row)
+        shared_role = "대표SKU" if shared_rule and shared_rule.is_master else "비대표SKU"
+        shared_tooltip = ""
+        if shared_rule:
+            shared_tooltip = (
+                f"\n공유재고 그룹: {shared_rule.group_id} | "
+                f"환산수량 x{shared_rule.pack_size} | {shared_role}"
+            )
 
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(6, 0, 6, 0)
-        layout.setSpacing(0)
+        layout.setSpacing(1)
+
+        if shared_rule:
+            badge_row = QWidget()
+            badge_layout = QHBoxLayout(badge_row)
+            badge_layout.setContentsMargins(0, 0, 0, 0)
+            badge_layout.setSpacing(3)
+
+            share_icon = QLabel("⇄")
+            share_icon.setAlignment(Qt.AlignCenter)
+            share_icon.setFixedSize(14, 14)
+            share_icon.setToolTip("공유재고")
+            share_icon.setStyleSheet(
+                """
+                color: #ffffff;
+                background: #059669;
+                font-size: 9px;
+                font-weight: 700;
+                border-radius: 7px;
+                """
+                if shared_rule.is_master
+                else """
+                color: #ffffff;
+                background: #2563eb;
+                font-size: 9px;
+                font-weight: 700;
+                border-radius: 7px;
+                """
+            )
+            badge_layout.addWidget(share_icon, 0, Qt.AlignLeft)
+
+            group_text = shared_rule.group_id
+            if len(group_text) > 14:
+                group_text = f"{group_text[:14]}..."
+            group_badge = QLabel(f"◈ {group_text} x{shared_rule.pack_size}")
+            group_badge.setToolTip(f"공유그룹: {shared_rule.group_id} | 환산수량 x{shared_rule.pack_size}")
+            group_badge.setStyleSheet(
+                """
+                color: #1e40af;
+                background: #dbeafe;
+                font-size: 8px;
+                font-weight: 600;
+                padding: 0px 4px;
+                border-radius: 5px;
+                """
+            )
+            badge_layout.addWidget(group_badge, 0, Qt.AlignLeft)
+            badge_layout.addStretch(1)
+            layout.addWidget(badge_row)
 
         name_label = EditableNameLabel(display_name)
         name_color = "#b91c1c" if is_zero_stock else "#0f172a"
         if is_customized:
-            name_label.setToolTip(f"원래 상품명: {original_name}\n더블클릭: 표시 상품명 수정")
+            name_label.setToolTip(
+                f"원래 상품명: {original_name}\n더블클릭: 표시 상품명 수정{shared_tooltip}"
+            )
             name_label.setStyleSheet(
                 f"color: {name_color}; font-weight: 700; padding: 0px; margin: 0px;"
             )
         else:
-            name_label.setToolTip("더블클릭: 표시 상품명 수정")
+            name_label.setToolTip(f"더블클릭: 표시 상품명 수정{shared_tooltip}")
             name_label.setStyleSheet(
                 f"color: {name_color}; font-weight: 500; padding: 0px; margin: 0px;"
             )
@@ -746,8 +1282,253 @@ class ChannelTab(QWidget):
         self._apply_filters()
         self.favorites_changed.emit(self.channel_name)
 
+    def _selected_filtered_rows(self) -> list[ChannelProduct]:
+        selected: list[ChannelProduct] = []
+        indexes = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        seen_rows: set[int] = set()
+        for idx in indexes:
+            row_index = idx.row()
+            if row_index in seen_rows:
+                continue
+            seen_rows.add(row_index)
+            if 0 <= row_index < len(self.filtered_rows):
+                selected.append(self.filtered_rows[row_index])
+        if selected:
+            return selected
+
+        current = self.table.currentRow()
+        if 0 <= current < len(self.filtered_rows):
+            return [self.filtered_rows[current]]
+        return []
+
+    def _available_shared_group_ids(self) -> list[str]:
+        groups = {rule.group_id for rule in self.shared_stock_rules.values() if rule.group_id}
+        return sorted(groups)
+
+    def _group_has_master(self, group_id: str) -> bool:
+        for rule in self.shared_stock_rules.values():
+            if rule.group_id == group_id and rule.is_master:
+                return True
+        return False
+
+    @Slot(object)
+    def _open_table_context_menu(self, pos: object) -> None:
+        if not hasattr(pos, "x") or not hasattr(pos, "y"):
+            return
+        index = self.table.indexAt(pos)
+        if index.isValid():
+            row_index = int(index.row())
+            selected_indexes = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+            selected_rows = {idx.row() for idx in selected_indexes}
+            if row_index not in selected_rows:
+                self.table.clearSelection()
+                self.table.selectRow(row_index)
+                self.table.setCurrentCell(row_index, 1)
+
+        selected = self._selected_filtered_rows()
+        if not selected:
+            return
+
+        menu = QMenu(self)
+        label = f"선택 {len(selected)}개" if len(selected) > 1 else "선택 상품"
+        set_action = menu.addAction(f"{label} 새 공유그룹 설정...")
+        add_existing_action = None
+        if self._available_shared_group_ids():
+            add_existing_action = menu.addAction(f"{label} 기존 공유그룹에 추가...")
+        clear_action = menu.addAction(f"{label} 공유재고 해제")
+
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen == set_action:
+            self._configure_shared_stock_for_selected()
+        elif add_existing_action and chosen == add_existing_action:
+            self._add_selected_to_existing_shared_group()
+        elif chosen == clear_action:
+            self._clear_shared_stock_for_selected()
+
+    def _pick_pack_size_for_row(self, row: ChannelProduct) -> int | None:
+        key = self._name_override_key(row)
+        current_rule = self.shared_stock_rules.get(key)
+        default_pack = current_rule.pack_size if current_rule else self._guess_pack_size(self._display_name(row))
+        pack_size, pack_ok = QInputDialog.getInt(
+            self,
+            "원재고 차감수량 설정",
+            f"[{self._display_name(row)}]\n이 상품 1개 판매 시 공용재고 차감수량",
+            max(1, int(default_pack)),
+            1,
+            9999,
+            1,
+        )
+        if not pack_ok:
+            return None
+        return int(pack_size)
+
+    def _add_selected_to_existing_shared_group(self) -> None:
+        selected = self._selected_filtered_rows()
+        if not selected:
+            return
+
+        groups = self._available_shared_group_ids()
+        if not groups:
+            QMessageBox.information(self, "공유재고", "등록된 공유그룹이 없습니다.")
+            return
+
+        group_key, ok = QInputDialog.getItem(
+            self,
+            "기존 공유그룹 선택",
+            "추가할 공유그룹을 선택하세요.",
+            groups,
+            0,
+            False,
+        )
+        if not ok or not group_key:
+            return
+
+        master_key: str | None = None
+        if not self._group_has_master(group_key):
+            options: list[str] = []
+            option_to_key: dict[str, str] = {}
+            for row in selected:
+                text = self._display_name(row)
+                key = self._name_override_key(row)
+                option = f"{row.serial}. {text}"
+                options.append(option)
+                option_to_key[option] = key
+            options.append("대표SKU 미지정")
+            picked, picked_ok = QInputDialog.getItem(
+                self,
+                "대표SKU 선택",
+                f"그룹 '{group_key}'에 대표SKU가 없습니다. 대표SKU를 선택하세요.",
+                options,
+                0,
+                False,
+            )
+            if not picked_ok:
+                return
+            master_key = option_to_key.get(picked)
+
+        saved_count = 0
+        for row in selected:
+            pack_size = self._pick_pack_size_for_row(row)
+            if pack_size is None:
+                return
+            key = self._name_override_key(row)
+            self._save_shared_stock_rule_with_sync(
+                key,
+                group_key,
+                pack_size,
+                bool(master_key and key == master_key),
+            )
+            saved_count += 1
+
+        self.shared_stock_rules = self.cache.load_shared_stock_rules(self.channel_name)
+        self._force_full_render_next = True
+        self._apply_filters()
+        self._update_today_sales_amount_label()
+        self.status_label.setText(
+            f"{self.channel_name} 공유그룹 '{group_key}' 추가: {saved_count}건"
+        )
+
+    def _configure_shared_stock_for_selected(self) -> None:
+        selected = self._selected_filtered_rows()
+        if not selected:
+            return
+
+        existing_groups = {
+            rule.group_id
+            for row in selected
+            for rule in [self._shared_stock_rule(row)]
+            if rule is not None
+        }
+        if len(existing_groups) == 1:
+            default_group = next(iter(existing_groups))
+        else:
+            base = re.sub(r"\s+", "-", self._display_name(selected[0]).strip())
+            default_group = (base[:24] or "shared-group").strip("-")
+
+        group_id, ok = QInputDialog.getText(
+            self,
+            "공유재고 그룹 설정",
+            "그룹명을 입력하세요.",
+            QLineEdit.Normal,
+            default_group,
+        )
+        if not ok:
+            return
+        group_key = group_id.strip()
+        if not group_key:
+            QMessageBox.information(self, "공유재고 그룹", "그룹명은 비워둘 수 없습니다.")
+            return
+
+        master_key: str | None = None
+        if len(selected) == 1:
+            master_key = self._name_override_key(selected[0])
+        else:
+            options: list[str] = []
+            option_to_key: dict[str, str] = {}
+            for row in selected:
+                text = self._display_name(row)
+                key = self._name_override_key(row)
+                option = f"{row.serial}. {text}"
+                options.append(option)
+                option_to_key[option] = key
+            options.append("다른 탭에서 대표SKU 지정")
+            picked, picked_ok = QInputDialog.getItem(
+                self,
+                "대표SKU 선택",
+                "이 그룹의 대표SKU를 선택하세요.",
+                options,
+                0,
+                False,
+            )
+            if not picked_ok:
+                return
+            master_key = option_to_key.get(picked)
+
+        saved_count = 0
+        for row in selected:
+            key = self._name_override_key(row)
+            pack_size = self._pick_pack_size_for_row(row)
+            if pack_size is None:
+                return
+
+            self._save_shared_stock_rule_with_sync(
+                key,
+                group_key,
+                pack_size,
+                bool(master_key and key == master_key),
+            )
+            saved_count += 1
+
+        self.shared_stock_rules = self.cache.load_shared_stock_rules(self.channel_name)
+        self._force_full_render_next = True
+        self._apply_filters()
+        self._update_today_sales_amount_label()
+        self.status_label.setText(f"{self.channel_name} 공유재고 설정 저장: {saved_count}건")
+
+    def _clear_shared_stock_for_selected(self) -> None:
+        selected = self._selected_filtered_rows()
+        if not selected:
+            return
+
+        removed = 0
+        for row in selected:
+            key = self._name_override_key(row)
+            if key in self.shared_stock_rules:
+                removed += 1
+            self._delete_shared_stock_rule_with_sync(key)
+
+        self.shared_stock_rules = self.cache.load_shared_stock_rules(self.channel_name)
+        self._force_full_render_next = True
+        self._apply_filters()
+        self._update_today_sales_amount_label()
+        self.status_label.setText(f"{self.channel_name} 공유재고 해제: {removed}건")
+
     def _open_product_page(self, url: str) -> None:
-        QDesktopServices.openUrl(QUrl(url))
+        normalized = _normalize_web_url(url)
+        if not normalized:
+            QMessageBox.information(self, "상품 링크", "유효한 상품 링크가 없습니다.")
+            return
+        QDesktopServices.openUrl(QUrl(normalized))
 
     @Slot()
     def _apply_filters(self) -> None:
@@ -825,9 +1606,9 @@ class ChannelTab(QWidget):
         if col == 4:
             return self._sort_nullable_numeric(rows, lambda row: row.stock, descending)
         if col == 5:
-            return self._sort_nullable_numeric(rows, lambda row: row.today_sales, descending)
+            return self._sort_nullable_numeric(rows, self._effective_today_sales, descending)
         if col == 6:
-            return self._sort_nullable_numeric(rows, lambda row: row.sales, descending)
+            return self._sort_nullable_numeric(rows, self._effective_sales, descending)
         if col == 7:
             return self._sort_nullable_numeric(rows, self._stockout_days, descending)
         if col == 8:
@@ -869,6 +1650,11 @@ class ChannelTab(QWidget):
         ]
 
     def _render_row(self, index: int, row: ChannelProduct, token: int) -> None:
+        today_sales = self._effective_today_sales(row)
+        period_sales = self._effective_sales(row)
+        shared_rule = self._shared_stock_rule(row)
+        shared_excluded = bool(shared_rule and not shared_rule.is_master)
+
         self.table.setRowHeight(index, 66)
         self.table.setCellWidget(index, 0, self._favorite_cell(row))
 
@@ -893,9 +1679,9 @@ class ChannelTab(QWidget):
             index,
             5,
             self._table_item(
-                self._fmt_int(row.today_sales),
+                self._fmt_int(today_sales),
                 Qt.AlignRight | Qt.AlignVCenter,
-                sort_value=self._sortable_none_last(row.today_sales),
+                sort_value=self._sortable_none_last(today_sales),
             ),
         )
 
@@ -903,9 +1689,9 @@ class ChannelTab(QWidget):
             index,
             6,
             self._table_item(
-                self._fmt_int(row.sales),
+                self._fmt_int(period_sales),
                 Qt.AlignRight | Qt.AlignVCenter,
-                sort_value=self._sortable_none_last(row.sales),
+                sort_value=self._sortable_none_last(period_sales),
             ),
         )
 
@@ -940,6 +1726,13 @@ class ChannelTab(QWidget):
         )
 
         self._queue_image(image_label, row.image_url, token)
+
+        if shared_excluded:
+            for col in (5, 6, 8):
+                item = self.table.item(index, col)
+                if item:
+                    item.setToolTip("공유재고 비대표 SKU는 중복 매출 방지를 위해 0으로 표시됩니다.")
+                    item.setForeground(QColor("#64748b"))
 
         # 품절 행 전체 빨간 배경
         is_soldout = row.stock is not None and int(row.stock) == 0
@@ -1577,7 +2370,11 @@ class InventoryManagementTab(QWidget):
         label.setStyleSheet("border: 1px solid #d0d7de; border-radius: 6px;")
 
     def _open_product_page(self, url: str) -> None:
-        QDesktopServices.openUrl(QUrl(url))
+        normalized = _normalize_web_url(url)
+        if not normalized:
+            QMessageBox.information(self, "상품 링크", "유효한 상품 링크가 없습니다.")
+            return
+        QDesktopServices.openUrl(QUrl(normalized))
 
     @Slot(QTableWidgetItem)
     def _on_item_double_clicked(self, item: QTableWidgetItem) -> None:
@@ -1592,7 +2389,11 @@ class InventoryManagementTab(QWidget):
         url = item.data(Qt.UserRole + 1)
         if not isinstance(url, str) or not url.strip():
             return
-        QDesktopServices.openUrl(QUrl(url))
+        normalized = _normalize_web_url(url)
+        if not normalized:
+            QMessageBox.information(self, "상품 링크", "유효한 상품 링크가 없습니다.")
+            return
+        QDesktopServices.openUrl(QUrl(normalized))
 
     def shutdown(self) -> None:
         self.image_executor.shutdown(wait=False, cancel_futures=True)
@@ -2481,6 +3282,7 @@ class SalesDailyTab(QWidget):
         self.image_downloaded.connect(self._on_image_downloaded)
 
         self._sales_dates: dict[str, int] = {}
+        self._highlighted_dates: set[str] = set()
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -2538,35 +3340,121 @@ class SalesDailyTab(QWidget):
         right.addWidget(self.table, 1)
         layout.addLayout(right, 1)
 
-        # 초기 로드: 판매 날짜 목록
-        self._load_sales_dates()
+        # 초기 로드: 판매 날짜 목록 + 최신 판매일 자동 조회
+        self.reload(preserve_selection=False)
 
-    def _load_sales_dates(self) -> None:
+    @staticmethod
+    def _qdate_from_iso(date_str: str) -> QDate | None:
+        try:
+            y, m, d = [int(x) for x in date_str.split("-")]
+            qdate = QDate(y, m, d)
+            if qdate.isValid():
+                return qdate
+        except Exception:
+            return None
+        return None
+
+    def reload(self, preserve_selection: bool = True) -> None:
+        self._load_sales_dates(preserve_selection=preserve_selection)
+
+    def _load_sales_dates(self, preserve_selection: bool = True) -> None:
         if not self.monitor_url:
+            self.table.setRowCount(0)
+            self.summary_label.setText("라즈베리파이 미연결")
             return
+
+        selected = self.calendar.selectedDate() if preserve_selection else None
         try:
             resp = httpx.get(
                 f"{self.monitor_url.rstrip('/')}/sales/dates",
                 timeout=self.timeout,
             )
             resp.raise_for_status()
-            self._sales_dates = resp.json().get("dates", {})
+            raw_dates = resp.json().get("dates", {})
+            if isinstance(raw_dates, dict):
+                cleaned: dict[str, int] = {}
+                for key, count in raw_dates.items():
+                    date_key = str(key)
+                    if self._qdate_from_iso(date_key) is None:
+                        continue
+                    try:
+                        cleaned[date_key] = int(count)
+                    except Exception:
+                        cleaned[date_key] = 0
+                self._sales_dates = cleaned
+            else:
+                self._sales_dates = {}
             self._highlight_calendar()
-        except Exception:
-            pass
+        except Exception as e:
+            self._sales_dates = {}
+            self.table.setRowCount(0)
+            self.summary_label.setText(f"판매일보 연결 실패: {e}")
+            return
+
+        target_date: QDate | None = None
+        if (
+            selected
+            and selected.isValid()
+            and selected.toString("yyyy-MM-dd") in self._sales_dates
+        ):
+            target_date = selected
+        elif self._sales_dates:
+            latest_date = max(self._sales_dates.keys())
+            target_date = self._qdate_from_iso(latest_date)
+        elif selected and selected.isValid():
+            target_date = selected
+        else:
+            target_date = QDate.currentDate()
+
+        if target_date and target_date.isValid():
+            self.calendar.setSelectedDate(target_date)
+            self._on_date_selected(target_date)
+        else:
+            self.table.setRowCount(0)
+            self.summary_label.setText("판매 데이터가 없습니다.")
 
     def _highlight_calendar(self) -> None:
         """판매 이벤트가 있는 날짜에 마커 표시."""
+        empty_fmt = QTextCharFormat()
+        for date_str in self._highlighted_dates:
+            qd = self._qdate_from_iso(date_str)
+            if qd is not None:
+                self.calendar.setDateTextFormat(qd, empty_fmt)
+
         fmt = QTextCharFormat()
         fmt.setBackground(QColor("#dbeafe"))
         fmt.setForeground(QColor("#1e40af"))
+        highlighted: set[str] = set()
         for date_str in self._sales_dates:
-            try:
-                parts = date_str.split("-")
-                qd = QDate(int(parts[0]), int(parts[1]), int(parts[2]))
-                self.calendar.setDateTextFormat(qd, fmt)
-            except Exception:
+            qd = self._qdate_from_iso(date_str)
+            if qd is None:
                 continue
+            self.calendar.setDateTextFormat(qd, fmt)
+            highlighted.add(date_str)
+        self._highlighted_dates = highlighted
+
+    def _sale_product_url(self, sale_row: dict) -> str | None:
+        direct = _normalize_web_url(sale_row.get("product_url"))
+        if direct:
+            return direct
+
+        channel = str(sale_row.get("channel") or "").strip().lower()
+        product_id = str(sale_row.get("product_id") or "").strip()
+        name = str(sale_row.get("name") or "").strip()
+
+        if channel == "naver" and product_id.isdigit():
+            generated = _normalize_web_url(f"https://smartstore.naver.com/main/products/{product_id}")
+            if generated:
+                return generated
+
+        return _normalize_web_url(_build_search_url(channel, name))
+
+    def _open_sale_product_page(self, url: str) -> None:
+        normalized = _normalize_web_url(url)
+        if not normalized:
+            QMessageBox.information(self, "상품 링크", "유효한 상품 링크가 없습니다.")
+            return
+        QDesktopServices.openUrl(QUrl(normalized))
 
     def _on_date_selected(self, qdate: QDate) -> None:
         date_str = qdate.toString("yyyy-MM-dd")
@@ -2625,9 +3513,11 @@ class SalesDailyTab(QWidget):
 
             # 이미지
             img_label = ProductImageLabel()
+            img_label.clicked.connect(self._open_sale_product_page)
             img_url = s.get("image_url")
+            product_url = self._sale_product_url(s)
+            img_label.set_product_url(product_url)
             if img_url:
-                img_label.set_product_url(s.get("product_url"))
                 self._request_image(img_label, img_url, token)
             self.table.setCellWidget(i, 0, img_label)
 
@@ -2743,6 +3633,8 @@ class MainWindow(QMainWindow):
             sales_period_days=sales_days,
             fetch_fn=self.naver_service.fetch,
             initial_fetch_fn=self.naver_service.fetch_cached,
+            monitor_url=config.monitor_url,
+            timeout_seconds=config.timeout_seconds,
         )
         self.coupang_tab = ChannelTab(
             channel_name="쿠팡",
@@ -2750,6 +3642,8 @@ class MainWindow(QMainWindow):
             sales_period_days=30,
             fetch_fn=self.coupang_service.fetch,
             initial_fetch_fn=self.coupang_service.fetch_cached,
+            monitor_url=config.monitor_url,
+            timeout_seconds=config.timeout_seconds,
         )
         self.inventory_tab = InventoryManagementTab()
         self.sales_daily_tab = SalesDailyTab(
@@ -2827,6 +3721,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.sales_daily_tab, "판매일보")
         self.tabs.addTab(self.revenue_tab, "매출비교")
         self.tabs.addTab(self.keyword_tab, "키워드매출")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         corner = QWidget()
         corner_layout = QHBoxLayout(corner)
         corner_layout.setContentsMargins(0, 0, 0, 0)
@@ -3047,6 +3942,11 @@ class MainWindow(QMainWindow):
             return
         if 0 <= index < self.tabs.count():
             self.tabs.setCurrentIndex(index)
+
+    @Slot(int)
+    def _on_tab_changed(self, index: int) -> None:
+        if self.tabs.widget(index) is self.sales_daily_tab:
+            self.sales_daily_tab.reload()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.naver_tab.shutdown()

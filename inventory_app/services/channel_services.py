@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, date
 from typing import Dict, List, Tuple
 
 import httpx
@@ -12,12 +12,22 @@ from inventory_app.models import ChannelProduct
 from inventory_app.services.local_cache import ChannelProductCache
 
 
+def _monitor_sales_key(product_id: str, item_id: str | None) -> str:
+    return f"{product_id}|{item_id or ''}"
+
+
 def _fetch_from_monitor(url: str, channel: str, timeout: int) -> List[ChannelProduct] | None:
     """라즈베리파이 API에서 최신 재고 조회. 실패 시 None 반환."""
     try:
-        resp = httpx.get(f"{url.rstrip('/')}/inventory", timeout=timeout)
+        base_url = url.rstrip("/")
+        resp = httpx.get(f"{base_url}/inventory", timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
+        today_sales_exact, today_sales_by_product = _fetch_today_sales_map_from_monitor(
+            base_url,
+            channel,
+            timeout,
+        )
         rows = data.get(channel, [])
         now = datetime.now()
         result: List[ChannelProduct] = []
@@ -26,10 +36,24 @@ def _fetch_from_monitor(url: str, channel: str, timeout: int) -> List[ChannelPro
                 synced = datetime.fromisoformat(r["recorded_at"])
             except Exception:
                 synced = now
+            product_id = str(r.get("product_id", ""))
+            item_id = (str(r.get("item_id")) if r.get("item_id") else None)
+            raw_today = r.get("today_sales")
+            if raw_today is None:
+                exact_key = _monitor_sales_key(product_id, item_id)
+                raw_today = today_sales_exact.get(exact_key)
+                # item_id가 있는 행은 정확 매칭만 사용하고, 없을 때만 product 단위 fallback 허용
+                if raw_today is None and not item_id:
+                    raw_today = today_sales_by_product.get(product_id, 0)
+                if raw_today is None:
+                    raw_today = 0
+            today_sales = _to_int(raw_today)
+            if today_sales is None:
+                today_sales = 0
             result.append(ChannelProduct(
                 serial=i,
-                product_id=str(r.get("product_id", "")),
-                item_id=r.get("item_id"),
+                product_id=product_id,
+                item_id=item_id,
                 name=str(r.get("name", "")),
                 image_url=r.get("image_url"),
                 product_url=r.get("product_url"),
@@ -37,11 +61,46 @@ def _fetch_from_monitor(url: str, channel: str, timeout: int) -> List[ChannelPro
                 sales=r.get("sales"),
                 price=r.get("price"),
                 synced_at=synced,
-                today_sales=r.get("today_sales"),
+                today_sales=today_sales,
             ))
         return result
     except Exception:
         return None
+
+
+def _fetch_today_sales_map_from_monitor(
+    base_url: str,
+    channel: str,
+    timeout: int,
+) -> tuple[Dict[str, int], Dict[str, int]]:
+    try:
+        today = date.today().strftime("%Y-%m-%d")
+        resp = httpx.get(f"{base_url}/sales?date={today}", timeout=timeout)
+        resp.raise_for_status()
+        payload = resp.json()
+        sales = payload.get("sales") if isinstance(payload, dict) else []
+        if not isinstance(sales, list):
+            return {}, {}
+
+        result_exact: Dict[str, int] = {}
+        result_by_product: Dict[str, int] = {}
+        for row in sales:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("channel") or "").lower() != channel.lower():
+                continue
+            product_id = str(row.get("product_id") or "").strip()
+            if not product_id:
+                continue
+            item_id = (str(row.get("item_id")) if row.get("item_id") else None)
+            qty = _to_int(row.get("qty_sold")) or 0
+            qty = max(0, qty)
+            exact_key = _monitor_sales_key(product_id, item_id)
+            result_exact[exact_key] = result_exact.get(exact_key, 0) + qty
+            result_by_product[product_id] = result_by_product.get(product_id, 0) + qty
+        return result_exact, result_by_product
+    except Exception:
+        return {}, {}
 
 
 def _to_int(value: object) -> int | None:
@@ -91,6 +150,7 @@ def _row_signature(row: ChannelProduct) -> tuple[object, ...]:
         row.product_url,
         _to_int(row.stock),
         _to_int(row.sales),
+        _to_int(row.today_sales),
         _to_int(row.price),
     )
 
@@ -182,9 +242,12 @@ class NaverChannelService:
                 try:
                     today_map = self.smartstore_stats.fetch_product_sales_counts(days=1)
                     for row in rows:
-                        row.today_sales = today_map.get(row.product_id)
+                        if row.today_sales is None:
+                            row.today_sales = today_map.get(row.product_id, 0)
                 except Exception:
-                    pass
+                    for row in rows:
+                        if row.today_sales is None:
+                            row.today_sales = 0
                 _assign_serial_by_sales(rows)
                 return rows, warnings
 
@@ -206,6 +269,7 @@ class NaverChannelService:
                     sales=None,
                     price=raw.get("price"),
                     synced_at=synced_at,
+                    today_sales=0,
                 )
             )
 
@@ -213,6 +277,15 @@ class NaverChannelService:
         if sales_map is not None:
             for row in rows:
                 row.sales = sales_map.get(row.product_id, 0)
+
+        try:
+            today_map = self.smartstore_stats.fetch_product_sales_counts(days=1)
+            for row in rows:
+                row.today_sales = today_map.get(row.product_id, 0)
+        except Exception:
+            for row in rows:
+                if row.today_sales is None:
+                    row.today_sales = 0
 
         rows = _reconcile_rows_with_cache(self._row_cache, rows)
         _assign_serial_by_sales(rows)
@@ -289,6 +362,7 @@ class CoupangChannelService:
                     sales=raw.get("sales"),
                     price=raw.get("price"),
                     synced_at=synced_at,
+                    today_sales=0,
                 )
             )
 

@@ -33,6 +33,13 @@ class CoupangRocketConnector:
         self.detail_sleep_seconds = 0.15
 
     @staticmethod
+    def _sanitize_query_text(text: str | None) -> str:
+        if not isinstance(text, str):
+            return ""
+        cleaned = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+        return " ".join(cleaned.split())
+
+    @staticmethod
     def _signed_date() -> str:
         return datetime.utcnow().strftime("%y%m%dT%H%M%SZ")
 
@@ -229,8 +236,9 @@ class CoupangRocketConnector:
                     f"?itemId={page_item_id}&vendorItemId={vendor_item_id}"
                 )
             return f"https://www.coupang.com/vp/products/{page_item_id}"
-        if display_name:
-            return f"https://www.coupang.com/np/search?q={quote_plus(display_name)}"
+        query = CoupangRocketConnector._sanitize_query_text(display_name)
+        if query:
+            return f"https://www.coupang.com/np/search?q={quote_plus(query)}"
         return None
 
     @staticmethod

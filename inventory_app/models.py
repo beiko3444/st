@@ -38,3 +38,10 @@ class UnifiedProduct:
     coupang_price: Optional[int]
     match_type: str
     synced_at: datetime
+
+
+@dataclass
+class SharedStockRule:
+    group_id: str
+    pack_size: int = 1
+    is_master: bool = False
