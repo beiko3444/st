@@ -4,6 +4,7 @@ import math
 import re
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, Callable, Dict, List
 from urllib.parse import quote_plus
 
@@ -3445,6 +3446,40 @@ class SalesDailyTab(QWidget):
     """판매일보 탭 — 캘린더에서 날짜 클릭 시 해당 일자 판매 내역을 표시."""
 
     image_downloaded = Signal(str, object)
+    _WEATHER_LOCATIONS: tuple[tuple[str, float, float], ...] = (
+        ("중국 상하이", 31.2304, 121.4737),
+        ("부산 강서구", 35.2122, 128.9807),
+    )
+    _WEATHER_CODE_LABELS: dict[int, str] = {
+        0: "맑음",
+        1: "대체로 맑음",
+        2: "부분 흐림",
+        3: "흐림",
+        45: "안개",
+        48: "짙은 안개",
+        51: "약한 이슬비",
+        53: "보통 이슬비",
+        55: "강한 이슬비",
+        56: "약한 어는 이슬비",
+        57: "강한 어는 이슬비",
+        61: "약한 비",
+        63: "보통 비",
+        65: "강한 비",
+        66: "약한 어는 비",
+        67: "강한 어는 비",
+        71: "약한 눈",
+        73: "보통 눈",
+        75: "강한 눈",
+        77: "싸락눈",
+        80: "약한 소나기",
+        81: "보통 소나기",
+        82: "강한 소나기",
+        85: "약한 눈 소나기",
+        86: "강한 눈 소나기",
+        95: "뇌우",
+        96: "약한 우박성 뇌우",
+        99: "강한 우박성 뇌우",
+    }
 
     def __init__(self, monitor_url: str | None = None, timeout: int = 30) -> None:
         super().__init__()
@@ -3460,6 +3495,7 @@ class SalesDailyTab(QWidget):
 
         self._sales_dates: dict[str, int] = {}
         self._highlighted_dates: set[str] = set()
+        self._weather_cache: dict[str, str] = {}
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -3477,6 +3513,10 @@ class SalesDailyTab(QWidget):
         self.summary_label = QLabel("날짜를 선택하세요")
         self.summary_label.setWordWrap(True)
         left.addWidget(self.summary_label)
+
+        self.weather_label = QLabel("날짜를 선택하면 중국 상하이/부산 강서구 날씨를 표시합니다.")
+        self.weather_label.setWordWrap(True)
+        left.addWidget(self.weather_label)
         left.addStretch(1)
         layout.addLayout(left, 0)
 
@@ -3510,6 +3550,20 @@ class SalesDailyTab(QWidget):
                     background: #f8fafc;
                     border: 1px solid #e2e8f0;
                     border-radius: 8px;
+                }
+                """
+            )
+        )
+        self.weather_label.setStyleSheet(
+            _with_base_widget_font(
+                """
+                QLabel {
+                    __BASE_WIDGET_FONT_CSS__
+                    padding: 8px;
+                    background: #f8fafc;
+                    border: 1px solid #e2e8f0;
+                    border-radius: 8px;
+                    color: #0f172a;
                 }
                 """
             )
@@ -3624,6 +3678,115 @@ class SalesDailyTab(QWidget):
             highlighted.add(date_str)
         self._highlighted_dates = highlighted
 
+    @classmethod
+    def _describe_weather_code(cls, weather_code: int | None) -> str:
+        if weather_code is None:
+            return "정보 없음"
+        return cls._WEATHER_CODE_LABELS.get(weather_code, f"코드 {weather_code}")
+
+    @staticmethod
+    def _first_daily_value(daily: dict[str, Any], key: str) -> Any | None:
+        values = daily.get(key)
+        if isinstance(values, list) and values:
+            return values[0]
+        return None
+
+    @staticmethod
+    def _to_float(value: Any) -> float | None:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    def _fetch_weather_for_location(
+        self,
+        date_str: str,
+        location_name: str,
+        latitude: float,
+        longitude: float,
+    ) -> str:
+        try:
+            target_date = date.fromisoformat(date_str)
+        except Exception:
+            return f"{location_name}: 날짜 형식 오류"
+
+        endpoint = (
+            "https://archive-api.open-meteo.com/v1/archive"
+            if target_date < date.today()
+            else "https://api.open-meteo.com/v1/forecast"
+        )
+        timeout_seconds = max(5.0, min(20.0, float(self.timeout)))
+
+        try:
+            resp = httpx.get(
+                endpoint,
+                params={
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum",
+                    "timezone": "Asia/Seoul",
+                    "start_date": date_str,
+                    "end_date": date_str,
+                },
+                timeout=timeout_seconds,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            return f"{location_name}: 조회 실패 ({exc})"
+
+        daily = payload.get("daily")
+        if not isinstance(daily, dict):
+            return f"{location_name}: 데이터 없음"
+        if not self._first_daily_value(daily, "time"):
+            return f"{location_name}: 예보 범위를 벗어난 날짜"
+
+        raw_code = self._first_daily_value(daily, "weather_code")
+        try:
+            weather_code = int(raw_code) if raw_code is not None else None
+        except Exception:
+            weather_code = None
+        weather_text = self._describe_weather_code(weather_code)
+
+        max_temp = self._to_float(self._first_daily_value(daily, "temperature_2m_max"))
+        min_temp = self._to_float(self._first_daily_value(daily, "temperature_2m_min"))
+        precip_sum = self._to_float(self._first_daily_value(daily, "precipitation_sum"))
+
+        if min_temp is not None and max_temp is not None:
+            temp_text = f"{min_temp:.1f}~{max_temp:.1f}°C"
+        elif max_temp is not None:
+            temp_text = f"최고 {max_temp:.1f}°C"
+        elif min_temp is not None:
+            temp_text = f"최저 {min_temp:.1f}°C"
+        else:
+            temp_text = "기온 정보 없음"
+        precip_text = f"강수 {precip_sum:.1f}mm" if precip_sum is not None else "강수 정보 없음"
+
+        return f"{location_name}: {weather_text} / {temp_text} / {precip_text}"
+
+    def _update_weather_label(self, date_str: str) -> None:
+        cached = self._weather_cache.get(date_str)
+        if cached:
+            self.weather_label.setText(cached)
+            return
+
+        lines = [f"<b>{date_str} 날씨</b>"]
+        for location_name, latitude, longitude in self._WEATHER_LOCATIONS:
+            lines.append(
+                self._fetch_weather_for_location(
+                    date_str=date_str,
+                    location_name=location_name,
+                    latitude=latitude,
+                    longitude=longitude,
+                )
+            )
+
+        text = "<br>".join(lines)
+        self._weather_cache[date_str] = text
+        self.weather_label.setText(text)
+
     def _sale_product_url(self, sale_row: dict) -> str | None:
         direct = _normalize_web_url(sale_row.get("product_url"))
         if direct:
@@ -3652,6 +3815,8 @@ class SalesDailyTab(QWidget):
         self.render_token += 1
         self.table.setRowCount(0)
         self.summary_label.setText(f"{date_str} 조회 중...")
+        self.weather_label.setText(f"{date_str} 날씨 조회 중...")
+        self._update_weather_label(date_str)
 
         if not self.monitor_url:
             self.summary_label.setText("라즈베리파이 미연결")
