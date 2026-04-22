@@ -314,6 +314,11 @@ class ChannelTab(QWidget):
         self._filter_timer.timeout.connect(self._apply_filters)
 
         self.sync_button = QPushButton("동기화")
+        self.auto_group_button = QPushButton("묶음 자동제안")
+        self.auto_group_button.setToolTip(
+            "상품명 패턴(예: 4팩, 10개입)으로 공유재고 그룹을 자동 감지합니다.\n"
+            "마스터(최소 pack_size)에 판매량을 합산하여 뻥튀기된 매출을 보정합니다."
+        )
         self.favorite_filter = QComboBox()
         self.search_input = QLineEdit()
         self.today_sales_amount_label = QLabel("오늘 총 판매금액: 0원")
@@ -360,7 +365,10 @@ class ChannelTab(QWidget):
         self.search_input.textChanged.connect(self._schedule_filter_refresh)
         self.today_sales_amount_label.setStyleSheet("color: #065f46; font-weight: 600;")
 
+        self.auto_group_button.clicked.connect(self._open_auto_group_suggest_dialog)
+
         top_bar.addWidget(self.sync_button)
+        top_bar.addWidget(self.auto_group_button)
         top_bar.addWidget(QLabel("필터"))
         top_bar.addWidget(self.favorite_filter)
         top_bar.addWidget(QLabel("검색"))
@@ -955,6 +963,115 @@ class ChannelTab(QWidget):
 
     def _shared_stock_rule(self, row: ChannelProduct) -> SharedStockRule | None:
         return self.shared_stock_rules.get(self._name_override_key(row))
+
+    def _open_auto_group_suggest_dialog(self) -> None:
+        """상품명 패턴으로 공유재고 그룹 자동 제안 → 확인 → 적용."""
+        from collections import defaultdict as _dd
+
+        from inventory_app.services.shared_stock_grouping import (
+            product_identity_key as _pk_fn,
+            suggest_groups as _suggest,
+        )
+
+        if not self.rows:
+            QMessageBox.information(self, "안내", "상품 목록이 없습니다. 먼저 동기화하세요.")
+            return
+
+        proposed = _suggest(self.rows, product_key_fn=_pk_fn)
+        if not proposed:
+            QMessageBox.information(
+                self,
+                "그룹 자동제안",
+                "묶음 상품 패턴(예: 4팩/10개입/세트 10 등)을 가진 그룹을 찾지 못했습니다.",
+            )
+            return
+
+        existing = dict(self.shared_stock_rules)
+        new_count = changed_count = same_count = 0
+        for pk, rule in proposed.items():
+            old = existing.get(pk)
+            if old is None:
+                new_count += 1
+            elif (old.group_id, int(old.pack_size), bool(old.is_master)) != (
+                rule.group_id,
+                int(rule.pack_size),
+                bool(rule.is_master),
+            ):
+                changed_count += 1
+            else:
+                same_count += 1
+
+        # 그룹 단위 미리보기
+        rows_by_key: Dict[str, ChannelProduct] = {}
+        for row in self.rows:
+            rows_by_key[_pk_fn(row)] = row
+        by_group: Dict[str, List[tuple[str, int, bool]]] = _dd(list)
+        for pk, rule in proposed.items():
+            row = rows_by_key.get(pk)
+            if row is None:
+                continue
+            by_group[rule.group_id].append(
+                (row.name, int(rule.pack_size), bool(rule.is_master))
+            )
+
+        preview_lines: List[str] = []
+        for gid, members in list(by_group.items())[:6]:
+            members_sorted = sorted(members, key=lambda m: m[1])
+            preview_lines.append(f"• 그룹: {gid}")
+            for name, pack, is_master in members_sorted:
+                tag = " ★마스터" if is_master else ""
+                short = name if len(name) <= 48 else name[:45] + "..."
+                preview_lines.append(f"   [{pack}팩]{tag} {short}")
+        if len(by_group) > 6:
+            preview_lines.append(f"... 외 {len(by_group) - 6}개 그룹 생략")
+        preview = "\n".join(preview_lines)
+
+        msg = (
+            f"{self.channel_name} 상품 기준 {len(by_group)}개 그룹 제안 "
+            f"(대상 SKU {len(proposed)}개)\n"
+            f"  신규 {new_count}  변경 {changed_count}  동일 {same_count}\n\n"
+            f"{preview}\n\n"
+            f"※ 마스터(최소 pack_size)에 판매량이 합산되고, 비마스터는 0 처리됩니다.\n"
+            f"기존 규칙은 덮어씁니다. 적용할까요?"
+        )
+
+        result = QMessageBox.question(
+            self,
+            "그룹 자동제안",
+            msg,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if result != QMessageBox.Yes:
+            return
+
+        applied = 0
+        for pk, rule in proposed.items():
+            try:
+                self._save_shared_stock_rule_with_sync(
+                    pk,
+                    rule.group_id,
+                    int(rule.pack_size),
+                    bool(rule.is_master),
+                )
+                applied += 1
+            except Exception:  # noqa: BLE001
+                continue
+
+        self.shared_stock_rules = self.cache.load_shared_stock_rules(self.channel_name)
+        self._apply_filters()
+        self._update_today_sales_amount_label()
+        self.favorites_changed.emit(self.channel_name)
+        self.status_label.setText(
+            f"{self.channel_name} 묶음 자동제안 적용 완료: {applied}건 저장 "
+            f"({len(by_group)}개 그룹)"
+        )
+        QMessageBox.information(
+            self,
+            "완료",
+            f"{applied}건 규칙 적용. 다음 동기화부터 마스터 집계가 반영됩니다.\n"
+            f"지금 즉시 반영하려면 상단 '동기화' 버튼을 누르세요.",
+        )
 
     def _shared_stock_api_url(self) -> str | None:
         if not self.monitor_url:
