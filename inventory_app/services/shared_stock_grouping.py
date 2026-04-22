@@ -201,7 +201,14 @@ def apply_master_aggregation(
     if not rules:
         return
 
-    # group_id 단위 집계
+    # 그룹별로 rows에 실제로 매칭된 member 목록 구성.
+    # "마스터 없는 그룹"을 감지하기 위해 먼저 group_has_master를 계산한다.
+    group_has_master: Dict[str, bool] = defaultdict(bool)
+    for rule in rules.values():
+        if rule.is_master:
+            group_has_master[rule.group_id] = True
+
+    # group_id 단위 집계 — 마스터가 있는 그룹만.
     totals_today: Dict[str, int] = defaultdict(int)
     totals_sales: Dict[str, int] = defaultdict(int)
     totals_today_has_data: Dict[str, bool] = defaultdict(bool)
@@ -212,6 +219,9 @@ def apply_master_aggregation(
         rule = rules.get(pk)
         if rule is None:
             continue
+        if not group_has_master.get(rule.group_id):
+            # 마스터가 없는 그룹은 집계를 신뢰할 수 없으므로 건드리지 않음.
+            continue
         pack = max(1, int(rule.pack_size))
 
         if row.today_sales is not None:
@@ -221,11 +231,14 @@ def apply_master_aggregation(
             totals_sales[rule.group_id] += max(0, int(row.sales)) * pack
             totals_sales_has_data[rule.group_id] = True
 
-    # rows 에 적용
+    # rows 에 적용 — 마스터 있는 그룹에 한해서만 덮어씀.
     for row in rows:
         pk = product_key_fn(row)
         rule = rules.get(pk)
         if rule is None:
+            continue
+        if not group_has_master.get(rule.group_id):
+            # 안전장치: 마스터 미지정 그룹은 원본 보존 (판매량 사라지지 않음).
             continue
         if rule.is_master:
             row.today_sales = (
