@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import threading
@@ -9,6 +10,23 @@ from pathlib import Path
 from typing import Dict, List
 
 from inventory_app.models import ChannelProduct, SharedStockRule
+
+
+def _row_content_hash(row: ChannelProduct) -> str:
+    """\ubcc0\uacbd \uac10\uc9c0\uc6a9 \ud574\uc2dc. serial/synced_at\uc740 \uc81c\uc678 (\ub300\uc0c1 \ub370\uc774\ud130 \uc790\uccb4\uc758 \ubcc0\uacbd\ub9cc \ubcf4\uae30 \uc704\ud568)."""
+    parts = (
+        str(row.product_id or ""),
+        str(row.item_id or ""),
+        str(row.name or ""),
+        str(row.image_url or ""),
+        str(row.product_url or ""),
+        str(row.stock) if row.stock is not None else "",
+        str(row.today_sales) if row.today_sales is not None else "",
+        str(row.sales) if row.sales is not None else "",
+        str(row.price) if row.price is not None else "",
+    )
+    joined = "\x1f".join(parts)
+    return hashlib.sha1(joined.encode("utf-8")).hexdigest()
 
 
 def _default_cache_path() -> Path:
@@ -58,6 +76,7 @@ class ChannelProductCache:
                     sales INTEGER,
                     price INTEGER,
                     synced_at TEXT NOT NULL,
+                    content_hash TEXT,
                     PRIMARY KEY (channel, row_no)
                 )
                 """
@@ -147,36 +166,81 @@ class ChannelProductCache:
             }
             if "today_sales" not in cols:
                 conn.execute("ALTER TABLE channel_products ADD COLUMN today_sales INTEGER")
+            if "content_hash" not in cols:
+                conn.execute("ALTER TABLE channel_products ADD COLUMN content_hash TEXT")
             conn.commit()
 
     def save_rows(self, channel: str, rows: List[ChannelProduct]) -> None:
+        """\ubcc0\uacbd\ubd84\ub9cc DB\uc5d0 \ubc18\uc601\ud558\ub294 diff-upsert \uc800\uc7a5.
+
+        - \uac01 row\uc758 content_hash\ub97c \uacc4\uc0b0\ud574 \uae30\uc874 \ud589\uacfc \ube44\uad50
+        - \ud574\uc2dc \ub3d9\uc77c: \uac74\ub108\ub700 (DB I/O \uc5c6\uc74c)
+        - \ud574\uc2dc \ub2e4\ub984: INSERT OR REPLACE
+        - \uc0c8 incoming\uc5d0\uc11c \uc0ac\ub77c\uc9c4 row_no\ub294 DELETE
+        - \uc804\uccb4 DELETE \ud6c4 \uc804\uccb4 INSERT \ubcf4\ub2e4 \ud6e8\uc52c \ube60\ub984 (\ubcc0\uacbd \uc5c6\uc73c\uba74 I/O 0)
+        """
         channel_key = str(channel).strip().lower()
-        with self._guard, self._connection() as conn:
-            conn.execute("DELETE FROM channel_products WHERE channel = ?", (channel_key,))
-            for row_no, row in enumerate(rows, start=1):
-                conn.execute(
-                    """
-                    INSERT INTO channel_products (
-                        channel, row_no, serial, product_id, item_id, name, image_url, product_url,
-                        stock, today_sales, sales, price, synced_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        channel_key,
-                        row_no,
-                        int(row.serial),
-                        row.product_id,
-                        row.item_id,
-                        row.name,
-                        row.image_url,
-                        row.product_url,
-                        row.stock,
-                        row.today_sales,
-                        row.sales,
-                        row.price,
-                        row.synced_at.isoformat(),
-                    ),
+        incoming: List[tuple] = []
+        incoming_row_nos: set[int] = set()
+        for row_no, row in enumerate(rows, start=1):
+            incoming_row_nos.add(row_no)
+            incoming.append(
+                (
+                    channel_key,
+                    row_no,
+                    int(row.serial),
+                    row.product_id,
+                    row.item_id,
+                    row.name,
+                    row.image_url,
+                    row.product_url,
+                    row.stock,
+                    row.today_sales,
+                    row.sales,
+                    row.price,
+                    row.synced_at.isoformat(),
+                    _row_content_hash(row),
                 )
+            )
+
+        with self._guard, self._connection() as conn:
+            # \uae30\uc874 row_no -> content_hash \uc2a4\ub0c5\uc0f7
+            existing: Dict[int, str] = {}
+            for rn, h in conn.execute(
+                "SELECT row_no, content_hash FROM channel_products WHERE channel = ?",
+                (channel_key,),
+            ):
+                existing[int(rn)] = str(h or "")
+
+            existing_row_nos = set(existing.keys())
+
+            # 1) incoming\uc5d0 \uc5c6\ub294 row_no\ub294 DELETE
+            to_delete = existing_row_nos - incoming_row_nos
+            if to_delete:
+                conn.executemany(
+                    "DELETE FROM channel_products WHERE channel = ? AND row_no = ?",
+                    [(channel_key, rn) for rn in to_delete],
+                )
+
+            # 2) \ud574\uc2dc \ubcc0\uacbd\ub41c/\uc2e0\uaddc row\ub9cc upsert
+            to_upsert: List[tuple] = []
+            for payload in incoming:
+                rn = payload[1]
+                h = payload[-1]
+                if existing.get(rn) != h:
+                    to_upsert.append(payload)
+
+            if to_upsert:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO channel_products (
+                        channel, row_no, serial, product_id, item_id, name, image_url, product_url,
+                        stock, today_sales, sales, price, synced_at, content_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    to_upsert,
+                )
+
             conn.commit()
 
     def load_rows(self, channel: str) -> List[ChannelProduct]:

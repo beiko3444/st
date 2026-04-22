@@ -3912,6 +3912,19 @@ class MainWindow(QMainWindow):
         self.keyword_tab.sync_finished.connect(self._on_sub_sync_finished)
         self._refresh_inventory_tab()
         QTimer.singleShot(0, self._load_initial_visible_channel_tab)
+        # 시작 시 자동 동기화: 창이 뜨고 캐시가 화면에 그려진 뒤 백그라운드 동기화 시작.
+        # 캐시 렌더링 → (500ms) → 자동 sync_now → 변경된 row만 diff 적용
+        QTimer.singleShot(500, self._auto_initial_sync)
+
+    def _auto_initial_sync(self) -> None:
+        """시작 시 자동 동기화 트리거. 이미 동기화 중이면 건너뜀."""
+        if self._sync_session_active:
+            return
+        try:
+            self.sync_now()
+        except Exception:  # noqa: BLE001
+            # 자동 트리거는 실패해도 조용히 넘김 (수동 버튼은 살아있음)
+            pass
 
     def _build_ui(self) -> None:
         root = QWidget(self)
