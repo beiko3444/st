@@ -29,6 +29,22 @@ def _row_content_hash(row: ChannelProduct) -> str:
     return hashlib.sha1(joined.encode("utf-8")).hexdigest()
 
 
+# 채널 키 정규화 — UI 는 한글명("네이버"/"쿠팡"), services 는 영문 코드("naver"/"coupang")를
+# 섞어 써왔기 때문에 둘 다 같은 bucket 으로 매핑한다.
+_CHANNEL_ALIASES = {
+    "네이버": "naver",
+    "naver": "naver",
+    "smartstore": "naver",
+    "쿠팡": "coupang",
+    "coupang": "coupang",
+}
+
+
+def _normalize_channel(channel: str | None) -> str:
+    text = str(channel or "").strip().lower()
+    return _CHANNEL_ALIASES.get(text, text)
+
+
 def _default_cache_path() -> Path:
     from_env = os.environ.get("SMARTINVENTORY_CACHE_DB", "").strip()
     if from_env:
@@ -168,6 +184,27 @@ class ChannelProductCache:
                 conn.execute("ALTER TABLE channel_products ADD COLUMN today_sales INTEGER")
             if "content_hash" not in cols:
                 conn.execute("ALTER TABLE channel_products ADD COLUMN content_hash TEXT")
+
+            # 채널 키 마이그레이션: 과거 UI 는 한글명("네이버"/"쿠팡") 으로 저장해
+            # services 의 영문 코드("naver"/"coupang") 조회와 불일치했음.
+            # 모든 관련 테이블의 channel 값을 정규화된 코드로 이동.
+            for old, new in [("네이버", "naver"), ("쿠팡", "coupang")]:
+                for table in (
+                    "channel_products",
+                    "product_name_overrides",
+                    "product_cost_overrides",
+                    "product_favorites",
+                    "shared_stock_rules",
+                    "shared_stock_pending_ops",
+                ):
+                    try:
+                        conn.execute(
+                            f"UPDATE {table} SET channel = ? WHERE channel = ?",
+                            (new, old),
+                        )
+                    except sqlite3.OperationalError:
+                        # 테이블 없거나 channel 컬럼 없으면 skip
+                        pass
             conn.commit()
 
     def save_rows(self, channel: str, rows: List[ChannelProduct]) -> None:
@@ -179,7 +216,7 @@ class ChannelProductCache:
         - \uc0c8 incoming\uc5d0\uc11c \uc0ac\ub77c\uc9c4 row_no\ub294 DELETE
         - \uc804\uccb4 DELETE \ud6c4 \uc804\uccb4 INSERT \ubcf4\ub2e4 \ud6e8\uc52c \ube60\ub984 (\ubcc0\uacbd \uc5c6\uc73c\uba74 I/O 0)
         """
-        channel_key = str(channel).strip().lower()
+        channel_key = _normalize_channel(channel)
         incoming: List[tuple] = []
         incoming_row_nos: set[int] = set()
         for row_no, row in enumerate(rows, start=1):
@@ -244,7 +281,7 @@ class ChannelProductCache:
             conn.commit()
 
     def load_rows(self, channel: str) -> List[ChannelProduct]:
-        channel_key = str(channel).strip().lower()
+        channel_key = _normalize_channel(channel)
         with self._guard, self._connection() as conn:
             cursor = conn.execute(
                 """
@@ -283,7 +320,7 @@ class ChannelProductCache:
         return parsed
 
     def load_name_overrides(self, channel: str) -> Dict[str, str]:
-        channel_key = str(channel).strip().lower()
+        channel_key = _normalize_channel(channel)
         with self._guard, self._connection() as conn:
             cursor = conn.execute(
                 """
@@ -304,7 +341,7 @@ class ChannelProductCache:
         return overrides
 
     def save_name_override(self, channel: str, product_key: str, custom_name: str | None) -> None:
-        channel_key = str(channel).strip().lower()
+        channel_key = _normalize_channel(channel)
         item_key = str(product_key).strip()
         value = str(custom_name or "").strip()
         if not item_key:
@@ -336,7 +373,7 @@ class ChannelProductCache:
             conn.commit()
 
     def load_favorite_keys(self, channel: str) -> set[str]:
-        channel_key = str(channel).strip().lower()
+        channel_key = _normalize_channel(channel)
         with self._guard, self._connection() as conn:
             cursor = conn.execute(
                 """
@@ -356,7 +393,7 @@ class ChannelProductCache:
         return keys
 
     def save_favorite(self, channel: str, product_key: str, is_favorite: bool) -> None:
-        channel_key = str(channel).strip().lower()
+        channel_key = _normalize_channel(channel)
         item_key = str(product_key).strip()
         if not item_key:
             return
@@ -386,7 +423,7 @@ class ChannelProductCache:
             conn.commit()
 
     def load_cost_overrides(self, channel: str) -> Dict[str, int]:
-        channel_key = str(channel).strip().lower()
+        channel_key = _normalize_channel(channel)
         with self._guard, self._connection() as conn:
             cursor = conn.execute(
                 """
@@ -410,7 +447,7 @@ class ChannelProductCache:
         return overrides
 
     def save_cost_override(self, channel: str, product_key: str, unit_cost: int | None) -> None:
-        channel_key = str(channel).strip().lower()
+        channel_key = _normalize_channel(channel)
         item_key = str(product_key).strip()
         if not item_key:
             return
@@ -441,7 +478,7 @@ class ChannelProductCache:
             conn.commit()
 
     def load_shared_stock_rules(self, channel: str) -> Dict[str, SharedStockRule]:
-        channel_key = str(channel).strip().lower()
+        channel_key = _normalize_channel(channel)
         with self._guard, self._connection() as conn:
             cursor = conn.execute(
                 """
@@ -471,7 +508,7 @@ class ChannelProductCache:
         return rules
 
     def replace_shared_stock_rules(self, channel: str, rules: Dict[str, SharedStockRule]) -> None:
-        channel_key = str(channel).strip().lower()
+        channel_key = _normalize_channel(channel)
         with self._guard, self._connection() as conn:
             conn.execute("DELETE FROM shared_stock_rules WHERE channel = ?", (channel_key,))
             for product_key, rule in rules.items():
@@ -507,7 +544,7 @@ class ChannelProductCache:
         pack_size: int,
         is_master: bool,
     ) -> None:
-        channel_key = str(channel).strip().lower()
+        channel_key = _normalize_channel(channel)
         item_key = str(product_key).strip()
         group_key = str(group_id).strip()
         if not item_key:
@@ -546,7 +583,7 @@ class ChannelProductCache:
             conn.commit()
 
     def delete_shared_stock_rule(self, channel: str, product_key: str) -> None:
-        channel_key = str(channel).strip().lower()
+        channel_key = _normalize_channel(channel)
         item_key = str(product_key).strip()
         if not item_key:
             return
@@ -570,7 +607,7 @@ class ChannelProductCache:
         pack_size: int | None = None,
         is_master: bool | None = None,
     ) -> None:
-        channel_key = str(channel).strip().lower()
+        channel_key = _normalize_channel(channel)
         item_key = str(product_key).strip()
         op = str(op_type).strip().lower()
         if not item_key or op not in {"upsert", "delete"}:
@@ -600,7 +637,7 @@ class ChannelProductCache:
         channel: str,
         limit: int = 200,
     ) -> list[dict]:
-        channel_key = str(channel).strip().lower()
+        channel_key = _normalize_channel(channel)
         with self._guard, self._connection() as conn:
             cursor = conn.execute(
                 """

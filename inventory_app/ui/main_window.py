@@ -226,6 +226,7 @@ class ClickableImageContainer(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self._product_url: str | None = None
+        self._press_inside: bool = False
 
     def set_product_url(self, url: str | None) -> None:
         self._product_url = _normalize_web_url(url)
@@ -236,11 +237,27 @@ class ClickableImageContainer(QWidget):
             self.setCursor(Qt.ArrowCursor)
             self.setToolTip("")
 
-    def mouseReleaseEvent(self, event: Any) -> None:
+    def mousePressEvent(self, event: Any) -> None:
+        # QTableWidget이 press를 가로채지 못하게 accept 해서 mouse grab 확보.
         if event.button() == Qt.LeftButton and self._product_url:
+            self._press_inside = True
+            event.accept()
+            return
+        self._press_inside = False
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: Any) -> None:
+        if (
+            event.button() == Qt.LeftButton
+            and self._product_url
+            and self._press_inside
+            and self.rect().contains(event.position().toPoint() if hasattr(event, "position") else event.pos())
+        ):
+            self._press_inside = False
             self.clicked.emit(self._product_url)
             event.accept()
             return
+        self._press_inside = False
         super().mouseReleaseEvent(event)
 
 
@@ -253,6 +270,23 @@ class EditableNameLabel(QLabel):
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
+
+
+class ClickableLabel(QLabel):
+    """클릭 가능한 QLabel."""
+
+    clicked = Signal()
+
+    def __init__(self, text: str = "") -> None:
+        super().__init__(text)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, event: Any) -> None:
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 class ChannelTab(QWidget):
@@ -306,7 +340,8 @@ class ChannelTab(QWidget):
         self.render_token = 0
         self._force_full_render_next = False
 
-        self.sort_column = 5
+        # 기본 정렬: 30일 누적 판매량 내림차순 (연번 순서와 일치)
+        self.sort_column = 6
         self.sort_order = Qt.DescendingOrder
         self._filter_timer = QTimer(self)
         self._filter_timer.setSingleShot(True)
@@ -321,7 +356,9 @@ class ChannelTab(QWidget):
         )
         self.favorite_filter = QComboBox()
         self.search_input = QLineEdit()
-        self.today_sales_amount_label = QLabel("오늘 총 판매금액: 0원")
+        self.today_sales_amount_label = ClickableLabel("오늘 총 판매금액: 0원")
+        self.today_sales_amount_label.setToolTip("클릭하면 오른쪽에 오늘 판매된 상품 목록을 표시합니다")
+        self.today_sales_amount_label.clicked.connect(self._show_today_all_sales_detail)
         self.status_label = QLabel("준비 완료")
         self.table = QTableWidget(0, 10)
         self.detail_title_label = QLabel("선택 상품 판매 로그")
@@ -384,7 +421,7 @@ class ChannelTab(QWidget):
                 "상품이미지",
                 "상품명",
                 "재고",
-                "판매",
+                "오늘판매",
                 "30일",
                 "품절예상",
                 "예상월매출",
@@ -423,7 +460,7 @@ class ChannelTab(QWidget):
         self.table.setColumnWidth(2, 64)
         self.table.setColumnWidth(3, 360)
         self.table.setColumnWidth(4, 68)
-        self.table.setColumnWidth(5, 66)
+        self.table.setColumnWidth(5, 76)
         self.table.setColumnWidth(6, 66)
         self.table.setColumnWidth(7, 84)
         self.table.setColumnWidth(8, 106)
@@ -664,7 +701,126 @@ class ChannelTab(QWidget):
         for rows in self._today_sales_events_by_product.values():
             rows.sort(key=lambda r: str(r.get("recorded_at") or ""), reverse=True)
 
+    def _set_detail_table_mode(self, mode: str) -> None:
+        """상세 테이블 헤더/컬럼 너비를 모드에 맞게 전환.
+
+        mode:
+          - 'row_log' : 선택 상품 판매 로그 (시간/수량/매출)
+          - 'today_all': 오늘 판매된 상품 집계 (상품명/수량/매출)
+        """
+        header = self.detail_table.horizontalHeader()
+        if mode == "today_all":
+            self.detail_table.setHorizontalHeaderLabels(["상품명", "수량", "매출"])
+            header.setSectionResizeMode(0, QHeaderView.Stretch)
+            header.setSectionResizeMode(1, QHeaderView.Fixed)
+            header.setSectionResizeMode(2, QHeaderView.Fixed)
+            self.detail_table.setColumnWidth(1, 56)
+            self.detail_table.setColumnWidth(2, 100)
+        else:  # row_log
+            self.detail_table.setHorizontalHeaderLabels(["시간", "수량", "매출"])
+            header.setSectionResizeMode(0, QHeaderView.Fixed)
+            header.setSectionResizeMode(1, QHeaderView.Fixed)
+            header.setSectionResizeMode(2, QHeaderView.Stretch)
+            self.detail_table.setColumnWidth(0, 80)
+            self.detail_table.setColumnWidth(1, 56)
+
+    def _show_today_all_sales_detail(self) -> None:
+        """상단 '오늘 총 판매금액' 라벨 클릭 시 오늘 판매된 상품 목록을 우측 상세 패널에 표시."""
+        from collections import defaultdict as _dd
+
+        self._fetch_today_sales_events()
+        self._set_detail_table_mode("today_all")
+        self.detail_title_label.setText(f"{self.channel_name} 오늘 판매 집계")
+
+        # 모든 events 모으기 (exact 키 기준, item_id 구분 유지)
+        all_events: List[dict] = []
+        for events_list in self._today_sales_events_by_exact.values():
+            all_events.extend(events_list)
+
+        if not all_events:
+            self.detail_meta_label.setText("오늘 판매된 상품이 없습니다.")
+            self.detail_table.setRowCount(0)
+            return
+
+        # 상품명 룩업 (현재 rows 기준)
+        name_map: Dict[str, str] = {}
+        for row in self.rows:
+            pid = str(row.product_id or "").strip()
+            iid = row.item_id if row.item_id else None
+            name_map[self._monitor_item_key(pid, iid)] = self._display_name(row)
+
+        # 비마스터(shadow) 이벤트 제외 — 채널탭 _effective_today_sales 과 동일 정책
+        rules = self.shared_stock_rules
+        master_group_ids = {
+            r.group_id for r in rules.values() if r.is_master
+        }
+
+        per_item: Dict[str, Dict[str, Any]] = _dd(
+            lambda: {"qty": 0, "amount": 0, "name": "", "count": 0}
+        )
+        for event in all_events:
+            pid = str(event.get("product_id") or "").strip()
+            iid = str(event.get("item_id")) if event.get("item_id") else None
+            key = self._monitor_item_key(pid, iid)
+
+            # shadow 제외
+            rule = rules.get(f"id:{pid}|item:{iid or ''}")
+            if rule is not None and not rule.is_master and rule.group_id in master_group_ids:
+                continue
+
+            qty = int(event.get("qty_sold") or 0)
+            try:
+                price = int(event.get("price") or 0)
+            except (TypeError, ValueError):
+                price = 0
+            rec = per_item[key]
+            rec["qty"] += qty
+            rec["amount"] += qty * price
+            rec["count"] += 1
+            if not rec["name"]:
+                rec["name"] = (
+                    name_map.get(key)
+                    or str(event.get("name") or "").strip()
+                    or pid
+                )
+
+        sorted_items = sorted(
+            per_item.values(),
+            key=lambda r: (r["amount"], r["qty"]),
+            reverse=True,
+        )
+
+        if not sorted_items:
+            self.detail_meta_label.setText("오늘 판매된 상품이 없습니다.")
+            self.detail_table.setRowCount(0)
+            return
+
+        total_qty = sum(r["qty"] for r in sorted_items)
+        total_amount = sum(r["amount"] for r in sorted_items)
+        self.detail_meta_label.setText(
+            f"{len(sorted_items)}개 상품 · 총 {total_qty:,}개 · ₩{total_amount:,}"
+        )
+
+        self.detail_table.setRowCount(len(sorted_items))
+        for i, r in enumerate(sorted_items):
+            name_item = QTableWidgetItem(r["name"])
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            name_item.setToolTip(r["name"])
+            self.detail_table.setItem(i, 0, name_item)
+
+            qty_item = QTableWidgetItem(f"{r['qty']:,}")
+            qty_item.setFlags(qty_item.flags() & ~Qt.ItemIsEditable)
+            qty_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.detail_table.setItem(i, 1, qty_item)
+
+            amt_item = QTableWidgetItem(f"{r['amount']:,}원")
+            amt_item.setFlags(amt_item.flags() & ~Qt.ItemIsEditable)
+            amt_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.detail_table.setItem(i, 2, amt_item)
+
     def _update_detail_for_row(self, row: ChannelProduct | None) -> None:
+        # 상품 단위 상세 모드로 헤더 복구
+        self._set_detail_table_mode("row_log")
         if row is None:
             self.detail_title_label.setText("선택 상품 판매 로그")
             self.detail_meta_label.setText("상품을 클릭하면 오늘 판매 이력이 표시됩니다.")
@@ -1014,49 +1170,99 @@ class ChannelTab(QWidget):
                 (row.name, int(rule.pack_size), bool(rule.is_master))
             )
 
+        # 전체 그룹을 스크롤 가능한 텍스트 영역으로 표시 (생략 없이)
         preview_lines: List[str] = []
-        for gid, members in list(by_group.items())[:6]:
+        for gid, members in by_group.items():
             members_sorted = sorted(members, key=lambda m: m[1])
-            preview_lines.append(f"• 그룹: {gid}")
+            preview_lines.append(f"● 그룹: {gid}")
             for name, pack, is_master in members_sorted:
                 tag = " ★마스터" if is_master else ""
-                short = name if len(name) <= 48 else name[:45] + "..."
+                short = name if len(name) <= 60 else name[:57] + "..."
                 preview_lines.append(f"   [{pack}팩]{tag} {short}")
-        if len(by_group) > 6:
-            preview_lines.append(f"... 외 {len(by_group) - 6}개 그룹 생략")
+            preview_lines.append("")
         preview = "\n".join(preview_lines)
 
-        msg = (
+        summary = (
             f"{self.channel_name} 상품 기준 {len(by_group)}개 그룹 제안 "
             f"(대상 SKU {len(proposed)}개)\n"
-            f"  신규 {new_count}  변경 {changed_count}  동일 {same_count}\n\n"
-            f"{preview}\n\n"
-            f"※ 마스터(최소 pack_size)에 판매량이 합산되고, 비마스터는 0 처리됩니다.\n"
-            f"기존 규칙은 덮어씁니다. 적용할까요?"
+            f"신규 {new_count} · 변경 {changed_count} · 동일 {same_count}\n"
+            f"※ 마스터(최소 pack_size)에 판매량 합산, 비마스터는 0 처리됩니다. "
+            f"기존 규칙은 덮어씁니다."
         )
 
-        result = QMessageBox.question(
-            self,
-            "그룹 자동제안",
-            msg,
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+        # 스크롤 가능한 커스텀 다이얼로그 (버튼이 항상 보이도록 고정 크기)
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QPlainTextEdit
+        dlg = QDialog(self)
+        dlg.setWindowTitle("그룹 자동제안")
+        dlg.setModal(True)
+        dlg.resize(640, 560)
+
+        dlg_layout = QVBoxLayout(dlg)
+        dlg_layout.setContentsMargins(14, 14, 14, 14)
+        dlg_layout.setSpacing(10)
+
+        summary_label = QLabel(summary)
+        summary_label.setWordWrap(True)
+        summary_label.setStyleSheet("font-weight: 600;")
+        dlg_layout.addWidget(summary_label)
+
+        text_view = QPlainTextEdit()
+        text_view.setPlainText(preview)
+        text_view.setReadOnly(True)
+        text_view.setStyleSheet("font-family: 'Malgun Gothic'; font-size: 12px;")
+        dlg_layout.addWidget(text_view, 1)
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.Yes | QDialogButtonBox.No
         )
-        if result != QMessageBox.Yes:
+        yes_btn = button_box.button(QDialogButtonBox.Yes)
+        no_btn = button_box.button(QDialogButtonBox.No)
+        if yes_btn is not None:
+            yes_btn.setText("적용")
+        if no_btn is not None:
+            no_btn.setText("취소")
+            no_btn.setDefault(True)
+        button_box.accepted.connect(dlg.accept)
+        button_box.rejected.connect(dlg.reject)
+        dlg_layout.addWidget(button_box)
+
+        if dlg.exec() != QDialog.Accepted:
             return
 
+        # UI 프리즈 방지:
+        # _save_shared_stock_rule_with_sync 는 건당 monitor 서버로 HTTP 호출을 하기 때문에
+        # 수백 건 루프에서는 창이 먹통이 된다. 대신 아래처럼 처리한다:
+        #   1) 로컬 SQLite 에 일괄 저장 (transaction 은 각 함수 내부에서 처리됨, 빠름)
+        #   2) monitor URL 이 있으면 pending queue 에 enqueue 만 하고
+        #      백그라운드 startup sync worker 가 추후 flush 하도록 맡긴다.
+        #   3) HTTP 호출은 UI 스레드에서 절대 하지 않음.
         applied = 0
-        for pk, rule in proposed.items():
-            try:
-                self._save_shared_stock_rule_with_sync(
-                    pk,
-                    rule.group_id,
-                    int(rule.pack_size),
-                    bool(rule.is_master),
-                )
-                applied += 1
-            except Exception:  # noqa: BLE001
-                continue
+        pending_enqueue = bool(self.monitor_url)
+        self._set_busy(True, f"{self.channel_name} 묶음 규칙 저장 중...")
+        try:
+            for pk, rule in proposed.items():
+                try:
+                    self.cache.save_shared_stock_rule(
+                        self.channel_name,
+                        pk,
+                        rule.group_id,
+                        int(rule.pack_size),
+                        bool(rule.is_master),
+                    )
+                    if pending_enqueue:
+                        self.cache.enqueue_shared_stock_pending_op(
+                            self.channel_name,
+                            pk,
+                            "upsert",
+                            group_id=rule.group_id,
+                            pack_size=int(rule.pack_size),
+                            is_master=bool(rule.is_master),
+                        )
+                    applied += 1
+                except Exception:  # noqa: BLE001
+                    continue
+        finally:
+            self._set_busy(False)
 
         self.shared_stock_rules = self.cache.load_shared_stock_rules(self.channel_name)
         self._apply_filters()
@@ -1066,11 +1272,21 @@ class ChannelTab(QWidget):
             f"{self.channel_name} 묶음 자동제안 적용 완료: {applied}건 저장 "
             f"({len(by_group)}개 그룹)"
         )
+
+        # 백그라운드로 monitor 서버 동기화 트리거 (있을 때만)
+        if pending_enqueue:
+            QTimer.singleShot(0, self._start_startup_shared_stock_sync)
+
+        remote_note = (
+            "\n(monitor 서버 동기화는 백그라운드에서 자동 처리됩니다.)"
+            if pending_enqueue
+            else ""
+        )
         QMessageBox.information(
             self,
             "완료",
             f"{applied}건 규칙 적용. 다음 동기화부터 마스터 집계가 반영됩니다.\n"
-            f"지금 즉시 반영하려면 상단 '동기화' 버튼을 누르세요.",
+            f"지금 즉시 반영하려면 상단 '동기화' 버튼을 누르세요." + remote_note,
         )
 
     def _shared_stock_api_url(self) -> str | None:
@@ -2082,24 +2298,9 @@ class ChannelTab(QWidget):
 
     @staticmethod
     def _download_image_bytes(url: str) -> bytes | None:
-        try:
-            response = httpx.get(
-                url,
-                timeout=15,
-                follow_redirects=True,
-                headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-                },
-            )
-            if response.status_code != 200:
-                return None
-            content_type = (response.headers.get("content-type") or "").lower()
-            if "image" not in content_type:
-                return None
-            return response.content
-        except Exception:  # noqa: BLE001
-            return None
+        # 디스크 캐시 우선 → 앱을 재시작해도 재다운로드 하지 않음.
+        from inventory_app.services.image_cache import get_image_bytes
+        return get_image_bytes(url, timeout=15)
 
     def _emit_image_downloaded(self, url: str, future: Future[bytes | None]) -> None:
         data: bytes | None
@@ -3580,6 +3781,10 @@ class SalesDailyTab(QWidget):
         self._sales_dates: dict[str, int] = {}
         self._highlighted_dates: set[str] = set()
 
+        # 공유재고 규칙 캐시 (묶음상품 뻥튀기 방지)
+        from inventory_app.services.local_cache import ChannelProductCache
+        self._rule_cache = ChannelProductCache()
+
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(12)
@@ -3743,6 +3948,76 @@ class SalesDailyTab(QWidget):
             highlighted.add(date_str)
         self._highlighted_dates = highlighted
 
+    @staticmethod
+    def _event_product_key(event: dict) -> str:
+        """SharedStockRule 테이블의 product_key 포맷과 동일하게 생성."""
+        pid = str(event.get("product_id") or "").strip()
+        iid_raw = event.get("item_id")
+        iid = str(iid_raw) if iid_raw not in (None, "") else ""
+        if pid:
+            return f"id:{pid}|item:{iid}"
+        url = str(event.get("product_url") or "").strip()
+        if url:
+            return f"url:{url}"
+        return f"name:{str(event.get('name') or '').strip()}"
+
+    def _filter_shadow_sale_events(self, sales: List[dict]) -> List[dict]:
+        """비마스터(그림자) 이벤트를 제거.
+
+        - 그룹에 마스터가 지정돼 있고 현재 이벤트가 비마스터면 → 제거
+        - 마스터가 없는 고아 그룹은 건드리지 않음 (원본 유지)
+        - 채널 미지정/규칙 미지정 이벤트도 그대로 유지
+        """
+        if not isinstance(sales, list):
+            return sales
+
+        # 채널별로 rules 한 번만 로드
+        rules_by_channel: Dict[str, Dict[str, SharedStockRule]] = {}
+        master_groups_by_channel: Dict[str, set[str]] = {}
+
+        def _rules_for(channel: str) -> Dict[str, SharedStockRule]:
+            if channel not in rules_by_channel:
+                try:
+                    rules = self._rule_cache.load_shared_stock_rules(channel)
+                except Exception:  # noqa: BLE001
+                    rules = {}
+                rules_by_channel[channel] = rules
+                master_groups_by_channel[channel] = {
+                    r.group_id for r in rules.values() if r.is_master
+                }
+            return rules_by_channel[channel]
+
+        filtered: List[dict] = []
+        dropped = 0
+        for event in sales:
+            if not isinstance(event, dict):
+                filtered.append(event)
+                continue
+            channel = str(event.get("channel") or "").strip().lower()
+            if not channel:
+                filtered.append(event)
+                continue
+            rules = _rules_for(channel)
+            if not rules:
+                filtered.append(event)
+                continue
+            key = self._event_product_key(event)
+            rule = rules.get(key)
+            if rule is None:
+                filtered.append(event)
+                continue
+            master_groups = master_groups_by_channel.get(channel, set())
+            # 마스터가 있는 그룹의 비마스터만 drop
+            if (not rule.is_master) and (rule.group_id in master_groups):
+                dropped += 1
+                continue
+            filtered.append(event)
+
+        if dropped:
+            # 상태 바에 힌트 제공 (summary_label 은 뒤에서 덮어쓰므로 여기선 조용히)
+            pass
+        return filtered
+
     def _sale_product_url(self, sale_row: dict) -> str | None:
         direct = _normalize_web_url(sale_row.get("product_url"))
         if direct:
@@ -3789,6 +4064,13 @@ class SalesDailyTab(QWidget):
 
         summary = data.get("summary", {})
         sales = data.get("sales", [])
+
+        # 공유재고(묶음상품) 뻥튀기 제거:
+        # 같은 물리재고를 공유하는 SKU 그룹에서 "마스터가 아닌" 이벤트는
+        # shadow 감소로 간주하고 제거한다.
+        # (예: 퀵베이트 1팩/4팩/10팩이 같은 재고를 공유하면 한번의 주문에
+        # 세 SKU 모두 재고가 줄어드는데, 이 중 비마스터(4팩/10팩) 이벤트는 버린다.)
+        sales = self._filter_shadow_sale_events(sales)
 
         # 채널별 분리 집계
         naver_qty = sum(s.get("qty_sold", 0) for s in sales if s.get("channel") == "naver")
