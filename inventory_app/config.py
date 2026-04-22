@@ -21,6 +21,10 @@ class AppConfig:
     timeout_seconds: int
     max_products: int
     monitor_url: str | None = None  # 라즈베리파이 재고 API URL
+    fassto_api_url: str = "https://fmsapi.fassto.ai"
+    fassto_api_cd: str = ""
+    fassto_api_key: str = ""
+    fassto_cst_cd: str = ""
 
 
 def _get(config: Dict[str, Any], *keys: str) -> Any:
@@ -72,4 +76,10 @@ def load_config(path: Path | None = None) -> AppConfig:
         timeout_seconds=int(_get(raw, "request", "timeout_seconds")),
         max_products=int(_get(raw, "request", "max_products")),
         monitor_url=str(_get_optional(raw, None, "monitor", "url")) or None,
+        fassto_api_url=str(
+            _get_optional(raw, "https://fmsapi.fassto.ai", "fassto", "api_url")
+        ),
+        fassto_api_cd=str(_get_optional(raw, "", "fassto", "api_cd")),
+        fassto_api_key=str(_get_optional(raw, "", "fassto", "api_key")),
+        fassto_cst_cd=str(_get_optional(raw, "", "fassto", "cst_cd")),
     )

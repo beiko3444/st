@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
 
 from inventory_app.config import AppConfig
 from inventory_app.models import ChannelProduct, SharedStockRule
+from inventory_app.ui.fassto_tab import FasstoTab
 from inventory_app.services.channel_services import CoupangChannelService, NaverChannelService
 from inventory_app.services.keyword_services import (
     KeywordRevenueRow,
@@ -4027,6 +4028,7 @@ class MainWindow(QMainWindow):
             fetch_fn=self.keyword_service.fetch,
             default_days=sales_days,
         )
+        self.fassto_tab = FasstoTab(config)
 
         self._build_ui()
 
@@ -4062,6 +4064,10 @@ class MainWindow(QMainWindow):
         self.tab_shortcut_7.setContext(Qt.ApplicationShortcut)
         self.tab_shortcut_7.activated.connect(lambda: self._activate_tab_shortcut(6))
 
+        self.tab_shortcut_8 = QShortcut(QKeySequence("8"), self)
+        self.tab_shortcut_8.setContext(Qt.ApplicationShortcut)
+        self.tab_shortcut_8.activated.connect(lambda: self._activate_tab_shortcut(7))
+
         self.naver_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.coupang_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.naver_tab.favorites_changed.connect(self._refresh_inventory_tab)
@@ -4091,6 +4097,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.sales_daily_tab, "판매일보")
         self.tabs.addTab(self.revenue_tab, "매출비교")
         self.tabs.addTab(self.keyword_tab, "키워드매출")
+        self.tabs.addTab(self.fassto_tab, "파스토")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         corner = QWidget()
         corner_layout = QHBoxLayout(corner)
