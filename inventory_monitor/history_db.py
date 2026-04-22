@@ -239,33 +239,70 @@ class InventoryHistoryDB:
         with self._guard, self._connection() as conn:
             cursor = conn.execute(
                 """
+                WITH pairs AS (
+                    SELECT
+                        a.channel,
+                        a.product_id,
+                        a.item_id,
+                        a.name,
+                        a.image_url,
+                        a.product_url,
+                        a.price,
+                        a.recorded_at,
+                        b.recorded_at AS prev_recorded_at,
+                        b.stock AS stock_before,
+                        a.stock AS stock_after,
+                        b.today_sales AS today_sales_before,
+                        a.today_sales AS today_sales_after,
+                        b.sales AS sales_before,
+                        a.sales AS sales_after,
+                        CASE
+                            WHEN a.channel = 'naver'
+                                 AND a.today_sales IS NOT NULL
+                            THEN CASE
+                                WHEN b.today_sales IS NOT NULL
+                                     AND DATE(b.recorded_at) = DATE(a.recorded_at)
+                                THEN MAX(0, a.today_sales - b.today_sales)
+                                ELSE MAX(0, a.today_sales)
+                            END
+                            WHEN a.channel = 'coupang'
+                                 AND a.sales IS NOT NULL
+                                 AND b.sales IS NOT NULL
+                            THEN MAX(0, a.sales - b.sales)
+                            WHEN a.stock IS NOT NULL
+                                 AND b.stock IS NOT NULL
+                            THEN (b.stock - a.stock)
+                            ELSE 0
+                        END AS qty_sold
+                    FROM inventory_history a
+                    JOIN inventory_history b
+                        ON a.channel = b.channel
+                        AND a.product_id = b.product_id
+                        AND (a.item_id = b.item_id OR (a.item_id IS NULL AND b.item_id IS NULL))
+                        AND b.id = (
+                            SELECT MAX(id) FROM inventory_history c
+                            WHERE c.channel = a.channel
+                              AND c.product_id = a.product_id
+                              AND (c.item_id = a.item_id OR (c.item_id IS NULL AND a.item_id IS NULL))
+                              AND c.id < a.id
+                        )
+                    WHERE DATE(a.recorded_at) = ?
+                )
                 SELECT
-                    a.channel,
-                    a.product_id,
-                    a.item_id,
-                    a.name,
-                    a.image_url,
-                    a.product_url,
-                    a.price,
-                    a.recorded_at,
-                    b.stock AS stock_before,
-                    a.stock AS stock_after,
-                    (b.stock - a.stock) AS qty_sold
-                FROM inventory_history a
-                JOIN inventory_history b
-                    ON a.channel = b.channel
-                    AND a.product_id = b.product_id
-                    AND (a.item_id = b.item_id OR (a.item_id IS NULL AND b.item_id IS NULL))
-                    AND b.id = (
-                        SELECT MAX(id) FROM inventory_history c
-                        WHERE c.channel = a.channel
-                          AND c.product_id = a.product_id
-                          AND (c.item_id = a.item_id OR (c.item_id IS NULL AND a.item_id IS NULL))
-                          AND c.id < a.id
-                    )
-                WHERE DATE(a.recorded_at) = ?
-                  AND a.stock < b.stock
-                ORDER BY a.recorded_at DESC
+                    channel,
+                    product_id,
+                    item_id,
+                    name,
+                    image_url,
+                    product_url,
+                    price,
+                    recorded_at,
+                    stock_before,
+                    stock_after,
+                    qty_sold
+                FROM pairs
+                WHERE qty_sold > 0
+                ORDER BY recorded_at DESC
                 """,
                 (date_str,),
             )
@@ -281,20 +318,43 @@ class InventoryHistoryDB:
         with self._guard, self._connection() as conn:
             cursor = conn.execute(
                 """
-                SELECT DATE(a.recorded_at) AS sale_date, COUNT(*) AS cnt
-                FROM inventory_history a
-                JOIN inventory_history b
-                    ON a.channel = b.channel
-                    AND a.product_id = b.product_id
-                    AND (a.item_id = b.item_id OR (a.item_id IS NULL AND b.item_id IS NULL))
-                    AND b.id = (
-                        SELECT MAX(id) FROM inventory_history c
-                        WHERE c.channel = a.channel
-                          AND c.product_id = a.product_id
-                          AND (c.item_id = a.item_id OR (c.item_id IS NULL AND a.item_id IS NULL))
-                          AND c.id < a.id
-                    )
-                WHERE a.stock < b.stock
+                WITH pairs AS (
+                    SELECT
+                        DATE(a.recorded_at) AS sale_date,
+                        CASE
+                            WHEN a.channel = 'naver'
+                                 AND a.today_sales IS NOT NULL
+                            THEN CASE
+                                WHEN b.today_sales IS NOT NULL
+                                     AND DATE(b.recorded_at) = DATE(a.recorded_at)
+                                THEN MAX(0, a.today_sales - b.today_sales)
+                                ELSE MAX(0, a.today_sales)
+                            END
+                            WHEN a.channel = 'coupang'
+                                 AND a.sales IS NOT NULL
+                                 AND b.sales IS NOT NULL
+                            THEN MAX(0, a.sales - b.sales)
+                            WHEN a.stock IS NOT NULL
+                                 AND b.stock IS NOT NULL
+                            THEN (b.stock - a.stock)
+                            ELSE 0
+                        END AS qty_sold
+                    FROM inventory_history a
+                    JOIN inventory_history b
+                        ON a.channel = b.channel
+                        AND a.product_id = b.product_id
+                        AND (a.item_id = b.item_id OR (a.item_id IS NULL AND b.item_id IS NULL))
+                        AND b.id = (
+                            SELECT MAX(id) FROM inventory_history c
+                            WHERE c.channel = a.channel
+                              AND c.product_id = a.product_id
+                              AND (c.item_id = a.item_id OR (c.item_id IS NULL AND a.item_id IS NULL))
+                              AND c.id < a.id
+                        )
+                )
+                SELECT sale_date, COUNT(*) AS cnt
+                FROM pairs
+                WHERE qty_sold > 0
                 GROUP BY sale_date
                 ORDER BY sale_date DESC
                 """
