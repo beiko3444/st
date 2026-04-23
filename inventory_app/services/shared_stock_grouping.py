@@ -204,8 +204,9 @@ def apply_master_aggregation(
     # 그룹별로 rows에 실제로 매칭된 member 목록 구성.
     # "마스터 없는 그룹"을 감지하기 위해 먼저 group_has_master를 계산한다.
     group_has_master: Dict[str, bool] = defaultdict(bool)
-    for rule in rules.values():
-        if rule.is_master:
+    for row in rows:
+        rule = rules.get(product_key_fn(row))
+        if rule is not None and rule.is_master:
             group_has_master[rule.group_id] = True
 
     # group_id 단위 집계 — 마스터가 있는 그룹만.
