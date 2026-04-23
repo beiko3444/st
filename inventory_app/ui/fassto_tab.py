@@ -74,7 +74,7 @@ class FasstoJob(QObject):
             self.finished.emit(
                 JobResult(
                     ok=False,
-                    error=f"[{exc.error_code or exc.status}] {exc}",
+                    error=_format_fassto_error(str(exc), exc.to_dict()),
                     data=exc.to_dict(),
                 )
             )
@@ -133,6 +133,36 @@ def _fill_table(
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
             table.setItem(r, c, item)
     table.resizeColumnsToContents()
+
+
+def _format_fassto_error(error: str | None, details: Any = None) -> str:
+    base = (error or "알 수 없는 오류").strip()
+    if not isinstance(details, dict):
+        return base
+
+    error_code = str(details.get("errorCode") or "").strip()
+    path = str(details.get("path") or "").strip()
+    status = details.get("status")
+    stage = "파스토 API 호출"
+    if path.startswith("/api/v1/auth/connect"):
+        stage = "파스토 accessToken 발급"
+
+    parts = [f"{stage} 실패"]
+    if error_code:
+        parts.append(f"코드: {error_code}")
+    if status not in (None, ""):
+        parts.append(f"HTTP: {status}")
+
+    message = " / ".join(parts)
+    if base:
+        message = f"{message}\n사유: {base}"
+
+    if error_code == "INVALID_API_KEY_OR_DELETED":
+        message += "\n현재 apiKey가 잘못됐거나 삭제된 상태입니다. 파스토에서 apiCd/apiKey 재확인이 필요합니다."
+    elif error_code == "INVALID_ACCESS":
+        message += "\n토큰이 만료됐거나 accessToken이 유효하지 않습니다. 다시 인증이 필요합니다."
+
+    return message
 
 
 # ---------------------------------------------------------------------------

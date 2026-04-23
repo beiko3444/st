@@ -64,6 +64,10 @@ def _fix_naver_product_urls(rows: List[ChannelProduct], base_url: str | None) ->
     base = base_url.rstrip("/")
     for row in rows:
         url = str(row.product_url or "")
+        product_id = str(row.product_id or "").strip()
+        if product_id.isdigit():
+            row.product_url = f"{base}/products/{product_id}"
+            continue
         if not url:
             continue
         # 네이버 계열 URL 이 아니면 건드리지 않음 (쿠팡 URL 보호)
@@ -192,6 +196,35 @@ def _assign_serial_by_sales(rows: List[ChannelProduct]) -> None:
         row.serial = index
 
 
+def _filter_rows_by_live_product_ids(
+    rows: List[ChannelProduct],
+    live_product_ids: set[str],
+) -> tuple[List[ChannelProduct], int]:
+    if not rows or not live_product_ids:
+        return rows, 0
+    filtered = [row for row in rows if str(row.product_id or "").strip() in live_product_ids]
+    hidden_count = len(rows) - len(filtered)
+    return filtered, max(0, hidden_count)
+
+
+def _apply_naver_sales_map(
+    rows: List[ChannelProduct],
+    sales_map: Dict[str, int],
+    origin_to_channel: Dict[str, str] | None = None,
+) -> int:
+    matched = 0
+    origin_to_channel = origin_to_channel or {}
+    for row in rows:
+        product_id = str(row.product_id or "").strip()
+        mapped_id = origin_to_channel.get(product_id, product_id)
+        if mapped_id in sales_map:
+            row.sales = sales_map.get(mapped_id, 0)
+            matched += 1
+        else:
+            row.sales = 0
+    return matched
+
+
 def _row_base_key(row: ChannelProduct) -> str:
     if row.product_id:
         return f"{row.product_id}|{row.item_id or ''}"
@@ -298,12 +331,16 @@ def _migrate_cached_naver_urls(cache: ChannelProductCache, base_url: str | None)
     changed = 0
     for row in rows:
         url = str(row.product_url or "")
-        if not url or not _NAVER_URL_PREFIX_RE.search(url):
-            continue
-        m = _NAVER_PRODUCT_ID_RE.search(url)
-        if not m:
-            continue
-        expected = f"{base}/products/{m.group(1)}"
+        product_id = str(row.product_id or "").strip()
+        if product_id.isdigit():
+            expected = f"{base}/products/{product_id}"
+        else:
+            if not url or not _NAVER_URL_PREFIX_RE.search(url):
+                continue
+            m = _NAVER_PRODUCT_ID_RE.search(url)
+            if not m:
+                continue
+            expected = f"{base}/products/{m.group(1)}"
         if row.product_url != expected:
             row.product_url = expected
             changed += 1
@@ -356,11 +393,34 @@ class NaverChannelService:
             rows = _fetch_from_monitor(self.config.monitor_url, "naver", self.config.timeout_seconds)
             if rows is not None:
                 warnings: List[str] = ["__pi__"]
+                live_product_ids: set[str] | None = None
+                origin_to_channel: Dict[str, str] = {}
+                try:
+                    live_rows = self.smartstore.fetch_products(max_items=self.config.max_products)
+                    live_product_ids = {
+                        str(raw.get("product_id") or "").strip()
+                        for raw in live_rows
+                        if str(raw.get("product_id") or "").strip()
+                    }
+                    for raw in live_rows:
+                        channel_id = str(raw.get("product_id") or "").strip()
+                        origin_id = str(raw.get("origin_product_id") or "").strip()
+                        if channel_id and origin_id:
+                            origin_to_channel[origin_id] = channel_id
+                except Exception:
+                    live_product_ids = None
+
+                if live_product_ids:
+                    rows, hidden_count = _filter_rows_by_live_product_ids(rows, live_product_ids)
+                    if hidden_count > 0:
+                        warnings.append(
+                            f"현재 네이버 실상품 목록에 없는 monitor 잔존 {hidden_count}건을 숨겼습니다."
+                        )
                 # 판매량은 실시간 API에서 직접 조회
                 sales_map = self._fetch_sales_map(warnings)
                 if sales_map is not None:
-                    for row in rows:
-                        row.sales = sales_map.get(row.product_id, 0)
+                    matched = _apply_naver_sales_map(rows, sales_map, origin_to_channel)
+                    warnings.append(f"30일 판매량 매칭: {matched}/{len(rows)}건")
                 # 오늘 판매량도 실시간 API에서 조회
                 try:
                     today_map = self.smartstore_stats.fetch_product_sales_counts(days=1)
