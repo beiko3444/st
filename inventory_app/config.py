@@ -20,7 +20,9 @@ class AppConfig:
     coupang_secret_key: str
     timeout_seconds: int
     max_products: int
+    # 이하 default 필드들
     monitor_url: str | None = None  # 라즈베리파이 재고 API URL
+    smartstore_store_url: str = ""  # 예: "https://smartstore.naver.com/baikoapp"
     fassto_api_url: str = "https://fmsapi.fassto.ai"
     fassto_api_cd: str = ""
     fassto_api_key: str = ""
@@ -55,11 +57,13 @@ def load_config(path: Path | None = None) -> AppConfig:
     smartstore_client_id = str(_get(raw, "smartstore", "client_id"))
     smartstore_client_secret = str(_get(raw, "smartstore", "client_secret"))
     smartstore_token_type = str(_get(raw, "smartstore", "token_type"))
+    smartstore_store_url = str(_get_optional(raw, "", "smartstore", "store_url")).strip()
 
     return AppConfig(
         smartstore_client_id=smartstore_client_id,
         smartstore_client_secret=smartstore_client_secret,
         smartstore_token_type=smartstore_token_type,
+        smartstore_store_url=smartstore_store_url,
         smartstore_stats_client_id=str(
             _get_optional(raw, smartstore_client_id, "smartstore_stats", "client_id")
         ),

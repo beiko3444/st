@@ -238,12 +238,14 @@ class NaverChannelService:
             client_secret=config.smartstore_client_secret,
             token_type=config.smartstore_token_type,
             timeout_seconds=config.timeout_seconds,
+            store_url=config.smartstore_store_url,
         )
         self.smartstore_stats = SmartStoreConnector(
             client_id=config.smartstore_stats_client_id,
             client_secret=config.smartstore_stats_client_secret,
             token_type=config.smartstore_stats_token_type,
             timeout_seconds=config.timeout_seconds,
+            store_url=config.smartstore_store_url,
         )
         self._row_cache: Dict[str, ChannelProduct] = {}
 

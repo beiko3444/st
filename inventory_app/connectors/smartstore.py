@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import base64
+import re
 import time
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -17,6 +18,7 @@ class SmartStoreConnector:
         client_secret: str,
         token_type: str,
         timeout_seconds: int,
+        store_url: str = "",
     ) -> None:
         self.client_id = client_id
         self.client_secret = client_secret
@@ -28,6 +30,13 @@ class SmartStoreConnector:
         self._access_token: Optional[str] = None
         self._token_expire_at: Optional[datetime] = None
         self._channel_no_cache: Optional[str] = None
+
+        # 스토어 slug: 상품 직링크 URL 을 만들기 위해 필요.
+        # smartstore.naver.com/{slug}/products/{id}
+        # 1) 사용자가 credentials.json 의 smartstore.store_url 에 지정한 값 우선
+        # 2) 없으면 /v1/seller/channels 호출해서 자동 탐지 (최초 1회)
+        self._store_slug_override: Optional[str] = self._extract_slug(store_url)
+        self._store_slug_cache: Optional[str] = None
 
     @property
     def api_client(self) -> httpx.Client:
@@ -204,13 +213,130 @@ class SmartStoreConnector:
             return None
 
     @staticmethod
-    def _build_product_url(product_id: Any, product_name: str | None) -> Optional[str]:
-        numeric_id = SmartStoreConnector._to_int(product_id)
-        if numeric_id is not None:
-            return f"https://smartstore.naver.com/main/products/{numeric_id}"
-        query = SmartStoreConnector._sanitize_query_text(product_name)
+    def _extract_slug(store_url: str | None) -> Optional[str]:
+        """사용자 입력 store_url 로부터 slug 추출.
+
+        예) "https://smartstore.naver.com/baikoapp" -> "baikoapp"
+            "baikoapp" -> "baikoapp"
+            "https://smartstore.naver.com/baikoapp/" -> "baikoapp"
+        """
+        text = str(store_url or "").strip()
+        if not text:
+            return None
+        if "/" in text:
+            # URL 에서 slug 추출
+            m = re.search(r"smartstore\.naver\.com/([^/?#]+)", text)
+            if m:
+                slug = m.group(1).strip().strip("/")
+                if slug and slug.lower() != "main":
+                    return slug
+            # 아니면 마지막 경로 세그먼트
+            parts = [p for p in text.split("/") if p and ":" not in p]
+            if parts:
+                slug = parts[-1]
+                if slug.lower() != "main":
+                    return slug
+            return None
+        return text  # slug 만 들어온 경우
+
+    _SMARTSTORE_URL_RE = re.compile(
+        r"https?://smartstore\.naver\.com/([A-Za-z0-9_-]+)", re.I
+    )
+
+    @classmethod
+    def _scan_for_store_slug(cls, obj: Any) -> Optional[str]:
+        """dict/list 를 재귀적으로 순회하며 smartstore.naver.com/{slug} 패턴을 찾음."""
+        if isinstance(obj, str):
+            m = cls._SMARTSTORE_URL_RE.search(obj)
+            if m:
+                slug = m.group(1).strip().strip("/")
+                if slug and slug.lower() != "main":
+                    return slug
+            return None
+        if isinstance(obj, dict):
+            for value in obj.values():
+                found = cls._scan_for_store_slug(value)
+                if found:
+                    return found
+            return None
+        if isinstance(obj, (list, tuple, set)):
+            for value in obj:
+                found = cls._scan_for_store_slug(value)
+                if found:
+                    return found
+            return None
+        return None
+
+    def _resolve_store_slug(self) -> Optional[str]:
+        """config 우선. 없으면 여러 API 엔드포인트를 공격적으로 탐지.
+
+        순서:
+        1) credentials.json 의 smartstore.store_url
+        2) /v1/seller/channels 응답 재귀 스캔
+        3) /v1/seller/account 응답 재귀 스캔 (있으면)
+        4) 상품 1건 detail (/v2/products/channel-products/{id}) 응답 재귀 스캔
+        """
+        if self._store_slug_override:
+            return self._store_slug_override
+        if self._store_slug_cache:
+            return self._store_slug_cache
+
+        candidates_endpoints = [
+            "/v1/seller/channels",
+            "/v1/seller/account",
+        ]
+        for endpoint in candidates_endpoints:
+            try:
+                response = self.api_client.get(
+                    endpoint,
+                    headers=self._auth_headers(),
+                )
+                response.raise_for_status()
+                payload = response.json()
+            except Exception:  # noqa: BLE001
+                continue
+            slug = self._scan_for_store_slug(payload)
+            if slug:
+                self._store_slug_cache = slug
+                return slug
+
+        # 상품 1건을 가져와서 응답 내부에 숨겨진 URL 이 있는지 스캔
+        try:
+            response = self.api_client.post(
+                "/v1/products/search",
+                headers={
+                    **self._auth_headers(),
+                    "Content-Type": "application/json",
+                },
+                json={"page": 1, "size": 1},
+            )
+            if response.status_code < 400:
+                slug = self._scan_for_store_slug(response.json())
+                if slug:
+                    self._store_slug_cache = slug
+                    return slug
+        except Exception:  # noqa: BLE001
+            pass
+
+        return None
+
+    def _build_product_url(self, product_id: Any, product_name: str | None) -> Optional[str]:
+        """상품 직링크 URL 생성.
+
+        우선순위:
+        1) store slug 확보되면 smartstore.naver.com/{slug}/products/{channelProductNo}
+        2) 실패 시 네이버 쇼핑 검색 URL(상품명 → 검색 결과 1위가 보통 그 상품)
+        """
+        numeric_id = self._to_int(product_id)
+        slug = self._resolve_store_slug()
+        if slug and numeric_id is not None:
+            return f"https://smartstore.naver.com/{slug}/products/{numeric_id}"
+
+        query = self._sanitize_query_text(product_name)
         if query:
             return f"https://search.shopping.naver.com/search/all?query={quote_plus(query)}"
+        if numeric_id is not None:
+            return f"https://search.shopping.naver.com/search/all?query={numeric_id}"
         return None
 
     def fetch_primary_channel_no(self) -> str:
@@ -460,6 +586,13 @@ class SmartStoreConnector:
             )
             response.raise_for_status()
             body = response.json()
+
+            # 상품 응답 전체를 재귀 스캔해서 smartstore.naver.com/{slug} 발견 시 캐시.
+            # 이후 _build_product_url 은 바로 slug 적용한 직링크 생성.
+            if not self._store_slug_cache and not self._store_slug_override:
+                found = self._scan_for_store_slug(body)
+                if found:
+                    self._store_slug_cache = found
 
             groups = body.get("contents") or []
             for group in groups:

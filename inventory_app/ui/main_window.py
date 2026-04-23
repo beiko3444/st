@@ -226,7 +226,6 @@ class ClickableImageContainer(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self._product_url: str | None = None
-        self._press_inside: bool = False
 
     def set_product_url(self, url: str | None) -> None:
         self._product_url = _normalize_web_url(url)
@@ -238,27 +237,13 @@ class ClickableImageContainer(QWidget):
             self.setToolTip("")
 
     def mousePressEvent(self, event: Any) -> None:
-        # QTableWidget이 press를 가로채지 못하게 accept 해서 mouse grab 확보.
+        # QTableWidget 셀 위젯에서는 release 이벤트가 유실되는 경우가 있어
+        # press 시점에 즉시 emit 한다 (ProductImageLabel 과 동일 패턴).
         if event.button() == Qt.LeftButton and self._product_url:
-            self._press_inside = True
-            event.accept()
-            return
-        self._press_inside = False
-        super().mousePressEvent(event)
-
-    def mouseReleaseEvent(self, event: Any) -> None:
-        if (
-            event.button() == Qt.LeftButton
-            and self._product_url
-            and self._press_inside
-            and self.rect().contains(event.position().toPoint() if hasattr(event, "position") else event.pos())
-        ):
-            self._press_inside = False
             self.clicked.emit(self._product_url)
             event.accept()
             return
-        self._press_inside = False
-        super().mouseReleaseEvent(event)
+        super().mousePressEvent(event)
 
 
 class EditableNameLabel(QLabel):
@@ -1092,17 +1077,10 @@ class ChannelTab(QWidget):
 
     def _row_product_url(self, row: ChannelProduct) -> str | None:
         direct = _normalize_web_url(row.product_url)
-        if direct:
+        # 옛 캐시에 저장된 잘못된 smartstore /main/products/ URL 은 무시 (store slug 없어 404).
+        # 재동기화 후 새 URL(올바른 slug 포함) 로 교체됨.
+        if direct and "smartstore.naver.com/main/products/" not in direct:
             return direct
-
-        if self.channel_code == "naver":
-            product_id = str(row.product_id or "").strip()
-            if product_id.isdigit():
-                generated = _normalize_web_url(
-                    f"https://smartstore.naver.com/main/products/{product_id}"
-                )
-                if generated:
-                    return generated
 
         return _normalize_web_url(_build_search_url(self.channel_name, self._display_name(row)))
 
@@ -4020,18 +3998,12 @@ class SalesDailyTab(QWidget):
 
     def _sale_product_url(self, sale_row: dict) -> str | None:
         direct = _normalize_web_url(sale_row.get("product_url"))
-        if direct:
+        # 캐시에 저장돼 있는 과거 잘못된 smartstore URL 은 무시
+        if direct and "smartstore.naver.com/main/products/" not in direct:
             return direct
 
         channel = str(sale_row.get("channel") or "").strip().lower()
-        product_id = str(sale_row.get("product_id") or "").strip()
         name = str(sale_row.get("name") or "").strip()
-
-        if channel == "naver" and product_id.isdigit():
-            generated = _normalize_web_url(f"https://smartstore.naver.com/main/products/{product_id}")
-            if generated:
-                return generated
-
         return _normalize_web_url(_build_search_url(channel, name))
 
     def _open_sale_product_page(self, url: str) -> None:
