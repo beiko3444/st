@@ -21,49 +21,57 @@ def _monitor_sales_key(product_id: str, item_id: str | None) -> str:
     return f"{product_id}|{item_id or ''}"
 
 
-def _extract_naver_store_slug(config: AppConfig) -> str | None:
-    """credentials 의 smartstore.store_url 에서 slug 추출.
+def _extract_naver_store_base(config: AppConfig) -> str | None:
+    """credentials.smartstore.store_url 를 그대로 base URL 로 반환.
 
-    허용 포맷:
-    - 전체 URL: https://smartstore.naver.com/xtr
-    - slug 만: xtr
-    - /main/ 은 잘못된 slug 라서 None 반환
+    예:
+    - "https://brand.naver.com/xtracker"  → 그대로
+    - "https://smartstore.naver.com/xtr"  → 그대로
+    - "xtr" (slug 만)                      → "https://smartstore.naver.com/xtr" (옛 호환)
+    - "https://smartstore.naver.com/main" → None (잘못된 slug 자리)
     """
-    raw = str(getattr(config, "smartstore_store_url", "") or "").strip()
+    raw = str(getattr(config, "smartstore_store_url", "") or "").strip().rstrip("/")
     if not raw:
         return None
-    m = re.search(r"smartstore\.naver\.com/([A-Za-z0-9_-]+)", raw, re.I)
-    if m:
-        slug = m.group(1)
-    elif "/" not in raw:
-        slug = raw
-    else:
+    if not raw.startswith(("http://", "https://")):
+        # slug 만 온 경우 smartstore 기본값으로 감쌈 (이전 설정 호환)
+        if "/" not in raw and raw.lower() != "main":
+            return f"https://smartstore.naver.com/{raw}"
         return None
-    if slug.lower() == "main":
+    # /main 같은 잘못된 slug 자리는 거부
+    if re.search(r"/(main)/?$", raw, re.I):
         return None
-    return slug
+    return raw
 
 
-_NAVER_MAIN_URL_RE = re.compile(
-    r"https?://(?:m\.)?smartstore\.naver\.com/main/products/(\d+)",
-    re.I,
+# 네이버 쪽 상품 URL 중 /products/{id} 부분에서 id 추출용
+_NAVER_PRODUCT_ID_RE = re.compile(r"/products/(\d+)", re.I)
+# 교정 대상 URL 판별용 (smartstore, brand, shopping 등)
+_NAVER_URL_PREFIX_RE = re.compile(
+    r"https?://(?:m\.)?(?:smartstore|brand|shopping)\.naver\.com/", re.I
 )
 
 
-def _fix_naver_product_urls(rows: List[ChannelProduct], slug: str | None) -> None:
-    """monitor 에서 온 /main/products/{id} URL 을 정확한 slug 로 교체.
+def _fix_naver_product_urls(rows: List[ChannelProduct], base_url: str | None) -> None:
+    """모든 네이버 계열 상품 URL 을 config 의 base_url 로 재구성.
 
-    slug 가 없으면 원본 유지 (검색 fallback 이 UI 에서 걸림).
+    - 기존 URL 에서 product id 만 추출 → `{base_url}/products/{id}` 로 교체
+    - /main/ 이든 /xtr/ 이든 다른 slug 든 전부 정규화됨
+    - base_url 이 없으면 원본 유지
     """
-    if not slug:
+    if not base_url:
         return
+    base = base_url.rstrip("/")
     for row in rows:
         url = str(row.product_url or "")
         if not url:
             continue
-        m = _NAVER_MAIN_URL_RE.search(url)
+        # 네이버 계열 URL 이 아니면 건드리지 않음 (쿠팡 URL 보호)
+        if not _NAVER_URL_PREFIX_RE.search(url):
+            continue
+        m = _NAVER_PRODUCT_ID_RE.search(url)
         if m:
-            row.product_url = f"https://smartstore.naver.com/{slug}/products/{m.group(1)}"
+            row.product_url = f"{base}/products/{m.group(1)}"
 
 
 def _fetch_from_monitor(url: str, channel: str, timeout: int) -> List[ChannelProduct] | None:
@@ -275,20 +283,29 @@ def _summarize_naver_sales_error(error: str) -> str:
     return f"네이버 판매량 조회 실패: {compact}"
 
 
-def _migrate_cached_naver_urls(cache: ChannelProductCache, slug: str | None) -> int:
-    """캐시 DB의 옛 /main/products/ URL 을 일괄 정상화 (최초 1회 유효)."""
-    if not slug:
+def _migrate_cached_naver_urls(cache: ChannelProductCache, base_url: str | None) -> int:
+    """캐시 DB 의 모든 네이버 상품 URL 을 config 의 base_url 로 일괄 정상화.
+
+    이전에 `/main/` 또는 잘못된 slug(`/xtr/`) 로 저장됐던 URL 도 모두 한 번에 교체됨.
+    """
+    if not base_url:
         return 0
     try:
         rows = cache.load_rows("naver")
     except Exception:  # noqa: BLE001
         return 0
+    base = base_url.rstrip("/")
     changed = 0
     for row in rows:
         url = str(row.product_url or "")
-        m = _NAVER_MAIN_URL_RE.search(url)
-        if m:
-            row.product_url = f"https://smartstore.naver.com/{slug}/products/{m.group(1)}"
+        if not url or not _NAVER_URL_PREFIX_RE.search(url):
+            continue
+        m = _NAVER_PRODUCT_ID_RE.search(url)
+        if not m:
+            continue
+        expected = f"{base}/products/{m.group(1)}"
+        if row.product_url != expected:
+            row.product_url = expected
             changed += 1
     if changed > 0:
         try:
@@ -303,7 +320,7 @@ class NaverChannelService:
         self.config = config
         self.cache = ChannelProductCache()
         # 최초 1회: 캐시에 남아있던 옛 /main/ URL 을 정상 slug 로 일괄 교체
-        _migrate_cached_naver_urls(self.cache, _extract_naver_store_slug(config))
+        _migrate_cached_naver_urls(self.cache, _extract_naver_store_base(config))
         self.smartstore = SmartStoreConnector(
             client_id=config.smartstore_client_id,
             client_secret=config.smartstore_client_secret,
@@ -327,13 +344,13 @@ class NaverChannelService:
             return [], []
         rows = _reconcile_rows_with_cache(self._row_cache, rows)
         # 캐시에 남은 옛 /main/products/ URL 도 즉시 교체 → 다음 동기화 전에도 바로 동작
-        _fix_naver_product_urls(rows, _extract_naver_store_slug(self.config))
+        _fix_naver_product_urls(rows, _extract_naver_store_base(self.config))
         _apply_shared_stock_rules(self.cache, "naver", rows)
         _assign_serial_by_sales(rows)
         return rows, []
 
     def fetch(self) -> Tuple[List[ChannelProduct], List[str]]:
-        naver_slug = _extract_naver_store_slug(self.config)
+        naver_base = _extract_naver_store_base(self.config)
         # 라즈베리파이 API 우선 시도
         if self.config.monitor_url:
             rows = _fetch_from_monitor(self.config.monitor_url, "naver", self.config.timeout_seconds)
@@ -355,7 +372,7 @@ class NaverChannelService:
                         if row.today_sales is None:
                             row.today_sales = 0
                 # monitor 가 내려준 /main/products/ 형식 URL 을 정상 slug 로 교체
-                _fix_naver_product_urls(rows, naver_slug)
+                _fix_naver_product_urls(rows, naver_base)
                 _apply_shared_stock_rules(self.cache, "naver", rows)
                 _assign_serial_by_sales(rows)
                 # monitor 경로에서도 캐시에 저장 → 다음 시작 시 바로 표시됨
@@ -402,7 +419,7 @@ class NaverChannelService:
                     row.today_sales = 0
 
         rows = _reconcile_rows_with_cache(self._row_cache, rows)
-        _fix_naver_product_urls(rows, naver_slug)
+        _fix_naver_product_urls(rows, naver_base)
         _apply_shared_stock_rules(self.cache, "naver", rows)
         _assign_serial_by_sales(rows)
         try:
