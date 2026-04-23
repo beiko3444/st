@@ -360,11 +360,36 @@ class FasstoConnector:
         )
 
     def create_delivery_parcel(self, items: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-        """2차 확장: 주문 승인 시 출고(택배) 생성.
-
-        가이드 12절 참고: POST /api/v1/delivery/parcel/{cstCd}
-        """
+        """주문 승인 시 출고(택배) 생성. POST /api/v1/delivery/parcel/{cstCd}"""
         return self.request("POST", f"/api/v1/delivery/parcel/{self.cst_cd}", body=list(items))
+
+    def update_delivery_parcel(self, items: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+        """PATCH /api/v1/delivery/parcel/{cstCd} — 출고 정보 수정."""
+        return self.request("PATCH", f"/api/v1/delivery/parcel/{self.cst_cd}", body=list(items))
+
+    def cancel_delivery(self, items: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+        """PATCH /api/v1/delivery/cancel/{cstCd} — 출고 요청 취소."""
+        return self.request("PATCH", f"/api/v1/delivery/cancel/{self.cst_cd}", body=list(items))
+
+    def get_delivery_detail(self, slip_no: str) -> Dict[str, Any]:
+        """GET /api/v1/delivery/detail/{cstCd}/{slipNo} — 전표번호 기준 출고 상세."""
+        return self.request("GET", f"/api/v1/delivery/detail/{self.cst_cd}/{slip_no}")
+
+    def get_delivery_parcel_list(
+        self, start: str, end: str, out_div: str = "1"
+    ) -> Dict[str, Any]:
+        """GET /api/v1/delivery/parcel/{cstCd}/{start}/{end}/{outDiv} — 택배 출고 목록."""
+        return self.request(
+            "GET",
+            f"/api/v1/delivery/parcel/{self.cst_cd}/{start}/{end}/{out_div}",
+        )
+
+    def get_delivery_good_detail_list(self, start: str, end: str) -> Dict[str, Any]:
+        """GET /api/v1/delivery/good/detail/list/{cstCd}/{start}/{end} — 출고 상품 상세."""
+        return self.request(
+            "GET",
+            f"/api/v1/delivery/good/detail/list/{self.cst_cd}/{start}/{end}",
+        )
 
 
 # ---------------------------------------------------------------------------

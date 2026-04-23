@@ -108,8 +108,9 @@ def _run_async(
 # ---------------------------------------------------------------------------
 
 
-def _fmt_yyyymmdd(d: date) -> str:
-    return d.strftime("%Y%m%d")
+def _fmt_api_date(d: date) -> str:
+    """Fassto API 는 경로 파라미터에 YYYY-MM-DD 형식을 요구 (Swagger 스펙)."""
+    return d.strftime("%Y-%m-%d")
 
 
 def _default_range() -> tuple[date, date]:
@@ -378,8 +379,8 @@ class _WarehousingSubTab(QWidget):
     def _refresh_list(self) -> None:
         if not self._tab.require_configured(self):
             return
-        start = _fmt_yyyymmdd(self.start_edit.date().toPython())
-        end = _fmt_yyyymmdd(self.end_edit.date().toPython())
+        start = _fmt_api_date(self.start_edit.date().toPython())
+        end = _fmt_api_date(self.end_edit.date().toPython())
         self.status.setText("조회 중...")
         self.refresh_btn.setEnabled(False)
 
@@ -464,11 +465,15 @@ class _DeliverySubTab(QWidget):
         self.end_edit.setDisplayFormat("yyyy-MM-dd")
 
         self.status_combo = QComboBox()
-        self.status_combo.addItems(["ALL", "READY", "WORKING", "DONE", "CANCEL"])
+        # Swagger 스펙: ALL | ORDER | WORKING | DONE | PARTDONE | CANCEL | SHORTAGE
+        self.status_combo.addItems(
+            ["ALL", "ORDER", "WORKING", "DONE", "PARTDONE", "CANCEL", "SHORTAGE"]
+        )
         self.status_combo.setEditable(True)
 
         self.out_div_combo = QComboBox()
-        self.out_div_combo.addItems(["1", "2", "3"])
+        # Swagger 스펙: 1(Parcel) | 2(Vehicle) | COUPANG | ONE_DAY
+        self.out_div_combo.addItems(["1", "2", "COUPANG", "ONE_DAY"])
         self.out_div_combo.setEditable(True)
 
         self.refresh_btn = QPushButton("조회")
@@ -498,8 +503,8 @@ class _DeliverySubTab(QWidget):
     def _refresh(self) -> None:
         if not self._tab.require_configured(self):
             return
-        start = _fmt_yyyymmdd(self.start_edit.date().toPython())
-        end = _fmt_yyyymmdd(self.end_edit.date().toPython())
+        start = _fmt_api_date(self.start_edit.date().toPython())
+        end = _fmt_api_date(self.end_edit.date().toPython())
         status = (self.status_combo.currentText() or "ALL").strip() or "ALL"
         out_div = (self.out_div_combo.currentText() or "1").strip() or "1"
 

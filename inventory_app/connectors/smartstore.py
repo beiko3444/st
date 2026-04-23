@@ -240,7 +240,8 @@ class SmartStoreConnector:
         return text  # slug 만 들어온 경우
 
     _SMARTSTORE_URL_RE = re.compile(
-        r"https?://smartstore\.naver\.com/([A-Za-z0-9_-]+)", re.I
+        r"https?://smartstore\.naver\.com/([A-Za-z0-9_-]+)(?:/products/(\d+))?",
+        re.I,
     )
 
     @classmethod
@@ -250,7 +251,7 @@ class SmartStoreConnector:
             m = cls._SMARTSTORE_URL_RE.search(obj)
             if m:
                 slug = m.group(1).strip().strip("/")
-                if slug and slug.lower() != "main":
+                if slug and slug.lower() not in ("main", "products"):
                     return slug
             return None
         if isinstance(obj, dict):
@@ -262,6 +263,54 @@ class SmartStoreConnector:
         if isinstance(obj, (list, tuple, set)):
             for value in obj:
                 found = cls._scan_for_store_slug(value)
+                if found:
+                    return found
+            return None
+        return None
+
+    @classmethod
+    def _scan_for_product_url(cls, obj: Any) -> Optional[str]:
+        """응답 어딘가에 포함된 smartstore 상품 URL 을 그대로 추출.
+
+        네이버 Commerce API 는 productUrl / mobileProductUrl 필드를
+        `https://smartstore.naver.com/main/products/{id}` 형식으로 반환함.
+        'main' 은 universal redirect 역할이므로 그대로 사용.
+        """
+        if isinstance(obj, str):
+            # 문자열에 smartstore URL 이 포함돼 있으면 리턴.
+            # 단, slug 자리가 "main" 이면 잘못된 URL(404 "no-product") 이므로 제외.
+            m = re.search(
+                r"https?://(?:m\.)?smartstore\.naver\.com/([A-Za-z0-9_-]+)/products/\d+[^\s\"'<>]*",
+                obj,
+            )
+            if m and m.group(1).lower() != "main":
+                return m.group(0)
+            return None
+        if isinstance(obj, dict):
+            # 네이버 공식 URL 필드 우선순위 (확인된 것부터)
+            preferred_keys = (
+                "productUrl",          # 네이버 공식: https://smartstore.naver.com/main/products/{id}
+                "pcProductUrl",
+                "mobileProductUrl",    # https://m.smartstore.naver.com/...
+                "channelProductUrl",
+                "productPageUrl",
+                "storeKeepUrl",
+                "detailPageUrl",
+                "url",
+            )
+            for key in preferred_keys:
+                if key in obj:
+                    found = cls._scan_for_product_url(obj[key])
+                    if found:
+                        return found
+            for value in obj.values():
+                found = cls._scan_for_product_url(value)
+                if found:
+                    return found
+            return None
+        if isinstance(obj, (list, tuple, set)):
+            for value in obj:
+                found = cls._scan_for_product_url(value)
                 if found:
                     return found
             return None
@@ -597,10 +646,34 @@ class SmartStoreConnector:
             groups = body.get("contents") or []
             for group in groups:
                 channel_products = group.get("channelProducts") or []
+                # 그룹 자체 레벨에도 URL 이 있을 수 있으니 group 먼저 보고 → product 순으로 scan
+                group_url = self._scan_for_product_url(group)
                 for product in channel_products:
                     image_data = product.get("representativeImage") or {}
                     origin_no = product.get("originProductNo")
                     channel_no = product.get("channelProductNo")
+
+                    # 1순위: 응답 속에 들어있는 진짜 상품 URL 을 그대로 사용.
+                    #        (Naver API 가 productUrl/pcProductUrl 같은 필드로 제공할 경우)
+                    product_url = self._scan_for_product_url(product)
+                    if not product_url:
+                        # product 에 없지만 group 에 있다면 product ID 로 교체 후 사용
+                        if group_url and (channel_no or origin_no):
+                            # group_url 에서 slug 만 추출해서 해당 product ID 로 재구성
+                            m = self._SMARTSTORE_URL_RE.search(group_url)
+                            if m:
+                                group_slug = m.group(1)
+                                product_url = (
+                                    f"https://smartstore.naver.com/{group_slug}/products/"
+                                    f"{channel_no or origin_no}"
+                                )
+                    if not product_url:
+                        # 3순위: slug 알면 직접 build, 아니면 검색 fallback
+                        product_url = self._build_product_url(
+                            origin_no or channel_no,
+                            str(product.get("name") or ""),
+                        )
+
                     results.append(
                         {
                             "channel": "스마트스토어",
@@ -609,10 +682,7 @@ class SmartStoreConnector:
                             "item_id": None,
                             "name": str(product.get("name") or ""),
                             "image_url": self._normalize_image_url(image_data.get("url")),
-                            "product_url": self._build_product_url(
-                                origin_no or channel_no,
-                                str(product.get("name") or ""),
-                            ),
+                            "product_url": product_url,
                             "stock": self._to_int(product.get("stockQuantity")),
                             "price": self._to_int(
                                 product.get("discountedPrice")

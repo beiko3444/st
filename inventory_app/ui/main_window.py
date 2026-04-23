@@ -231,16 +231,29 @@ class ClickableImageContainer(QWidget):
         self._product_url = _normalize_web_url(url)
         if self._product_url:
             self.setCursor(Qt.PointingHandCursor)
-            self.setToolTip("이미지 클릭 시 상품페이지 열기")
+            # 툴팁에 실제 URL 을 노출 → 유저가 클릭 전에 검증 가능
+            self.setToolTip(
+                f"좌클릭: 상품페이지 열기\n"
+                f"우클릭: 이 URL 복사\n\n{self._product_url}"
+            )
         else:
             self.setCursor(Qt.ArrowCursor)
             self.setToolTip("")
 
     def mousePressEvent(self, event: Any) -> None:
-        # QTableWidget 셀 위젯에서는 release 이벤트가 유실되는 경우가 있어
-        # press 시점에 즉시 emit 한다 (ProductImageLabel 과 동일 패턴).
+        # 좌클릭: 상품 페이지 열기 (QTableWidget 셀 위젯에선 release 이벤트 유실 사례가
+        # 있어서 press 시점에 즉시 emit).
         if event.button() == Qt.LeftButton and self._product_url:
             self.clicked.emit(self._product_url)
+            event.accept()
+            return
+        # 우클릭: URL 을 클립보드에 복사 (링크가 이상할 때 유저가 직접 브라우저에
+        # 붙여넣어 확인할 수 있도록 진단 편의 제공)
+        if event.button() == Qt.RightButton and self._product_url:
+            try:
+                QApplication.clipboard().setText(self._product_url)
+            except Exception:  # noqa: BLE001
+                pass
             event.accept()
             return
         super().mousePressEvent(event)
@@ -1076,12 +1089,10 @@ class ChannelTab(QWidget):
         return self.name_overrides.get(key, row.name)
 
     def _row_product_url(self, row: ChannelProduct) -> str | None:
+        # services 레이어가 /main/ URL 을 이미 정상 slug 로 교정해서 넘겨줌.
         direct = _normalize_web_url(row.product_url)
-        # 옛 캐시에 저장된 잘못된 smartstore /main/products/ URL 은 무시 (store slug 없어 404).
-        # 재동기화 후 새 URL(올바른 slug 포함) 로 교체됨.
-        if direct and "smartstore.naver.com/main/products/" not in direct:
+        if direct:
             return direct
-
         return _normalize_web_url(_build_search_url(self.channel_name, self._display_name(row)))
 
     @staticmethod
@@ -3998,8 +4009,8 @@ class SalesDailyTab(QWidget):
 
     def _sale_product_url(self, sale_row: dict) -> str | None:
         direct = _normalize_web_url(sale_row.get("product_url"))
-        # 캐시에 저장돼 있는 과거 잘못된 smartstore URL 은 무시
-        if direct and "smartstore.naver.com/main/products/" not in direct:
+        # 잘못된 /main/ URL 필터
+        if direct and "smartstore.naver.com/main/" not in direct:
             return direct
 
         channel = str(sale_row.get("channel") or "").strip().lower()
