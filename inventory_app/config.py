@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
 
+import httpx
+
 
 @dataclass
 class AppConfig:
@@ -47,6 +49,41 @@ def _get_optional(config: Dict[str, Any], default: Any, *keys: str) -> Any:
     return current
 
 
+def _resolve_monitor_url_from_gist(gist_raw_url: str, timeout: float = 5.0) -> str | None:
+    """Secret gist 의 monitor.json 에서 최신 Pi tunnel URL 을 가져온다.
+
+    Pi 부팅 때마다 cloudflared quick tunnel hostname 이 바뀌기 때문에
+    Pi 쪽 publisher 스크립트가 매번 gist 를 업데이트하고,
+    앱은 시작 시 이 raw URL 에서 현재 URL 을 읽어온다.
+
+    raw.githubusercontent.com 은 CDN 캐시가 있어 최신 커밋 반영까지
+    지연이 있으므로 쿼리스트링 cache buster + no-cache 헤더로 우회한다.
+
+    실패 시 None 반환 → 호출부에서 credentials.json 의 monitor.url 로 fallback.
+    """
+    if not gist_raw_url:
+        return None
+    import time
+    separator = "&" if "?" in gist_raw_url else "?"
+    bust = f"{gist_raw_url}{separator}t={int(time.time())}"
+    try:
+        resp = httpx.get(
+            bust,
+            timeout=timeout,
+            follow_redirects=True,
+            headers={"Cache-Control": "no-cache"},
+        )
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(payload, dict):
+        return None
+    url = str(payload.get("url") or "").strip()
+    return url or None
+
+
 def load_config(path: Path | None = None) -> AppConfig:
     if path is None:
         root = Path(__file__).resolve().parents[1]
@@ -58,6 +95,17 @@ def load_config(path: Path | None = None) -> AppConfig:
     smartstore_client_secret = str(_get(raw, "smartstore", "client_secret"))
     smartstore_token_type = str(_get(raw, "smartstore", "token_type"))
     smartstore_store_url = str(_get_optional(raw, "", "smartstore", "store_url")).strip()
+
+    # Pi tunnel URL 해상도:
+    # 1) monitor.url_gist 가 있으면 gist 에서 최신 URL fetch (Pi 재부팅에도 무관)
+    # 2) 실패하거나 미설정이면 monitor.url 을 그대로 사용
+    gist_raw_url = str(_get_optional(raw, "", "monitor", "url_gist")).strip()
+    fallback_monitor_url = str(_get_optional(raw, "", "monitor", "url")).strip()
+    resolved_monitor_url: str | None = None
+    if gist_raw_url:
+        resolved_monitor_url = _resolve_monitor_url_from_gist(gist_raw_url)
+    if not resolved_monitor_url:
+        resolved_monitor_url = fallback_monitor_url or None
 
     return AppConfig(
         smartstore_client_id=smartstore_client_id,
@@ -79,7 +127,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         coupang_secret_key=str(_get(raw, "coupang", "secret_key")),
         timeout_seconds=int(_get(raw, "request", "timeout_seconds")),
         max_products=int(_get(raw, "request", "max_products")),
-        monitor_url=str(_get_optional(raw, None, "monitor", "url")) or None,
+        monitor_url=resolved_monitor_url,
         fassto_api_url=str(
             _get_optional(raw, "https://fmsapi.fassto.ai", "fassto", "api_url")
         ),

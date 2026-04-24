@@ -57,6 +57,9 @@ _MASTER_COLS = [
     "쿠팡재고",
     "총재고",
     "재고원가",
+    "네이버(오늘)",
+    "쿠팡(오늘)",
+    "오늘판매",
     "네이버판매(30일)",
     "쿠팡판매(30일)",
     "총판매(30일)",
@@ -164,16 +167,38 @@ class ProductMasterTab(QWidget):
         self.master_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.master_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.master_table.setAlternatingRowColors(True)
+        self.master_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.master_table.itemSelectionChanged.connect(self._on_master_selected)
+        # 컬럼 너비 전략:
+        # - 이미지/이름은 Interactive (사용자가 드래그 가능) + 기본폭 지정
+        # - 숫자 컬럼은 Interactive + 고정 폭 (ResizeToContents 는 행마다 폭이 튀어서 산만)
+        #   테이블 전체가 화면보다 넓으면 가로 스크롤 허용.
         header = self.master_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Fixed)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
-        for idx in range(2, len(_MASTER_COLS)):
-            header.setSectionResizeMode(idx, QHeaderView.ResizeToContents)
-        self.master_table.setColumnWidth(0, 56)
+        header.setStretchLastSection(False)
+        for idx in range(len(_MASTER_COLS)):
+            header.setSectionResizeMode(idx, QHeaderView.Interactive)
+        # 너비 설정: 이미지 56, 이름 260, 숫자 80~110
+        _col_widths = {
+            0: 56,    # 이미지
+            1: 260,   # 이름
+            2: 80,    # 원가
+            3: 86,    # 네이버재고
+            4: 80,    # 쿠팡재고
+            5: 80,    # 총재고
+            6: 110,   # 재고원가
+            7: 92,    # 네이버(오늘)
+            8: 84,    # 쿠팡(오늘)
+            9: 86,    # 오늘판매
+            10: 116,  # 네이버판매(30일)
+            11: 110,  # 쿠팡판매(30일)
+            12: 108,  # 총판매(30일)
+            13: 56,   # 연결
+        }
+        for col, w in _col_widths.items():
+            self.master_table.setColumnWidth(col, w)
         self.master_table.verticalHeader().setDefaultSectionSize(48)
-        # 총합 컬럼은 굵게 강조
-        for total_col in (5, 9):
+        # 총합 컬럼은 굵게 강조 (총재고 / 오늘판매 / 총판매30일)
+        for total_col in (5, 9, 12):
             header_item = self.master_table.horizontalHeaderItem(total_col)
             if header_item is not None:
                 f = header_item.font()
@@ -244,7 +269,9 @@ class ProductMasterTab(QWidget):
         self.links_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.links_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.links_table.setAlternatingRowColors(True)
+        self.links_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         links_header = self.links_table.horizontalHeader()
+        links_header.setStretchLastSection(False)
         links_header.setSectionResizeMode(1, QHeaderView.Stretch)
         for idx in (0, 2, 3, 4, 5, 6, 7, 8):
             links_header.setSectionResizeMode(idx, QHeaderView.ResizeToContents)
@@ -252,9 +279,10 @@ class ProductMasterTab(QWidget):
 
         splitter.addWidget(left)
         splitter.addWidget(right)
-        splitter.setStretchFactor(0, 1)
+        # 마스터 테이블이 화면 다수 차지 (컬럼 14개). detail 은 고정폭 느낌으로.
+        splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([580, 780])
+        splitter.setSizes([1120, 520])
         root_layout.addWidget(splitter, 1)
 
         self._set_detail_enabled(False)
@@ -272,7 +300,11 @@ class ProductMasterTab(QWidget):
             try:
                 self.service.refresh_from_remote()
             except MasterRemoteError as exc:
-                self._remote_refresh_warning = f"Pi 동기화 실패 (로컬 캐시 사용): {exc}"
+                if exc.status == 0:
+                    # 네트워크/DNS 오류 — Pi 가 꺼져있거나 LAN 밖. 조용히 로컬 캐시 사용.
+                    self._remote_refresh_warning = "Pi 오프라인 (로컬 캐시 사용)"
+                else:
+                    self._remote_refresh_warning = f"Pi 동기화 실패 (HTTP {exc.status})"
         rows_by_channel: Dict[str, List[ChannelProduct]] = {
             "naver": self.cache.load_rows("naver"),
             "coupang": self.cache.load_rows("coupang"),
@@ -348,17 +380,29 @@ class ProductMasterTab(QWidget):
             row_idx, 6, self._number_item(_format_price(stock_cost), stock_cost)
         )
         self.master_table.setItem(
-            row_idx, 7, self._number_item(_format_int(master_row.naver_sales), master_row.naver_sales)
+            row_idx, 7,
+            self._number_item(_format_int(master_row.naver_today_sales), master_row.naver_today_sales),
         )
         self.master_table.setItem(
-            row_idx, 8, self._number_item(_format_int(master_row.coupang_sales), master_row.coupang_sales)
+            row_idx, 8,
+            self._number_item(_format_int(master_row.coupang_today_sales), master_row.coupang_today_sales),
         )
         self.master_table.setItem(
-            row_idx, 9, self._number_item(_format_int(master_row.total_sales), master_row.total_sales)
+            row_idx, 9,
+            self._number_item(_format_int(master_row.total_today_sales), master_row.total_today_sales),
+        )
+        self.master_table.setItem(
+            row_idx, 10, self._number_item(_format_int(master_row.naver_sales), master_row.naver_sales)
+        )
+        self.master_table.setItem(
+            row_idx, 11, self._number_item(_format_int(master_row.coupang_sales), master_row.coupang_sales)
+        )
+        self.master_table.setItem(
+            row_idx, 12, self._number_item(_format_int(master_row.total_sales), master_row.total_sales)
         )
         link_count = len(master_row.linked)
         self.master_table.setItem(
-            row_idx, 10, self._number_item(str(link_count), link_count)
+            row_idx, 13, self._number_item(str(link_count), link_count)
         )
 
     @staticmethod

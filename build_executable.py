@@ -42,6 +42,16 @@ def main() -> int:
     build_name = "SmartInventory"
     print(f"Building {build_name} ...")
 
+    icon_path: Path | None = None
+    if sys.platform == "darwin":
+        candidate = root / "assets" / "icon.icns"
+        if candidate.exists():
+            icon_path = candidate
+    elif sys.platform.startswith("win"):
+        candidate = root / "assets" / "icon.ico"
+        if candidate.exists():
+            icon_path = candidate
+
     command = [
         sys.executable,
         "-m",
@@ -53,8 +63,10 @@ def main() -> int:
         build_name,
         "--add-data",
         _add_data_arg(),
-        "main.py",
     ]
+    if icon_path is not None:
+        command += ["--icon", str(icon_path)]
+    command.append("main.py")
     env = os.environ.copy()
     if sys.platform == "darwin":
         env["COPYFILE_DISABLE"] = "1"

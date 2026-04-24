@@ -1,0 +1,14 @@
+[Unit]
+Description=Publish cloudflared tunnel URL to GitHub gist
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=beiko
+ExecStart=/usr/local/bin/publish-tunnel-url.sh
+# Pi 부팅 직후 cloudflared 가 아직 URL 안 뿌렸으면 스크립트가 60초 폴링 후 실패 → timer 가 다시 돌려줌
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target

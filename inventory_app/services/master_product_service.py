@@ -155,6 +155,11 @@ class MasterProductService:
         # 읽기는 로컬 캐시에서만 (속도/오프라인 내성). 신선도는 refresh_from_remote() 로 관리.
         return self.cache.list_masters()
 
+    @staticmethod
+    def _is_offline(exc: MasterRemoteError) -> bool:
+        # status==0 은 네트워크/DNS 레벨 실패. Pi 가 꺼졌거나 LAN 밖일 때.
+        return int(getattr(exc, "status", 0)) == 0
+
     def create_master(
         self,
         name: str,
@@ -162,24 +167,34 @@ class MasterProductService:
         memo: str | None = None,
     ) -> MasterProduct:
         if self.remote is not None:
-            master = self.remote.create_master(name, unit_cost=unit_cost, memo=memo)
-            self.cache.upsert_master_row(master)
-            return master
+            try:
+                master = self.remote.create_master(name, unit_cost=unit_cost, memo=memo)
+                self.cache.upsert_master_row(master)
+                return master
+            except MasterRemoteError as exc:
+                if not self._is_offline(exc):
+                    raise
         return self.cache.create_master(name, unit_cost=unit_cost, memo=memo)
 
     def update_master(self, master_id: int, **kwargs) -> None:
         if self.remote is not None:
-            master = self.remote.update_master(master_id, **kwargs)
-            self.cache.upsert_master_row(master)
-            return
+            try:
+                master = self.remote.update_master(master_id, **kwargs)
+                self.cache.upsert_master_row(master)
+                return
+            except MasterRemoteError as exc:
+                if not self._is_offline(exc):
+                    raise
         self.cache.update_master(master_id, **kwargs)
 
     def delete_master(self, master_id: int) -> None:
         if self.remote is not None:
-            self.remote.delete_master(master_id)
-            # 로컬도 삭제 (FK CASCADE 로 링크도 같이 사라짐)
-            self.cache.delete_master(master_id)
-            return
+            try:
+                self.remote.delete_master(master_id)
+            except MasterRemoteError as exc:
+                if not self._is_offline(exc):
+                    raise
+        # 로컬도 삭제 (FK CASCADE 로 링크도 같이 사라짐)
         self.cache.delete_master(master_id)
 
     def set_representative(
@@ -189,15 +204,19 @@ class MasterProductService:
         product_key: str | None,
     ) -> None:
         if self.remote is not None:
-            master = self.remote.set_master_representative(
-                master_id, channel, product_key
-            )
-            self.cache.upsert_master_row(master)
-            return
+            try:
+                master = self.remote.set_master_representative(
+                    master_id, channel, product_key
+                )
+                self.cache.upsert_master_row(master)
+                return
+            except MasterRemoteError as exc:
+                if not self._is_offline(exc):
+                    raise
         self.cache.set_master_representative(master_id, channel, product_key)
 
     # ------------------------------------------------------------------
-    # Link CRUD (write-through)
+    # Link CRUD (write-through; offline 시 로컬 fallback)
     # ------------------------------------------------------------------
 
     def link(
@@ -208,23 +227,33 @@ class MasterProductService:
         multiplier: int = 1,
     ) -> None:
         if self.remote is not None:
-            link = self.remote.link(channel, product_key, master_id, multiplier)
-            self.cache.upsert_link_row(link)
-            return
+            try:
+                link = self.remote.link(channel, product_key, master_id, multiplier)
+                self.cache.upsert_link_row(link)
+                return
+            except MasterRemoteError as exc:
+                if not self._is_offline(exc):
+                    raise
         self.cache.link_channel_product(channel, product_key, master_id, multiplier)
 
     def unlink(self, channel: str, product_key: str) -> None:
         if self.remote is not None:
-            self.remote.unlink(channel, product_key)
-            self.cache.unlink_channel_product(channel, product_key)
-            return
+            try:
+                self.remote.unlink(channel, product_key)
+            except MasterRemoteError as exc:
+                if not self._is_offline(exc):
+                    raise
         self.cache.unlink_channel_product(channel, product_key)
 
     def set_multiplier(self, channel: str, product_key: str, multiplier: int) -> None:
         if self.remote is not None:
-            link = self.remote.set_link_multiplier(channel, product_key, multiplier)
-            self.cache.upsert_link_row(link)
-            return
+            try:
+                link = self.remote.set_link_multiplier(channel, product_key, multiplier)
+                self.cache.upsert_link_row(link)
+                return
+            except MasterRemoteError as exc:
+                if not self._is_offline(exc):
+                    raise
         self.cache.set_link_multiplier(channel, product_key, multiplier)
 
     def get_link(self, channel: str, product_key: str) -> ChannelMasterLink | None:

@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic gist refresh of cloudflared tunnel URL
+
+[Timer]
+# 부팅 후 30초부터 첫 실행 (cloudflared 뜨길 기다림)
+OnBootSec=30s
+# 이후 5분마다 재확인 (URL 바뀌면 감지해서 gist 업데이트)
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
