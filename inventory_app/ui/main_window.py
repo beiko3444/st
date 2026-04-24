@@ -43,8 +43,9 @@ from PySide6.QtWidgets import (
 )
 
 from inventory_app.config import AppConfig
-from inventory_app.models import ChannelProduct, SharedStockRule
+from inventory_app.models import ChannelProduct
 from inventory_app.ui.fassto_tab import FasstoTab
+from inventory_app.ui.product_master_tab import ProductMasterTab
 from inventory_app.services.channel_services import CoupangChannelService, NaverChannelService
 from inventory_app.services.keyword_services import (
     KeywordRevenueRow,
@@ -52,6 +53,8 @@ from inventory_app.services.keyword_services import (
     NaverKeywordRevenueService,
 )
 from inventory_app.services.local_cache import ChannelProductCache
+from inventory_app.services.master_product_service import MasterProductService
+from inventory_app.services.shared_stock_grouping import product_identity_key
 from inventory_app.services.revenue_services import (
     RevenueChannelSummary,
     RevenueComparisonService,
@@ -168,31 +171,6 @@ class ChannelSyncWorker(QThread):
             self.failed.emit(str(exc))
 
 
-class StartupSharedStockSyncWorker(QThread):
-    completed = Signal(object, int)
-
-    def __init__(
-        self,
-        flush_fn: Callable[[], int],
-        fetch_fn: Callable[[], Dict[str, SharedStockRule]],
-    ) -> None:
-        super().__init__()
-        self.flush_fn = flush_fn
-        self.fetch_fn = fetch_fn
-
-    def run(self) -> None:
-        synced_pending = 0
-        try:
-            synced_pending = int(self.flush_fn() or 0)
-        except Exception:
-            synced_pending = 0
-        try:
-            remote_rules = self.fetch_fn()
-        except Exception:
-            remote_rules = None
-        self.completed.emit(remote_rules, synced_pending)
-
-
 class ProductImageLabel(QLabel):
     clicked = Signal(str)
 
@@ -291,6 +269,7 @@ class ChannelTab(QWidget):
     image_downloaded = Signal(str, object)
     sync_finished = Signal(str, bool)
     favorites_changed = Signal(str)
+    masters_changed = Signal(str)  # 마스터/링크가 이 탭에서 변경됨
 
     @staticmethod
     def _resolve_channel_code(channel_name: str) -> str:
@@ -322,14 +301,16 @@ class ChannelTab(QWidget):
         self.channel_code = self._resolve_channel_code(self.channel_name)
 
         self.worker: ChannelSyncWorker | None = None
-        self.startup_shared_stock_worker: StartupSharedStockSyncWorker | None = None
         self._initial_rows_loaded = False
         self.rows: List[ChannelProduct] = []
         self.filtered_rows: List[ChannelProduct] = []
         self.cache = ChannelProductCache()
+        self.master_service = MasterProductService(cache=self.cache)
         self.favorite_keys: set[str] = self.cache.load_favorite_keys(self.channel_name)
         self.name_overrides = self.cache.load_name_overrides(self.channel_name)
-        self.shared_stock_rules = self.cache.load_shared_stock_rules(self.channel_name)
+        # product_key -> master_id (이 채널에 속한 링크만)
+        self.master_link_map: Dict[str, int] = {}
+        self._reload_master_links()
 
         self.image_cache: dict[str, QPixmap] = {}
         self._image_waiters: dict[str, list[tuple[QLabel, int]]] = {}
@@ -347,11 +328,6 @@ class ChannelTab(QWidget):
         self._filter_timer.timeout.connect(self._apply_filters)
 
         self.sync_button = QPushButton("동기화")
-        self.auto_group_button = QPushButton("묶음 자동제안")
-        self.auto_group_button.setToolTip(
-            "상품명 패턴(예: 4팩, 10개입)으로 공유재고 그룹을 자동 감지합니다.\n"
-            "마스터(최소 pack_size)에 판매량을 합산하여 뻥튀기된 매출을 보정합니다."
-        )
         self.favorite_filter = QComboBox()
         self.search_input = QLineEdit()
         self.today_sales_amount_label = ClickableLabel("오늘 총 판매금액: 0원")
@@ -379,7 +355,6 @@ class ChannelTab(QWidget):
             return
         self._initial_rows_loaded = True
         self._load_initial_rows()
-        QTimer.singleShot(1200, self._start_startup_shared_stock_sync)
 
     def _build_ui(self) -> None:
         root_layout = QVBoxLayout(self)
@@ -400,10 +375,7 @@ class ChannelTab(QWidget):
         self.search_input.textChanged.connect(self._schedule_filter_refresh)
         self.today_sales_amount_label.setStyleSheet("color: #065f46; font-weight: 600;")
 
-        self.auto_group_button.clicked.connect(self._open_auto_group_suggest_dialog)
-
         top_bar.addWidget(self.sync_button)
-        top_bar.addWidget(self.auto_group_button)
         top_bar.addWidget(QLabel("필터"))
         top_bar.addWidget(self.favorite_filter)
         top_bar.addWidget(QLabel("검색"))
@@ -747,12 +719,6 @@ class ChannelTab(QWidget):
             iid = row.item_id if row.item_id else None
             name_map[self._monitor_item_key(pid, iid)] = self._display_name(row)
 
-        # 비마스터(shadow) 이벤트 제외 — 채널탭 _effective_today_sales 과 동일 정책
-        rules = self.shared_stock_rules
-        master_group_ids = {
-            r.group_id for r in rules.values() if r.is_master
-        }
-
         per_item: Dict[str, Dict[str, Any]] = _dd(
             lambda: {"qty": 0, "amount": 0, "name": "", "count": 0}
         )
@@ -760,11 +726,6 @@ class ChannelTab(QWidget):
             pid = str(event.get("product_id") or "").strip()
             iid = str(event.get("item_id")) if event.get("item_id") else None
             key = self._monitor_item_key(pid, iid)
-
-            # shadow 제외
-            rule = rules.get(f"id:{pid}|item:{iid or ''}")
-            if rule is not None and not rule.is_master and rule.group_id in master_group_ids:
-                continue
 
             qty = int(event.get("qty_sold") or 0)
             try:
@@ -1095,391 +1056,12 @@ class ChannelTab(QWidget):
             return direct
         return _normalize_web_url(_build_search_url(self.channel_name, self._display_name(row)))
 
-    @staticmethod
-    def _guess_pack_size(name: str) -> int:
-        text = str(name or "")
-        matches = re.findall(r"(\d+)\s*(?:개|팩|세트|입)", text)
-        if not matches:
-            return 1
-        try:
-            return max(1, int(matches[-1]))
-        except (TypeError, ValueError):
-            return 1
-
-    def _shared_stock_rule(self, row: ChannelProduct) -> SharedStockRule | None:
-        return self.shared_stock_rules.get(self._name_override_key(row))
-
-    def _open_auto_group_suggest_dialog(self) -> None:
-        """상품명 패턴으로 공유재고 그룹 자동 제안 → 확인 → 적용."""
-        from collections import defaultdict as _dd
-
-        from inventory_app.services.shared_stock_grouping import (
-            product_identity_key as _pk_fn,
-            suggest_groups as _suggest,
-        )
-
-        if not self.rows:
-            QMessageBox.information(self, "안내", "상품 목록이 없습니다. 먼저 동기화하세요.")
-            return
-
-        proposed = _suggest(self.rows, product_key_fn=_pk_fn)
-        if not proposed:
-            QMessageBox.information(
-                self,
-                "그룹 자동제안",
-                "묶음 상품 패턴(예: 4팩/10개입/세트 10 등)을 가진 그룹을 찾지 못했습니다.",
-            )
-            return
-
-        existing = dict(self.shared_stock_rules)
-        new_count = changed_count = same_count = 0
-        for pk, rule in proposed.items():
-            old = existing.get(pk)
-            if old is None:
-                new_count += 1
-            elif (old.group_id, int(old.pack_size), bool(old.is_master)) != (
-                rule.group_id,
-                int(rule.pack_size),
-                bool(rule.is_master),
-            ):
-                changed_count += 1
-            else:
-                same_count += 1
-
-        # 그룹 단위 미리보기
-        rows_by_key: Dict[str, ChannelProduct] = {}
-        for row in self.rows:
-            rows_by_key[_pk_fn(row)] = row
-        by_group: Dict[str, List[tuple[str, int, bool]]] = _dd(list)
-        for pk, rule in proposed.items():
-            row = rows_by_key.get(pk)
-            if row is None:
-                continue
-            by_group[rule.group_id].append(
-                (row.name, int(rule.pack_size), bool(rule.is_master))
-            )
-
-        # 전체 그룹을 스크롤 가능한 텍스트 영역으로 표시 (생략 없이)
-        preview_lines: List[str] = []
-        for gid, members in by_group.items():
-            members_sorted = sorted(members, key=lambda m: m[1])
-            preview_lines.append(f"● 그룹: {gid}")
-            for name, pack, is_master in members_sorted:
-                tag = " ★마스터" if is_master else ""
-                short = name if len(name) <= 60 else name[:57] + "..."
-                preview_lines.append(f"   [{pack}팩]{tag} {short}")
-            preview_lines.append("")
-        preview = "\n".join(preview_lines)
-
-        summary = (
-            f"{self.channel_name} 상품 기준 {len(by_group)}개 그룹 제안 "
-            f"(대상 SKU {len(proposed)}개)\n"
-            f"신규 {new_count} · 변경 {changed_count} · 동일 {same_count}\n"
-            f"※ 마스터(최소 pack_size)에 판매량 합산, 비마스터는 0 처리됩니다. "
-            f"기존 규칙은 덮어씁니다."
-        )
-
-        # 스크롤 가능한 커스텀 다이얼로그 (버튼이 항상 보이도록 고정 크기)
-        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QPlainTextEdit
-        dlg = QDialog(self)
-        dlg.setWindowTitle("그룹 자동제안")
-        dlg.setModal(True)
-        dlg.resize(640, 560)
-
-        dlg_layout = QVBoxLayout(dlg)
-        dlg_layout.setContentsMargins(14, 14, 14, 14)
-        dlg_layout.setSpacing(10)
-
-        summary_label = QLabel(summary)
-        summary_label.setWordWrap(True)
-        summary_label.setStyleSheet("font-weight: 600;")
-        dlg_layout.addWidget(summary_label)
-
-        text_view = QPlainTextEdit()
-        text_view.setPlainText(preview)
-        text_view.setReadOnly(True)
-        text_view.setStyleSheet("font-family: 'Malgun Gothic'; font-size: 12px;")
-        dlg_layout.addWidget(text_view, 1)
-
-        button_box = QDialogButtonBox(
-            QDialogButtonBox.Yes | QDialogButtonBox.No
-        )
-        yes_btn = button_box.button(QDialogButtonBox.Yes)
-        no_btn = button_box.button(QDialogButtonBox.No)
-        if yes_btn is not None:
-            yes_btn.setText("적용")
-        if no_btn is not None:
-            no_btn.setText("취소")
-            no_btn.setDefault(True)
-        button_box.accepted.connect(dlg.accept)
-        button_box.rejected.connect(dlg.reject)
-        dlg_layout.addWidget(button_box)
-
-        if dlg.exec() != QDialog.Accepted:
-            return
-
-        # UI 프리즈 방지:
-        # _save_shared_stock_rule_with_sync 는 건당 monitor 서버로 HTTP 호출을 하기 때문에
-        # 수백 건 루프에서는 창이 먹통이 된다. 대신 아래처럼 처리한다:
-        #   1) 로컬 SQLite 에 일괄 저장 (transaction 은 각 함수 내부에서 처리됨, 빠름)
-        #   2) monitor URL 이 있으면 pending queue 에 enqueue 만 하고
-        #      백그라운드 startup sync worker 가 추후 flush 하도록 맡긴다.
-        #   3) HTTP 호출은 UI 스레드에서 절대 하지 않음.
-        applied = 0
-        pending_enqueue = bool(self.monitor_url)
-        self._set_busy(True, f"{self.channel_name} 묶음 규칙 저장 중...")
-        try:
-            for pk, rule in proposed.items():
-                try:
-                    self.cache.save_shared_stock_rule(
-                        self.channel_name,
-                        pk,
-                        rule.group_id,
-                        int(rule.pack_size),
-                        bool(rule.is_master),
-                    )
-                    if pending_enqueue:
-                        self.cache.enqueue_shared_stock_pending_op(
-                            self.channel_name,
-                            pk,
-                            "upsert",
-                            group_id=rule.group_id,
-                            pack_size=int(rule.pack_size),
-                            is_master=bool(rule.is_master),
-                        )
-                    applied += 1
-                except Exception:  # noqa: BLE001
-                    continue
-        finally:
-            self._set_busy(False)
-
-        self.shared_stock_rules = self.cache.load_shared_stock_rules(self.channel_name)
-        self._apply_filters()
-        self._update_today_sales_amount_label()
-        self.favorites_changed.emit(self.channel_name)
-        self.status_label.setText(
-            f"{self.channel_name} 묶음 자동제안 적용 완료: {applied}건 저장 "
-            f"({len(by_group)}개 그룹)"
-        )
-
-        # 백그라운드로 monitor 서버 동기화 트리거 (있을 때만)
-        if pending_enqueue:
-            QTimer.singleShot(0, self._start_startup_shared_stock_sync)
-
-        remote_note = (
-            "\n(monitor 서버 동기화는 백그라운드에서 자동 처리됩니다.)"
-            if pending_enqueue
-            else ""
-        )
-        QMessageBox.information(
-            self,
-            "완료",
-            f"{applied}건 규칙 적용. 다음 동기화부터 마스터 집계가 반영됩니다.\n"
-            f"지금 즉시 반영하려면 상단 '동기화' 버튼을 누르세요." + remote_note,
-        )
-
-    def _shared_stock_api_url(self) -> str | None:
-        if not self.monitor_url:
-            return None
-        return f"{self.monitor_url.rstrip('/')}/shared-stock"
-
-    def _fetch_remote_shared_stock_rules(self) -> Dict[str, SharedStockRule] | None:
-        url = self._shared_stock_api_url()
-        if not url:
-            return None
-        resp = httpx.get(
-            url,
-            params={"channel": self.channel_code},
-            timeout=self.timeout_seconds,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        rows = payload.get("rules", []) if isinstance(payload, dict) else []
-        if not isinstance(rows, list):
-            return {}
-
-        rules: Dict[str, SharedStockRule] = {}
-        for raw in rows:
-            if not isinstance(raw, dict):
-                continue
-            product_key = str(raw.get("product_key") or "").strip()
-            group_id = str(raw.get("group_id") or "").strip()
-            if not product_key or not group_id:
-                continue
-            try:
-                pack_size = max(1, int(raw.get("pack_size") or 1))
-            except (TypeError, ValueError):
-                pack_size = 1
-            is_master = bool(int(raw.get("is_master") or 0))
-            rules[product_key] = SharedStockRule(
-                group_id=group_id,
-                pack_size=pack_size,
-                is_master=is_master,
-            )
-        return rules
-
-    def _push_remote_shared_stock_rule(
-        self,
-        product_key: str,
-        group_id: str,
-        pack_size: int,
-        is_master: bool,
-    ) -> None:
-        url = self._shared_stock_api_url()
-        if not url:
-            return
-        response = httpx.post(
-            url,
-            json={
-                "channel": self.channel_code,
-                "product_key": product_key,
-                "group_id": group_id,
-                "pack_size": int(pack_size),
-                "is_master": bool(is_master),
-            },
-            timeout=self.timeout_seconds,
-        )
-        response.raise_for_status()
-
-    def _delete_remote_shared_stock_rule(self, product_key: str) -> None:
-        url = self._shared_stock_api_url()
-        if not url:
-            return
-        response = httpx.delete(
-            url,
-            params={"channel": self.channel_code, "product_key": product_key},
-            timeout=self.timeout_seconds,
-        )
-        response.raise_for_status()
-
-    def _flush_shared_stock_pending_ops(self) -> int:
-        if not self.monitor_url:
-            return 0
-        pending = self.cache.load_shared_stock_pending_ops(self.channel_name)
-        if not pending:
-            return 0
-
-        synced = 0
-        for op in pending:
-            try:
-                op_type = str(op.get("op_type") or "")
-                product_key = str(op.get("product_key") or "")
-                if not product_key:
-                    self.cache.delete_shared_stock_pending_op(int(op["id"]))
-                    continue
-                if op_type == "upsert":
-                    group_id = str(op.get("group_id") or "").strip()
-                    if not group_id:
-                        self.cache.delete_shared_stock_pending_op(int(op["id"]))
-                        continue
-                    pack_size = int(op.get("pack_size") or 1)
-                    is_master = bool(op.get("is_master"))
-                    self._push_remote_shared_stock_rule(product_key, group_id, pack_size, is_master)
-                elif op_type == "delete":
-                    self._delete_remote_shared_stock_rule(product_key)
-                else:
-                    self.cache.delete_shared_stock_pending_op(int(op["id"]))
-                    continue
-                self.cache.delete_shared_stock_pending_op(int(op["id"]))
-                synced += 1
-            except Exception:
-                continue
-        return synced
-
-    def _start_startup_shared_stock_sync(self) -> None:
-        if not self.monitor_url:
-            return
-        if self.startup_shared_stock_worker and self.startup_shared_stock_worker.isRunning():
-            return
-        self.startup_shared_stock_worker = StartupSharedStockSyncWorker(
-            flush_fn=self._flush_shared_stock_pending_ops,
-            fetch_fn=self._fetch_remote_shared_stock_rules,
-        )
-        self.startup_shared_stock_worker.completed.connect(
-            self._on_startup_shared_stock_sync_completed
-        )
-        self.startup_shared_stock_worker.start()
-
-    @Slot(object, int)
-    def _on_startup_shared_stock_sync_completed(
-        self,
-        remote_rules: object,
-        synced_pending: int,
-    ) -> None:
-        self.startup_shared_stock_worker = None
-
-        if not isinstance(remote_rules, dict):
-            if synced_pending > 0:
-                self.status_label.setText(
-                    f"{self.channel_name} 공유재고 오프라인 큐 {synced_pending}건 동기화"
-                )
-            return
-
-        self.shared_stock_rules = remote_rules
-        self.cache.replace_shared_stock_rules(self.channel_name, remote_rules)
-        self._force_full_render_next = True
-        self._apply_filters()
-        self._update_today_sales_amount_label()
-        if synced_pending > 0:
-            self.status_label.setText(
-                f"{self.channel_name} 공유재고 서버 동기화 완료 ({synced_pending}건 재전송)"
-            )
-
-    def _save_shared_stock_rule_with_sync(
-        self,
-        product_key: str,
-        group_id: str,
-        pack_size: int,
-        is_master: bool,
-    ) -> None:
-        self.cache.save_shared_stock_rule(
-            self.channel_name,
-            product_key,
-            group_id,
-            int(pack_size),
-            bool(is_master),
-        )
-        if not self.monitor_url:
-            return
-        try:
-            self._push_remote_shared_stock_rule(product_key, group_id, int(pack_size), bool(is_master))
-            self._flush_shared_stock_pending_ops()
-        except Exception:
-            self.cache.enqueue_shared_stock_pending_op(
-                self.channel_name,
-                product_key,
-                "upsert",
-                group_id=group_id,
-                pack_size=int(pack_size),
-                is_master=bool(is_master),
-            )
-
-    def _delete_shared_stock_rule_with_sync(self, product_key: str) -> None:
-        self.cache.delete_shared_stock_rule(self.channel_name, product_key)
-        if not self.monitor_url:
-            return
-        try:
-            self._delete_remote_shared_stock_rule(product_key)
-            self._flush_shared_stock_pending_ops()
-        except Exception:
-            self.cache.enqueue_shared_stock_pending_op(
-                self.channel_name,
-                product_key,
-                "delete",
-            )
-
     def _effective_sales(self, row: ChannelProduct) -> int | None:
-        rule = self._shared_stock_rule(row)
-        if rule and not rule.is_master:
-            return 0
         if row.sales is None:
             return None
         return max(0, int(row.sales))
 
     def _effective_today_sales(self, row: ChannelProduct) -> int | None:
-        rule = self._shared_stock_rule(row)
-        if rule and not rule.is_master:
-            return 0
         if row.today_sales is None:
             return None
         return max(0, int(row.today_sales))
@@ -1608,79 +1190,47 @@ class ChannelTab(QWidget):
         original_name = row.name
         is_customized = display_name != original_name
         is_zero_stock = row.stock is not None and int(row.stock) == 0
-        shared_rule = self._shared_stock_rule(row)
-        shared_role = "대표SKU" if shared_rule and shared_rule.is_master else "비대표SKU"
-        shared_tooltip = ""
-        if shared_rule:
-            shared_tooltip = (
-                f"\n공유재고 그룹: {shared_rule.group_id} | "
-                f"환산수량 x{shared_rule.pack_size} | {shared_role}"
-            )
 
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(6, 0, 6, 0)
         layout.setSpacing(1)
 
-        if shared_rule:
-            badge_row = QWidget()
-            badge_layout = QHBoxLayout(badge_row)
-            badge_layout.setContentsMargins(0, 0, 0, 0)
-            badge_layout.setSpacing(3)
-
-            share_icon = QLabel("⇄")
-            share_icon.setAlignment(Qt.AlignCenter)
-            share_icon.setFixedSize(14, 14)
-            share_icon.setToolTip("공유재고")
-            share_icon.setStyleSheet(
-                """
-                color: #ffffff;
-                background: #059669;
-                font-size: 9px;
-                font-weight: 700;
-                border-radius: 7px;
-                """
-                if shared_rule.is_master
-                else """
-                color: #ffffff;
-                background: #2563eb;
-                font-size: 9px;
-                font-weight: 700;
-                border-radius: 7px;
-                """
+        if not self.is_row_linked(row):
+            unlinked_badge_row = QWidget()
+            unlinked_layout = QHBoxLayout(unlinked_badge_row)
+            unlinked_layout.setContentsMargins(0, 0, 0, 0)
+            unlinked_layout.setSpacing(3)
+            unlinked_badge = QLabel("● 미연결")
+            unlinked_badge.setToolTip(
+                "이 상품은 아직 마스터 상품에 연결되지 않았습니다.\n"
+                "우클릭 → ‘마스터에 연결…’ 로 연결하세요."
             )
-            badge_layout.addWidget(share_icon, 0, Qt.AlignLeft)
-
-            group_text = shared_rule.group_id
-            if len(group_text) > 14:
-                group_text = f"{group_text[:14]}..."
-            group_badge = QLabel(f"◈ {group_text} x{shared_rule.pack_size}")
-            group_badge.setToolTip(f"공유그룹: {shared_rule.group_id} | 환산수량 x{shared_rule.pack_size}")
-            group_badge.setStyleSheet(
+            unlinked_badge.setStyleSheet(
                 """
-                color: #1e40af;
-                background: #dbeafe;
+                color: #ffffff;
+                background: #dc2626;
                 font-size: 8px;
-                font-weight: 600;
-                padding: 0px 4px;
+                font-weight: 700;
+                padding: 0px 5px;
                 border-radius: 5px;
                 """
             )
-            badge_layout.addWidget(group_badge, 0, Qt.AlignLeft)
-            badge_layout.addStretch(1)
-            layout.addWidget(badge_row)
+            unlinked_layout.addWidget(unlinked_badge, 0, Qt.AlignLeft)
+            unlinked_layout.addStretch(1)
+            layout.addWidget(unlinked_badge_row)
 
         name_label = EditableNameLabel(display_name)
         name_color = "#b91c1c" if is_zero_stock else "#0f172a"
         if is_customized:
             name_label.setToolTip(
-                f"원래 상품명: {original_name}\n더블클릭: 표시 상품명 수정{shared_tooltip}"
+                f"원래 상품명: {original_name}\n더블클릭: 표시 상품명 수정"
             )
             name_label.setStyleSheet(
                 f"color: {name_color}; font-weight: 700; padding: 0px; margin: 0px;"
             )
         else:
-            name_label.setToolTip(f"더블클릭: 표시 상품명 수정{shared_tooltip}")
+            name_label.setToolTip("더블클릭: 표시 상품명 수정")
             name_label.setStyleSheet(
                 f"color: {name_color}; font-weight: 500; padding: 0px; margin: 0px;"
             )
@@ -1740,15 +1290,139 @@ class ChannelTab(QWidget):
             return [self.filtered_rows[current]]
         return []
 
-    def _available_shared_group_ids(self) -> list[str]:
-        groups = {rule.group_id for rule in self.shared_stock_rules.values() if rule.group_id}
-        return sorted(groups)
+    # ------------------------------------------------------------------
+    # Master product linkage
+    # ------------------------------------------------------------------
 
-    def _group_has_master(self, group_id: str) -> bool:
-        for rule in self.shared_stock_rules.values():
-            if rule.group_id == group_id and rule.is_master:
-                return True
-        return False
+    def _reload_master_links(self) -> None:
+        try:
+            all_links = self.cache.load_all_links()
+        except Exception:  # noqa: BLE001
+            all_links = {}
+        channel_code = self.channel_code
+        self.master_link_map = {
+            product_key: link.master_id
+            for (channel, product_key), link in all_links.items()
+            if channel == channel_code
+        }
+
+    def is_row_linked(self, row: ChannelProduct) -> bool:
+        return product_identity_key(row) in self.master_link_map
+
+    def _linked_master_id(self, row: ChannelProduct) -> int | None:
+        return self.master_link_map.get(product_identity_key(row))
+
+    def _open_link_to_master_dialog(self, rows: List[ChannelProduct]) -> None:
+        if not rows:
+            return
+
+        masters = self.master_service.list_masters()
+        CREATE_LABEL = "+ 새 마스터 만들기"
+        options: List[str] = [CREATE_LABEL]
+        option_to_master: Dict[str, int] = {}
+        for master in masters:
+            tag = f"#{master.id} · {master.name}"
+            if master.unit_cost is not None:
+                tag += f" ({master.unit_cost:,}원)"
+            options.append(tag)
+            option_to_master[tag] = master.id
+
+        pick_title = (
+            "연결할 마스터 선택"
+            if len(rows) == 1
+            else f"{len(rows)}개 상품을 연결할 마스터 선택"
+        )
+        pick, ok = QInputDialog.getItem(
+            self,
+            pick_title,
+            "마스터 상품을 선택하거나 새로 만들어주세요.",
+            options,
+            0,
+            False,
+        )
+        if not ok or not pick:
+            return
+
+        if pick == CREATE_LABEL:
+            name, ok = QInputDialog.getText(self, "새 마스터", "마스터 이름:")
+            if not ok:
+                return
+            name = str(name or "").strip()
+            if not name:
+                QMessageBox.warning(self, "이름 필요", "이름을 입력해주세요.")
+                return
+            try:
+                new_master = self.master_service.create_master(name=name)
+            except ValueError as exc:
+                QMessageBox.warning(self, "실패", str(exc))
+                return
+            master_id = new_master.id
+            master_label = f"#{new_master.id} · {new_master.name}"
+        else:
+            master_id = option_to_master[pick]
+            master_label = pick
+
+        # 각 row 에 대해 multiplier 입력
+        linked_count = 0
+        for row in rows:
+            current = self.master_link_map.get(product_identity_key(row))
+            existing_link = self.master_service.get_link(self.channel_code, product_identity_key(row))
+            default_mult = existing_link.multiplier if existing_link else 1
+            value, mok = QInputDialog.getInt(
+                self,
+                f"배수 입력 — {master_label}",
+                f"[{self._display_name(row)}]\n"
+                "채널 상품 1건이 마스터 몇 단위?",
+                max(1, int(default_mult)),
+                1,
+                10_000,
+                1,
+            )
+            if not mok:
+                continue
+            self.master_service.link(
+                self.channel_code,
+                product_identity_key(row),
+                master_id,
+                multiplier=int(value),
+            )
+            linked_count += 1
+
+        if linked_count == 0:
+            return
+
+        self._reload_master_links()
+        self._force_full_render_next = True
+        self._apply_filters()
+        self.status_label.setText(
+            f"{self.channel_name} → 마스터 연결: {linked_count}건"
+        )
+        self.masters_changed.emit(self.channel_name)
+
+    def _unlink_selected_from_master(self, rows: List[ChannelProduct]) -> None:
+        if not rows:
+            return
+        unlinked = 0
+        for row in rows:
+            if not self.is_row_linked(row):
+                continue
+            self.master_service.unlink(self.channel_code, product_identity_key(row))
+            unlinked += 1
+        if unlinked == 0:
+            return
+        self._reload_master_links()
+        self._force_full_render_next = True
+        self._apply_filters()
+        self.status_label.setText(
+            f"{self.channel_name} → 마스터 연결 해제: {unlinked}건"
+        )
+        self.masters_changed.emit(self.channel_name)
+
+    def refresh_master_links_from_external(self) -> None:
+        """상품등록 탭 등에서 링크가 바뀐 경우 이 탭의 배지 갱신."""
+        self._reload_master_links()
+        self._force_full_render_next = True
+        self._apply_filters()
 
     @Slot(object)
     def _open_table_context_menu(self, pos: object) -> None:
@@ -1770,197 +1444,17 @@ class ChannelTab(QWidget):
 
         menu = QMenu(self)
         label = f"선택 {len(selected)}개" if len(selected) > 1 else "선택 상품"
-        set_action = menu.addAction(f"{label} 새 공유그룹 설정...")
-        add_existing_action = None
-        if self._available_shared_group_ids():
-            add_existing_action = menu.addAction(f"{label} 기존 공유그룹에 추가...")
-        clear_action = menu.addAction(f"{label} 공유재고 해제")
+
+        link_action = menu.addAction(f"{label} 마스터에 연결…")
+        unlink_action = None
+        if any(self.is_row_linked(row) for row in selected):
+            unlink_action = menu.addAction(f"{label} 마스터 연결 해제")
 
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
-        if chosen == set_action:
-            self._configure_shared_stock_for_selected()
-        elif add_existing_action and chosen == add_existing_action:
-            self._add_selected_to_existing_shared_group()
-        elif chosen == clear_action:
-            self._clear_shared_stock_for_selected()
-
-    def _pick_pack_size_for_row(self, row: ChannelProduct) -> int | None:
-        key = self._name_override_key(row)
-        current_rule = self.shared_stock_rules.get(key)
-        default_pack = current_rule.pack_size if current_rule else self._guess_pack_size(self._display_name(row))
-        pack_size, pack_ok = QInputDialog.getInt(
-            self,
-            "원재고 차감수량 설정",
-            f"[{self._display_name(row)}]\n이 상품 1개 판매 시 공용재고 차감수량",
-            max(1, int(default_pack)),
-            1,
-            9999,
-            1,
-        )
-        if not pack_ok:
-            return None
-        return int(pack_size)
-
-    def _add_selected_to_existing_shared_group(self) -> None:
-        selected = self._selected_filtered_rows()
-        if not selected:
-            return
-
-        groups = self._available_shared_group_ids()
-        if not groups:
-            QMessageBox.information(self, "공유재고", "등록된 공유그룹이 없습니다.")
-            return
-
-        group_key, ok = QInputDialog.getItem(
-            self,
-            "기존 공유그룹 선택",
-            "추가할 공유그룹을 선택하세요.",
-            groups,
-            0,
-            False,
-        )
-        if not ok or not group_key:
-            return
-
-        master_key: str | None = None
-        if not self._group_has_master(group_key):
-            options: list[str] = []
-            option_to_key: dict[str, str] = {}
-            for row in selected:
-                text = self._display_name(row)
-                key = self._name_override_key(row)
-                option = f"{row.serial}. {text}"
-                options.append(option)
-                option_to_key[option] = key
-            options.append("대표SKU 미지정")
-            picked, picked_ok = QInputDialog.getItem(
-                self,
-                "대표SKU 선택",
-                f"그룹 '{group_key}'에 대표SKU가 없습니다. 대표SKU를 선택하세요.",
-                options,
-                0,
-                False,
-            )
-            if not picked_ok:
-                return
-            master_key = option_to_key.get(picked)
-
-        saved_count = 0
-        for row in selected:
-            pack_size = self._pick_pack_size_for_row(row)
-            if pack_size is None:
-                return
-            key = self._name_override_key(row)
-            self._save_shared_stock_rule_with_sync(
-                key,
-                group_key,
-                pack_size,
-                bool(master_key and key == master_key),
-            )
-            saved_count += 1
-
-        self.shared_stock_rules = self.cache.load_shared_stock_rules(self.channel_name)
-        self._force_full_render_next = True
-        self._apply_filters()
-        self._update_today_sales_amount_label()
-        self.status_label.setText(
-            f"{self.channel_name} 공유그룹 '{group_key}' 추가: {saved_count}건"
-        )
-
-    def _configure_shared_stock_for_selected(self) -> None:
-        selected = self._selected_filtered_rows()
-        if not selected:
-            return
-
-        existing_groups = {
-            rule.group_id
-            for row in selected
-            for rule in [self._shared_stock_rule(row)]
-            if rule is not None
-        }
-        if len(existing_groups) == 1:
-            default_group = next(iter(existing_groups))
-        else:
-            base = re.sub(r"\s+", "-", self._display_name(selected[0]).strip())
-            default_group = (base[:24] or "shared-group").strip("-")
-
-        group_id, ok = QInputDialog.getText(
-            self,
-            "공유재고 그룹 설정",
-            "그룹명을 입력하세요.",
-            QLineEdit.Normal,
-            default_group,
-        )
-        if not ok:
-            return
-        group_key = group_id.strip()
-        if not group_key:
-            QMessageBox.information(self, "공유재고 그룹", "그룹명은 비워둘 수 없습니다.")
-            return
-
-        master_key: str | None = None
-        if len(selected) == 1:
-            master_key = self._name_override_key(selected[0])
-        else:
-            options: list[str] = []
-            option_to_key: dict[str, str] = {}
-            for row in selected:
-                text = self._display_name(row)
-                key = self._name_override_key(row)
-                option = f"{row.serial}. {text}"
-                options.append(option)
-                option_to_key[option] = key
-            options.append("다른 탭에서 대표SKU 지정")
-            picked, picked_ok = QInputDialog.getItem(
-                self,
-                "대표SKU 선택",
-                "이 그룹의 대표SKU를 선택하세요.",
-                options,
-                0,
-                False,
-            )
-            if not picked_ok:
-                return
-            master_key = option_to_key.get(picked)
-
-        saved_count = 0
-        for row in selected:
-            key = self._name_override_key(row)
-            pack_size = self._pick_pack_size_for_row(row)
-            if pack_size is None:
-                return
-
-            self._save_shared_stock_rule_with_sync(
-                key,
-                group_key,
-                pack_size,
-                bool(master_key and key == master_key),
-            )
-            saved_count += 1
-
-        self.shared_stock_rules = self.cache.load_shared_stock_rules(self.channel_name)
-        self._force_full_render_next = True
-        self._apply_filters()
-        self._update_today_sales_amount_label()
-        self.status_label.setText(f"{self.channel_name} 공유재고 설정 저장: {saved_count}건")
-
-    def _clear_shared_stock_for_selected(self) -> None:
-        selected = self._selected_filtered_rows()
-        if not selected:
-            return
-
-        removed = 0
-        for row in selected:
-            key = self._name_override_key(row)
-            if key in self.shared_stock_rules:
-                removed += 1
-            self._delete_shared_stock_rule_with_sync(key)
-
-        self.shared_stock_rules = self.cache.load_shared_stock_rules(self.channel_name)
-        self._force_full_render_next = True
-        self._apply_filters()
-        self._update_today_sales_amount_label()
-        self.status_label.setText(f"{self.channel_name} 공유재고 해제: {removed}건")
+        if chosen == link_action:
+            self._open_link_to_master_dialog(selected)
+        elif unlink_action and chosen == unlink_action:
+            self._unlink_selected_from_master(selected)
 
     def _open_product_page(self, url: str) -> None:
         normalized = _normalize_web_url(url)
@@ -2100,8 +1594,6 @@ class ChannelTab(QWidget):
     def _render_row(self, index: int, row: ChannelProduct, token: int) -> None:
         today_sales = self._effective_today_sales(row)
         period_sales = self._effective_sales(row)
-        shared_rule = self._shared_stock_rule(row)
-        shared_excluded = bool(shared_rule and not shared_rule.is_master)
 
         self.table.setRowHeight(index, 66)
         self.table.setCellWidget(index, 0, self._favorite_cell(row))
@@ -2174,13 +1666,6 @@ class ChannelTab(QWidget):
         )
 
         self._queue_image(image_label, row.image_url, token)
-
-        if shared_excluded:
-            for col in (5, 6, 8):
-                item = self.table.item(index, col)
-                if item:
-                    item.setToolTip("공유재고 비대표 SKU는 중복 매출 방지를 위해 0으로 표시됩니다.")
-                    item.setForeground(QColor("#64748b"))
 
         # 품절 행 전체 빨간 배경
         is_soldout = row.stock is not None and int(row.stock) == 0
@@ -2347,11 +1832,6 @@ class ChannelTab(QWidget):
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
-        if self.startup_shared_stock_worker and self.startup_shared_stock_worker.isRunning():
-            finished = self.startup_shared_stock_worker.wait(60000)
-            if not finished:
-                self.startup_shared_stock_worker.terminate()
-                self.startup_shared_stock_worker.wait(2000)
         if self.worker and self.worker.isRunning():
             finished = self.worker.wait(60000)
             if not finished:
@@ -3770,10 +3250,6 @@ class SalesDailyTab(QWidget):
         self._sales_dates: dict[str, int] = {}
         self._highlighted_dates: set[str] = set()
 
-        # 공유재고 규칙 캐시 (묶음상품 뻥튀기 방지)
-        from inventory_app.services.local_cache import ChannelProductCache
-        self._rule_cache = ChannelProductCache()
-
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(12)
@@ -3937,76 +3413,6 @@ class SalesDailyTab(QWidget):
             highlighted.add(date_str)
         self._highlighted_dates = highlighted
 
-    @staticmethod
-    def _event_product_key(event: dict) -> str:
-        """SharedStockRule 테이블의 product_key 포맷과 동일하게 생성."""
-        pid = str(event.get("product_id") or "").strip()
-        iid_raw = event.get("item_id")
-        iid = str(iid_raw) if iid_raw not in (None, "") else ""
-        if pid:
-            return f"id:{pid}|item:{iid}"
-        url = str(event.get("product_url") or "").strip()
-        if url:
-            return f"url:{url}"
-        return f"name:{str(event.get('name') or '').strip()}"
-
-    def _filter_shadow_sale_events(self, sales: List[dict]) -> List[dict]:
-        """비마스터(그림자) 이벤트를 제거.
-
-        - 그룹에 마스터가 지정돼 있고 현재 이벤트가 비마스터면 → 제거
-        - 마스터가 없는 고아 그룹은 건드리지 않음 (원본 유지)
-        - 채널 미지정/규칙 미지정 이벤트도 그대로 유지
-        """
-        if not isinstance(sales, list):
-            return sales
-
-        # 채널별로 rules 한 번만 로드
-        rules_by_channel: Dict[str, Dict[str, SharedStockRule]] = {}
-        master_groups_by_channel: Dict[str, set[str]] = {}
-
-        def _rules_for(channel: str) -> Dict[str, SharedStockRule]:
-            if channel not in rules_by_channel:
-                try:
-                    rules = self._rule_cache.load_shared_stock_rules(channel)
-                except Exception:  # noqa: BLE001
-                    rules = {}
-                rules_by_channel[channel] = rules
-                master_groups_by_channel[channel] = {
-                    r.group_id for r in rules.values() if r.is_master
-                }
-            return rules_by_channel[channel]
-
-        filtered: List[dict] = []
-        dropped = 0
-        for event in sales:
-            if not isinstance(event, dict):
-                filtered.append(event)
-                continue
-            channel = str(event.get("channel") or "").strip().lower()
-            if not channel:
-                filtered.append(event)
-                continue
-            rules = _rules_for(channel)
-            if not rules:
-                filtered.append(event)
-                continue
-            key = self._event_product_key(event)
-            rule = rules.get(key)
-            if rule is None:
-                filtered.append(event)
-                continue
-            master_groups = master_groups_by_channel.get(channel, set())
-            # 마스터가 있는 그룹의 비마스터만 drop
-            if (not rule.is_master) and (rule.group_id in master_groups):
-                dropped += 1
-                continue
-            filtered.append(event)
-
-        if dropped:
-            # 상태 바에 힌트 제공 (summary_label 은 뒤에서 덮어쓰므로 여기선 조용히)
-            pass
-        return filtered
-
     def _sale_product_url(self, sale_row: dict) -> str | None:
         direct = _normalize_web_url(sale_row.get("product_url"))
         # 잘못된 /main/ URL 필터
@@ -4047,13 +3453,6 @@ class SalesDailyTab(QWidget):
 
         summary = data.get("summary", {})
         sales = data.get("sales", [])
-
-        # 공유재고(묶음상품) 뻥튀기 제거:
-        # 같은 물리재고를 공유하는 SKU 그룹에서 "마스터가 아닌" 이벤트는
-        # shadow 감소로 간주하고 제거한다.
-        # (예: 퀵베이트 1팩/4팩/10팩이 같은 재고를 공유하면 한번의 주문에
-        # 세 SKU 모두 재고가 줄어드는데, 이 중 비마스터(4팩/10팩) 이벤트는 버린다.)
-        sales = self._filter_shadow_sale_events(sales)
 
         # 채널별 분리 집계
         naver_qty = sum(s.get("qty_sold", 0) for s in sales if s.get("channel") == "naver")
@@ -4233,6 +3632,7 @@ class MainWindow(QMainWindow):
             monitor_url=config.monitor_url,
             timeout_seconds=config.timeout_seconds,
         )
+        self.product_master_tab = ProductMasterTab()
         self.inventory_tab = InventoryManagementTab()
         self.sales_daily_tab = SalesDailyTab(
             monitor_url=config.monitor_url,
@@ -4290,6 +3690,11 @@ class MainWindow(QMainWindow):
         self.coupang_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.naver_tab.favorites_changed.connect(self._refresh_inventory_tab)
         self.coupang_tab.favorites_changed.connect(self._refresh_inventory_tab)
+        self.naver_tab.sync_finished.connect(self._on_channel_sync_finished_for_masters)
+        self.coupang_tab.sync_finished.connect(self._on_channel_sync_finished_for_masters)
+        self.naver_tab.masters_changed.connect(self._on_masters_changed)
+        self.coupang_tab.masters_changed.connect(self._on_masters_changed)
+        self.product_master_tab.masters_changed.connect(self._on_masters_changed)
         self.revenue_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.keyword_tab.sync_finished.connect(self._on_sub_sync_finished)
         self._refresh_inventory_tab()
@@ -4324,6 +3729,7 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(self.naver_tab, "네이버")
         self.tabs.addTab(self.coupang_tab, "쿠팡")
+        self.tabs.addTab(self.product_master_tab, "상품등록")
         self.tabs.addTab(self.inventory_tab, "재고관리")
         self.tabs.addTab(self.sales_daily_tab, "판매일보")
         self.tabs.addTab(self.revenue_tab, "매출비교")
@@ -4601,6 +4007,29 @@ class MainWindow(QMainWindow):
         self._start_sync_session(started_sources)
 
     @Slot(str, bool)
+    def _on_channel_sync_finished_for_masters(self, source: str, succeeded: bool) -> None:
+        # 채널 동기화로 cache 에 저장된 raw rows 가 바뀌었을 수 있으니
+        # 상품등록 탭의 마스터 집계도 재계산.
+        if not succeeded:
+            return
+        try:
+            self.product_master_tab.refresh()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_masters_changed(self, *_args: object) -> None:
+        # 마스터/링크가 어느 탭에서든 바뀌면 관련 탭들 재조정
+        try:
+            self.product_master_tab.refresh()
+        except Exception:  # noqa: BLE001
+            pass
+        for tab in (self.naver_tab, self.coupang_tab):
+            try:
+                tab.refresh_master_links_from_external()
+            except Exception:  # noqa: BLE001
+                pass
+        self._refresh_inventory_tab()
+
     def _on_sub_sync_finished(self, source: str, succeeded: bool) -> None:
         if not self._sync_session_active:
             return

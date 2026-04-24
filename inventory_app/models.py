@@ -21,27 +21,22 @@ class ChannelProduct:
 
 
 @dataclass
-class UnifiedProduct:
-    serial: int
+class MasterProduct:
+    id: int
     name: str
-    image_url: Optional[str]
-    naver_url: Optional[str]
-    coupang_url: Optional[str]
-    naver_name: Optional[str]
-    coupang_name: Optional[str]
-    naver_stock: Optional[int]
-    coupang_stock: Optional[int]
-    stock_diff: Optional[int]
-    naver_sales: Optional[int]
-    coupang_sales: Optional[int]
-    naver_price: Optional[int]
-    coupang_price: Optional[int]
-    match_type: str
-    synced_at: datetime
+    unit_cost: Optional[int]
+    memo: Optional[str]
+    representative_channel: Optional[str]
+    representative_product_key: Optional[str]
+    created_at: datetime
+    updated_at: datetime
 
 
 @dataclass
-class SharedStockRule:
-    group_id: str
-    pack_size: int = 1
-    is_master: bool = False
+class ChannelMasterLink:
+    channel: str
+    product_key: str
+    master_id: int
+    multiplier: int
+    created_at: datetime
+    updated_at: datetime

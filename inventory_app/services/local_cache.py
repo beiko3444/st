@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
-from inventory_app.models import ChannelProduct, SharedStockRule
+from inventory_app.models import ChannelMasterLink, ChannelProduct, MasterProduct
 
 
 def _row_content_hash(row: ChannelProduct) -> str:
@@ -64,6 +64,7 @@ class ChannelProductCache:
         conn = sqlite3.connect(self.db_path, timeout=5.0)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
         return conn
 
     @contextmanager
@@ -135,43 +136,43 @@ class ChannelProductCache:
                 )
                 """
             )
+            # shared_stock_rules / shared_stock_pending_ops 는 과거 자동매칭 기능 잔재.
+            # 마스터 상품 연결(channel_master_links) 로 대체됐으므로 이전 DB 에 남아
+            # 있을 경우 제거한다.
+            conn.execute("DROP TABLE IF EXISTS shared_stock_rules")
+            conn.execute("DROP TABLE IF EXISTS shared_stock_pending_ops")
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS shared_stock_rules (
-                    channel TEXT NOT NULL,
-                    product_key TEXT NOT NULL,
-                    group_id TEXT NOT NULL,
-                    pack_size INTEGER NOT NULL DEFAULT 1,
-                    is_master INTEGER NOT NULL DEFAULT 0,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (channel, product_key)
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_shared_stock_group
-                ON shared_stock_rules(group_id)
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS shared_stock_pending_ops (
+                CREATE TABLE IF NOT EXISTS master_products (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    channel TEXT NOT NULL,
-                    product_key TEXT NOT NULL,
-                    op_type TEXT NOT NULL,
-                    group_id TEXT,
-                    pack_size INTEGER,
-                    is_master INTEGER,
-                    created_at TEXT NOT NULL
+                    name TEXT NOT NULL,
+                    unit_cost INTEGER,
+                    memo TEXT,
+                    representative_channel TEXT,
+                    representative_product_key TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 )
                 """
             )
             conn.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_shared_stock_pending_created
-                ON shared_stock_pending_ops(created_at, id)
+                CREATE TABLE IF NOT EXISTS channel_master_links (
+                    channel TEXT NOT NULL,
+                    product_key TEXT NOT NULL,
+                    master_id INTEGER NOT NULL,
+                    multiplier INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (channel, product_key),
+                    FOREIGN KEY (master_id) REFERENCES master_products(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_channel_master_links_master
+                ON channel_master_links(master_id)
                 """
             )
 
@@ -194,8 +195,6 @@ class ChannelProductCache:
                     "product_name_overrides",
                     "product_cost_overrides",
                     "product_favorites",
-                    "shared_stock_rules",
-                    "shared_stock_pending_ops",
                 ):
                     try:
                         conn.execute(
@@ -477,202 +476,333 @@ class ChannelProductCache:
                 )
             conn.commit()
 
-    def load_shared_stock_rules(self, channel: str) -> Dict[str, SharedStockRule]:
-        channel_key = _normalize_channel(channel)
+    # ------------------------------------------------------------------
+    # Master products (user-curated SKU catalog)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _row_to_master(row: tuple) -> MasterProduct:
+        (
+            master_id,
+            name,
+            unit_cost,
+            memo,
+            rep_channel,
+            rep_key,
+            created_at,
+            updated_at,
+        ) = row
+        try:
+            created = datetime.fromisoformat(str(created_at))
+        except Exception:  # noqa: BLE001
+            created = datetime.now()
+        try:
+            updated = datetime.fromisoformat(str(updated_at))
+        except Exception:  # noqa: BLE001
+            updated = created
+        return MasterProduct(
+            id=int(master_id),
+            name=str(name or ""),
+            unit_cost=(int(unit_cost) if unit_cost is not None else None),
+            memo=(str(memo) if memo is not None else None),
+            representative_channel=(
+                _normalize_channel(rep_channel) if rep_channel else None
+            ),
+            representative_product_key=(str(rep_key) if rep_key else None),
+            created_at=created,
+            updated_at=updated,
+        )
+
+    def create_master(
+        self,
+        name: str,
+        unit_cost: int | None = None,
+        memo: str | None = None,
+    ) -> MasterProduct:
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("master name is required")
+        now = datetime.now().isoformat()
         with self._guard, self._connection() as conn:
             cursor = conn.execute(
                 """
-                SELECT product_key, group_id, pack_size, is_master
-                FROM shared_stock_rules
-                WHERE channel = ?
-                """,
-                (channel_key,),
-            )
-            rows = cursor.fetchall()
-
-        rules: Dict[str, SharedStockRule] = {}
-        for product_key, group_id, pack_size, is_master in rows:
-            key = str(product_key or "").strip()
-            group = str(group_id or "").strip()
-            if not key or not group:
-                continue
-            try:
-                qty = max(1, int(pack_size))
-            except (TypeError, ValueError):
-                qty = 1
-            rules[key] = SharedStockRule(
-                group_id=group,
-                pack_size=qty,
-                is_master=bool(int(is_master or 0)),
-            )
-        return rules
-
-    def replace_shared_stock_rules(self, channel: str, rules: Dict[str, SharedStockRule]) -> None:
-        channel_key = _normalize_channel(channel)
-        with self._guard, self._connection() as conn:
-            conn.execute("DELETE FROM shared_stock_rules WHERE channel = ?", (channel_key,))
-            for product_key, rule in rules.items():
-                item_key = str(product_key or "").strip()
-                if not item_key:
-                    continue
-                group_key = str(rule.group_id or "").strip()
-                if not group_key:
-                    continue
-                qty = max(1, int(rule.pack_size))
-                conn.execute(
-                    """
-                    INSERT INTO shared_stock_rules (
-                        channel, product_key, group_id, pack_size, is_master, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        channel_key,
-                        item_key,
-                        group_key,
-                        qty,
-                        1 if rule.is_master else 0,
-                        datetime.now().isoformat(),
-                    ),
-                )
-            conn.commit()
-
-    def save_shared_stock_rule(
-        self,
-        channel: str,
-        product_key: str,
-        group_id: str,
-        pack_size: int,
-        is_master: bool,
-    ) -> None:
-        channel_key = _normalize_channel(channel)
-        item_key = str(product_key).strip()
-        group_key = str(group_id).strip()
-        if not item_key:
-            return
-        if not group_key:
-            self.delete_shared_stock_rule(channel, item_key)
-            return
-
-        qty = max(1, int(pack_size))
-
-        with self._guard, self._connection() as conn:
-            if is_master:
-                conn.execute(
-                    """
-                    UPDATE shared_stock_rules
-                    SET is_master = 0, updated_at = ?
-                    WHERE group_id = ?
-                    """,
-                    (datetime.now().isoformat(), group_key),
-                )
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO shared_stock_rules (
-                    channel, product_key, group_id, pack_size, is_master, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO master_products (
+                    name, unit_cost, memo,
+                    representative_channel, representative_product_key,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, NULL, NULL, ?, ?)
                 """,
                 (
-                    channel_key,
-                    item_key,
-                    group_key,
-                    qty,
-                    1 if is_master else 0,
+                    clean_name,
+                    (int(unit_cost) if unit_cost is not None else None),
+                    (str(memo).strip() if memo else None),
+                    now,
+                    now,
+                ),
+            )
+            master_id = int(cursor.lastrowid)
+            conn.commit()
+            row = conn.execute(
+                """
+                SELECT id, name, unit_cost, memo,
+                    representative_channel, representative_product_key,
+                    created_at, updated_at
+                FROM master_products WHERE id = ?
+                """,
+                (master_id,),
+            ).fetchone()
+        return self._row_to_master(row)
+
+    def update_master(
+        self,
+        master_id: int,
+        *,
+        name: str | None = None,
+        unit_cost: int | None = None,
+        memo: str | None = None,
+        clear_unit_cost: bool = False,
+        clear_memo: bool = False,
+    ) -> None:
+        updates: list[str] = []
+        params: list = []
+        if name is not None:
+            clean = str(name).strip()
+            if not clean:
+                raise ValueError("master name cannot be empty")
+            updates.append("name = ?")
+            params.append(clean)
+        if clear_unit_cost:
+            updates.append("unit_cost = NULL")
+        elif unit_cost is not None:
+            updates.append("unit_cost = ?")
+            params.append(int(unit_cost))
+        if clear_memo:
+            updates.append("memo = NULL")
+        elif memo is not None:
+            updates.append("memo = ?")
+            params.append(str(memo).strip() or None)
+        if not updates:
+            return
+        updates.append("updated_at = ?")
+        params.append(datetime.now().isoformat())
+        params.append(int(master_id))
+
+        with self._guard, self._connection() as conn:
+            conn.execute(
+                f"UPDATE master_products SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+            conn.commit()
+
+    def delete_master(self, master_id: int) -> None:
+        with self._guard, self._connection() as conn:
+            conn.execute(
+                "DELETE FROM master_products WHERE id = ?",
+                (int(master_id),),
+            )
+            conn.commit()
+
+    def get_master(self, master_id: int) -> MasterProduct | None:
+        with self._guard, self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id, name, unit_cost, memo,
+                    representative_channel, representative_product_key,
+                    created_at, updated_at
+                FROM master_products WHERE id = ?
+                """,
+                (int(master_id),),
+            ).fetchone()
+        return self._row_to_master(row) if row else None
+
+    def list_masters(self) -> List[MasterProduct]:
+        with self._guard, self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, name, unit_cost, memo,
+                    representative_channel, representative_product_key,
+                    created_at, updated_at
+                FROM master_products
+                ORDER BY name ASC, id ASC
+                """
+            ).fetchall()
+        return [self._row_to_master(r) for r in rows]
+
+    def set_master_representative(
+        self,
+        master_id: int,
+        channel: str | None,
+        product_key: str | None,
+    ) -> None:
+        with self._guard, self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE master_products
+                SET representative_channel = ?, representative_product_key = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    (_normalize_channel(channel) if channel else None),
+                    (str(product_key).strip() if product_key else None),
                     datetime.now().isoformat(),
+                    int(master_id),
                 ),
             )
             conn.commit()
 
-    def delete_shared_stock_rule(self, channel: str, product_key: str) -> None:
+    # ------------------------------------------------------------------
+    # Channel-to-master links
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _row_to_link(row: tuple) -> ChannelMasterLink:
+        channel, product_key, master_id, multiplier, created_at, updated_at = row
+        try:
+            created = datetime.fromisoformat(str(created_at))
+        except Exception:  # noqa: BLE001
+            created = datetime.now()
+        try:
+            updated = datetime.fromisoformat(str(updated_at))
+        except Exception:  # noqa: BLE001
+            updated = created
+        return ChannelMasterLink(
+            channel=_normalize_channel(channel),
+            product_key=str(product_key or ""),
+            master_id=int(master_id),
+            multiplier=max(1, int(multiplier or 1)),
+            created_at=created,
+            updated_at=updated,
+        )
+
+    def link_channel_product(
+        self,
+        channel: str,
+        product_key: str,
+        master_id: int,
+        multiplier: int = 1,
+    ) -> None:
         channel_key = _normalize_channel(channel)
         item_key = str(product_key).strip()
         if not item_key:
             return
+        qty = max(1, int(multiplier))
+        now = datetime.now().isoformat()
+        with self._guard, self._connection() as conn:
+            existing = conn.execute(
+                """
+                SELECT created_at FROM channel_master_links
+                WHERE channel = ? AND product_key = ?
+                """,
+                (channel_key, item_key),
+            ).fetchone()
+            created_at = str(existing[0]) if existing else now
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO channel_master_links (
+                    channel, product_key, master_id, multiplier,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (channel_key, item_key, int(master_id), qty, created_at, now),
+            )
+            conn.commit()
 
+    def unlink_channel_product(self, channel: str, product_key: str) -> None:
+        channel_key = _normalize_channel(channel)
+        item_key = str(product_key).strip()
+        if not item_key:
+            return
         with self._guard, self._connection() as conn:
             conn.execute(
                 """
-                DELETE FROM shared_stock_rules
+                DELETE FROM channel_master_links
                 WHERE channel = ? AND product_key = ?
                 """,
                 (channel_key, item_key),
             )
+            # representative 가 이 링크를 가리키고 있었으면 해제
+            conn.execute(
+                """
+                UPDATE master_products
+                SET representative_channel = NULL,
+                    representative_product_key = NULL,
+                    updated_at = ?
+                WHERE representative_channel = ?
+                    AND representative_product_key = ?
+                """,
+                (datetime.now().isoformat(), channel_key, item_key),
+            )
             conn.commit()
 
-    def enqueue_shared_stock_pending_op(
+    def set_link_multiplier(
         self,
         channel: str,
         product_key: str,
-        op_type: str,
-        group_id: str | None = None,
-        pack_size: int | None = None,
-        is_master: bool | None = None,
+        multiplier: int,
     ) -> None:
         channel_key = _normalize_channel(channel)
         item_key = str(product_key).strip()
-        op = str(op_type).strip().lower()
-        if not item_key or op not in {"upsert", "delete"}:
+        if not item_key:
             return
-
+        qty = max(1, int(multiplier))
         with self._guard, self._connection() as conn:
             conn.execute(
                 """
-                INSERT INTO shared_stock_pending_ops (
-                    channel, product_key, op_type, group_id, pack_size, is_master, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                UPDATE channel_master_links
+                SET multiplier = ?, updated_at = ?
+                WHERE channel = ? AND product_key = ?
                 """,
-                (
-                    channel_key,
-                    item_key,
-                    op,
-                    (str(group_id).strip() if group_id is not None else None),
-                    (int(pack_size) if pack_size is not None else None),
-                    (None if is_master is None else (1 if is_master else 0)),
-                    datetime.now().isoformat(),
-                ),
+                (qty, datetime.now().isoformat(), channel_key, item_key),
             )
             conn.commit()
 
-    def load_shared_stock_pending_ops(
+    def get_link(
         self,
         channel: str,
-        limit: int = 200,
-    ) -> list[dict]:
+        product_key: str,
+    ) -> ChannelMasterLink | None:
         channel_key = _normalize_channel(channel)
+        item_key = str(product_key).strip()
+        if not item_key:
+            return None
         with self._guard, self._connection() as conn:
-            cursor = conn.execute(
+            row = conn.execute(
                 """
-                SELECT id, product_key, op_type, group_id, pack_size, is_master, created_at
-                FROM shared_stock_pending_ops
-                WHERE channel = ?
-                ORDER BY id ASC
-                LIMIT ?
+                SELECT channel, product_key, master_id, multiplier,
+                    created_at, updated_at
+                FROM channel_master_links
+                WHERE channel = ? AND product_key = ?
                 """,
-                (channel_key, max(1, int(limit))),
-            )
-            rows = cursor.fetchall()
+                (channel_key, item_key),
+            ).fetchone()
+        return self._row_to_link(row) if row else None
 
-        pending: list[dict] = []
-        for row_id, product_key, op_type, group_id, pack_size, is_master, created_at in rows:
-            pending.append(
-                {
-                    "id": int(row_id),
-                    "product_key": str(product_key or "").strip(),
-                    "op_type": str(op_type or "").strip().lower(),
-                    "group_id": (str(group_id).strip() if group_id is not None else None),
-                    "pack_size": (int(pack_size) if pack_size is not None else None),
-                    "is_master": (bool(int(is_master)) if is_master is not None else None),
-                    "created_at": str(created_at or ""),
-                }
-            )
-        return pending
-
-    def delete_shared_stock_pending_op(self, op_id: int) -> None:
+    def list_links_for_master(self, master_id: int) -> List[ChannelMasterLink]:
         with self._guard, self._connection() as conn:
-            conn.execute(
+            rows = conn.execute(
                 """
-                DELETE FROM shared_stock_pending_ops
-                WHERE id = ?
+                SELECT channel, product_key, master_id, multiplier,
+                    created_at, updated_at
+                FROM channel_master_links
+                WHERE master_id = ?
+                ORDER BY created_at ASC
                 """,
-                (int(op_id),),
-            )
-            conn.commit()
+                (int(master_id),),
+            ).fetchall()
+        return [self._row_to_link(r) for r in rows]
+
+    def load_all_links(self) -> Dict[tuple[str, str], ChannelMasterLink]:
+        """(channel, product_key) -> link 전체 스냅샷. 집계 파이프라인용."""
+        with self._guard, self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT channel, product_key, master_id, multiplier,
+                    created_at, updated_at
+                FROM channel_master_links
+                """
+            ).fetchall()
+        result: Dict[tuple[str, str], ChannelMasterLink] = {}
+        for row in rows:
+            link = self._row_to_link(row)
+            result[(link.channel, link.product_key)] = link
+        return result

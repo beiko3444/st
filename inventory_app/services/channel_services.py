@@ -11,10 +11,7 @@ from inventory_app.connectors.coupang import CoupangRocketConnector
 from inventory_app.connectors.smartstore import SmartStoreConnector
 from inventory_app.models import ChannelProduct
 from inventory_app.services.local_cache import ChannelProductCache
-from inventory_app.services.shared_stock_grouping import (
-    apply_master_aggregation,
-    product_identity_key,
-)
+from inventory_app.services.shared_stock_grouping import product_identity_key
 
 
 def _monitor_sales_key(product_id: str, item_id: str | None) -> str:
@@ -251,26 +248,6 @@ def _row_signature(row: ChannelProduct) -> tuple[object, ...]:
     )
 
 
-def _apply_shared_stock_rules(
-    cache: ChannelProductCache,
-    channel_key: str,
-    rows: List[ChannelProduct],
-) -> None:
-    """캐시에 저장된 SharedStockRule을 로드해 rows에 마스터 집계 적용.
-
-    묶음상품(4팩/10팩 등)의 판매량을 마스터(1팩)에 합산하여
-    재고-기반 판매량 집계의 이중계산 문제를 해결.
-    rules 가 비어있으면 아무 것도 안 함.
-    """
-    try:
-        rules = cache.load_shared_stock_rules(channel_key)
-    except Exception:  # noqa: BLE001
-        return
-    if not rules:
-        return
-    apply_master_aggregation(rows, rules, product_key_fn=product_identity_key)
-
-
 def _reconcile_rows_with_cache(
     cache: Dict[str, ChannelProduct],
     incoming: List[ChannelProduct],
@@ -382,7 +359,6 @@ class NaverChannelService:
         rows = _reconcile_rows_with_cache(self._row_cache, rows)
         # 캐시에 남은 옛 /main/products/ URL 도 즉시 교체 → 다음 동기화 전에도 바로 동작
         _fix_naver_product_urls(rows, _extract_naver_store_base(self.config))
-        _apply_shared_stock_rules(self.cache, "naver", rows)
         _assign_serial_by_sales(rows)
         return rows, []
 
@@ -433,7 +409,6 @@ class NaverChannelService:
                             row.today_sales = 0
                 # monitor 가 내려준 /main/products/ 형식 URL 을 정상 slug 로 교체
                 _fix_naver_product_urls(rows, naver_base)
-                _apply_shared_stock_rules(self.cache, "naver", rows)
                 _assign_serial_by_sales(rows)
                 # monitor 경로에서도 캐시에 저장 → 다음 시작 시 바로 표시됨
                 try:
@@ -480,7 +455,6 @@ class NaverChannelService:
 
         rows = _reconcile_rows_with_cache(self._row_cache, rows)
         _fix_naver_product_urls(rows, naver_base)
-        _apply_shared_stock_rules(self.cache, "naver", rows)
         _assign_serial_by_sales(rows)
         try:
             self.cache.save_rows("naver", rows)
@@ -526,7 +500,6 @@ class CoupangChannelService:
         except Exception:  # noqa: BLE001
             return [], []
         rows = _reconcile_rows_with_cache(self._row_cache, rows)
-        _apply_shared_stock_rules(self.cache, "coupang", rows)
         _assign_serial_by_sales(rows)
         return rows, []
 
@@ -535,7 +508,6 @@ class CoupangChannelService:
         if self.config.monitor_url:
             rows = _fetch_from_monitor(self.config.monitor_url, "coupang", self.config.timeout_seconds)
             if rows is not None:
-                _apply_shared_stock_rules(self.cache, "coupang", rows)
                 _assign_serial_by_sales(rows)
                 # monitor 경로에서도 캐시에 저장 → 다음 시작 시 바로 표시됨
                 try:
@@ -567,7 +539,6 @@ class CoupangChannelService:
             )
 
         rows = _reconcile_rows_with_cache(self._row_cache, rows)
-        _apply_shared_stock_rules(self.cache, "coupang", rows)
         _assign_serial_by_sales(rows)
         try:
             self.cache.save_rows("coupang", rows)
