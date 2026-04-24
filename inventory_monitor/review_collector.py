@@ -43,93 +43,6 @@ _DESKTOP_UA = (
 )
 
 
-def _collect_naver_reviews(db: InventoryHistoryDB) -> int:
-    """스마트스토어 리뷰 수 수집 — 모바일 페이지 meta 태그 파싱."""
-    products = db.get_latest_snapshot("naver")
-    if not products:
-        log.info("네이버 상품 없음, 건너뜀")
-        return 0
-
-    results: list[dict] = []
-
-    for p in products:
-        product_url = p.get("product_url") or ""
-        product_id = p.get("product_id", "")
-        name = p.get("name", "")
-        image_url = p.get("image_url")
-
-        if not product_url:
-            continue
-
-        review_count = _naver_mobile_review_count(product_url)
-
-        if review_count is not None:
-            results.append({
-                "product_id": product_id,
-                "name": name,
-                "image_url": image_url,
-                "review_count": review_count,
-                "review_score": None,
-            })
-            log.info("  네이버 [%s] 리뷰: %d", name[:30], review_count)
-
-        # 429 방지 딜레이 (10초 — 30개 상품 기준 약 5분)
-        time.sleep(10)
-
-    if results:
-        n = db.insert_reviews("naver", results)
-        log.info("네이버 리뷰 %d건 저장", n)
-        return n
-    return 0
-
-
-def _naver_mobile_review_count(product_url: str) -> int | None:
-    """모바일 스마트스토어 페이지에서 meta 태그로 리뷰 수 파싱.
-    <meta name="review_count" content="123">
-    429 발생 시 최대 2회 재시도 (대기 후).
-    """
-    mobile_url = product_url.replace(
-        "://smartstore.naver.com/", "://m.smartstore.naver.com/"
-    )
-
-    for attempt in range(3):
-        try:
-            resp = httpx.get(
-                mobile_url,
-                headers={
-                    "User-Agent": _MOBILE_UA,
-                    "Accept": "text/html,application/xhtml+xml",
-                    "Accept-Language": "ko-KR,ko;q=0.9",
-                },
-                follow_redirects=True,
-                timeout=15,
-            )
-            if resp.status_code == 429:
-                wait = 30 * (attempt + 1)
-                log.info("  429 rate limit, %d초 대기 후 재시도...", wait)
-                time.sleep(wait)
-                continue
-
-            if resp.status_code != 200:
-                return None
-
-            html = resp.text
-            match = re.search(r'name=["\']review_count["\'][^>]*content=["\'](\d+)["\']', html)
-            if match:
-                return int(match.group(1))
-
-            match = re.search(r'review_count["\'][^>]*content=["\'](\d+)', html)
-            if match:
-                return int(match.group(1))
-
-            return None
-
-        except Exception as e:
-            log.warning("네이버 모바일 실패 [%s]: %s", product_url[:50], e)
-            return None
-    return None
-
-
 def _collect_coupang_reviews(db: InventoryHistoryDB) -> int:
     """쿠팡 리뷰 수 수집 — 모바일 페이지 또는 Selenium."""
     products = db.get_latest_snapshot("coupang")
@@ -268,10 +181,9 @@ def main() -> None:
     log.info("=== 리뷰 수집 시작 ===")
     db = InventoryHistoryDB()
 
-    n_naver = _collect_naver_reviews(db)
     n_coupang = _collect_coupang_reviews(db)
 
-    log.info("=== 리뷰 수집 완료: 네이버 %d건, 쿠팡 %d건 ===", n_naver, n_coupang)
+    log.info("=== 리뷰 수집 완료: 쿠팡 %d건 ===", n_coupang)
 
 
 if __name__ == "__main__":
