@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -122,6 +123,29 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
+        elif path == "/masters":
+            try:
+                self._send_json({"masters": db.list_masters()})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif _match_master_id(path) is not None:
+            master_id = _match_master_id(path)
+            try:
+                m = db.get_master(master_id)
+                if not m:
+                    self._send_json({"error": "not found"}, 404)
+                else:
+                    self._send_json({"master": m})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/master-links":
+            try:
+                self._send_json({"links": db.list_all_links()})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -131,27 +155,134 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
-        if path != "/shared-stock":
+        if path == "/shared-stock":
+            try:
+                body = self._read_json_body()
+                channel = str(body.get("channel") or "").strip().lower()
+                product_key = str(body.get("product_key") or "").strip()
+                group_id = str(body.get("group_id") or "").strip()
+                pack_size = int(body.get("pack_size") or 1)
+                is_master = bool(body.get("is_master"))
+                db.upsert_shared_stock_rule(
+                    channel=channel,
+                    product_key=product_key,
+                    group_id=group_id,
+                    pack_size=pack_size,
+                    is_master=is_master,
+                )
+                self._send_json({"ok": True})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 400)
+            return
+
+        if path == "/masters":
+            try:
+                body = self._read_json_body()
+                m = db.create_master(
+                    name=str(body.get("name") or ""),
+                    unit_cost=_opt_int(body.get("unit_cost")),
+                    memo=body.get("memo"),
+                )
+                self._send_json({"master": m}, 201)
+            except ValueError as e:
+                self._send_json({"error": str(e)}, 400)
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/master-links":
+            try:
+                body = self._read_json_body()
+                link = db.link_channel_product(
+                    channel=str(body.get("channel") or ""),
+                    product_key=str(body.get("product_key") or ""),
+                    master_id=int(body.get("master_id")),
+                    multiplier=int(body.get("multiplier") or 1),
+                )
+                self._send_json({"link": link}, 201)
+            except (ValueError, TypeError) as e:
+                self._send_json({"error": str(e)}, 400)
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        self._send_json({"error": "not found"}, 404)
+
+    def do_PATCH(self):
+        from urllib.parse import urlparse
+
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        master_id = _match_master_id(path)
+        if master_id is None:
             self._send_json({"error": "not found"}, 404)
             return
 
         try:
             body = self._read_json_body()
-            channel = str(body.get("channel") or "").strip().lower()
-            product_key = str(body.get("product_key") or "").strip()
-            group_id = str(body.get("group_id") or "").strip()
-            pack_size = int(body.get("pack_size") or 1)
-            is_master = bool(body.get("is_master"))
-            db.upsert_shared_stock_rule(
-                channel=channel,
-                product_key=product_key,
-                group_id=group_id,
-                pack_size=pack_size,
-                is_master=is_master,
+            m = db.update_master(
+                master_id,
+                name=body.get("name") if body.get("name") is not None else None,
+                unit_cost=_opt_int(body.get("unit_cost")),
+                memo=body.get("memo"),
+                clear_unit_cost=bool(body.get("clear_unit_cost")),
+                clear_memo=bool(body.get("clear_memo")),
             )
-            self._send_json({"ok": True})
-        except Exception as e:
+            if not m:
+                self._send_json({"error": "not found"}, 404)
+            else:
+                self._send_json({"master": m})
+        except ValueError as e:
             self._send_json({"error": str(e)}, 400)
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+
+    def do_PUT(self):
+        from urllib.parse import urlparse
+
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        rep_match = _MASTER_REP_RE.match(path)
+        if rep_match is not None:
+            master_id = int(rep_match.group(1))
+            try:
+                body = self._read_json_body()
+                channel = body.get("channel")
+                product_key = body.get("product_key")
+                m = db.set_master_representative(
+                    master_id,
+                    (str(channel) if channel else None),
+                    (str(product_key) if product_key else None),
+                )
+                if not m:
+                    self._send_json({"error": "not found"}, 404)
+                else:
+                    self._send_json({"master": m})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/master-links/multiplier":
+            try:
+                body = self._read_json_body()
+                link = db.set_link_multiplier(
+                    channel=str(body.get("channel") or ""),
+                    product_key=str(body.get("product_key") or ""),
+                    multiplier=int(body.get("multiplier") or 1),
+                )
+                if not link:
+                    self._send_json({"error": "not found"}, 404)
+                else:
+                    self._send_json({"link": link})
+            except (ValueError, TypeError) as e:
+                self._send_json({"error": str(e)}, 400)
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        self._send_json({"error": "not found"}, 404)
 
     def do_DELETE(self):
         from urllib.parse import urlparse, parse_qs
@@ -160,17 +291,54 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         qs = parse_qs(parsed.query)
 
-        if path != "/shared-stock":
-            self._send_json({"error": "not found"}, 404)
+        if path == "/shared-stock":
+            try:
+                channel = str((qs.get("channel", [None])[0] or "")).strip().lower()
+                product_key = str((qs.get("product_key", [None])[0] or "")).strip()
+                db.delete_shared_stock_rule(channel=channel, product_key=product_key)
+                self._send_json({"ok": True})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 400)
             return
 
-        try:
-            channel = str((qs.get("channel", [None])[0] or "")).strip().lower()
-            product_key = str((qs.get("product_key", [None])[0] or "")).strip()
-            db.delete_shared_stock_rule(channel=channel, product_key=product_key)
-            self._send_json({"ok": True})
-        except Exception as e:
-            self._send_json({"error": str(e)}, 400)
+        master_id = _match_master_id(path)
+        if master_id is not None:
+            try:
+                db.delete_master(master_id)
+                self._send_json({"ok": True})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/master-links":
+            try:
+                channel = str((qs.get("channel", [None])[0] or "")).strip()
+                product_key = str((qs.get("product_key", [None])[0] or "")).strip()
+                db.unlink_channel_product(channel=channel, product_key=product_key)
+                self._send_json({"ok": True})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 400)
+            return
+
+        self._send_json({"error": "not found"}, 404)
+
+
+_MASTER_ID_RE = re.compile(r"^/masters/(\d+)$")
+_MASTER_REP_RE = re.compile(r"^/masters/(\d+)/representative$")
+
+
+def _match_master_id(path: str) -> int | None:
+    m = _MASTER_ID_RE.match(path)
+    return int(m.group(1)) if m else None
+
+
+def _opt_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def main() -> None:

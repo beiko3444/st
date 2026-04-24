@@ -806,3 +806,117 @@ class ChannelProductCache:
             link = self._row_to_link(row)
             result[(link.channel, link.product_key)] = link
         return result
+
+    # ------------------------------------------------------------------
+    # Remote mirror helpers (Pi source-of-truth 모드)
+    # ------------------------------------------------------------------
+
+    def upsert_master_row(self, master: MasterProduct) -> None:
+        """Pi 응답으로 받은 MasterProduct 를 로컬 캐시에 INSERT OR REPLACE (id 보존)."""
+        with self._guard, self._connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO master_products (
+                    id, name, unit_cost, memo,
+                    representative_channel, representative_product_key,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(master.id),
+                    str(master.name or ""),
+                    (int(master.unit_cost) if master.unit_cost is not None else None),
+                    (str(master.memo) if master.memo is not None else None),
+                    (
+                        _normalize_channel(master.representative_channel)
+                        if master.representative_channel
+                        else None
+                    ),
+                    (
+                        str(master.representative_product_key)
+                        if master.representative_product_key
+                        else None
+                    ),
+                    master.created_at.isoformat(),
+                    master.updated_at.isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def upsert_link_row(self, link: ChannelMasterLink) -> None:
+        """Pi 응답으로 받은 ChannelMasterLink 를 로컬 캐시에 INSERT OR REPLACE."""
+        with self._guard, self._connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO channel_master_links (
+                    channel, product_key, master_id, multiplier,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _normalize_channel(link.channel),
+                    str(link.product_key or ""),
+                    int(link.master_id),
+                    max(1, int(link.multiplier or 1)),
+                    link.created_at.isoformat(),
+                    link.updated_at.isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def replace_all_masters_and_links(
+        self,
+        masters: List[MasterProduct],
+        links: List[ChannelMasterLink],
+    ) -> None:
+        """로컬 마스터/링크를 전량 Pi 스냅샷으로 교체 (refresh_from_remote 용)."""
+        with self._guard, self._connection() as conn:
+            # FK CASCADE 가 links 를 지우지만 순서 보장 위해 명시적으로 먼저 삭제
+            conn.execute("DELETE FROM channel_master_links")
+            conn.execute("DELETE FROM master_products")
+            for m in masters:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO master_products (
+                        id, name, unit_cost, memo,
+                        representative_channel, representative_product_key,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(m.id),
+                        str(m.name or ""),
+                        (int(m.unit_cost) if m.unit_cost is not None else None),
+                        (str(m.memo) if m.memo is not None else None),
+                        (
+                            _normalize_channel(m.representative_channel)
+                            if m.representative_channel
+                            else None
+                        ),
+                        (
+                            str(m.representative_product_key)
+                            if m.representative_product_key
+                            else None
+                        ),
+                        m.created_at.isoformat(),
+                        m.updated_at.isoformat(),
+                    ),
+                )
+            for lk in links:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO channel_master_links (
+                        channel, product_key, master_id, multiplier,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        _normalize_channel(lk.channel),
+                        str(lk.product_key or ""),
+                        int(lk.master_id),
+                        max(1, int(lk.multiplier or 1)),
+                        lk.created_at.isoformat(),
+                        lk.updated_at.isoformat(),
+                    ),
+                )
+            conn.commit()

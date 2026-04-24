@@ -577,20 +577,20 @@ class _OverviewSubTab(QWidget):
 
 class _GoodsSubTab(QWidget):
     COLUMNS = (
-        "cstGodCd",
-        "godNm",
-        "godBarcd",
-        "useYn",
-        "giftDivNm",
-        "cateNm",
-        "supNm",
-        "inPr",
-        "salPr",
+        "상품코드",
+        "상품명",
+        "바코드",
+        "사용",
+        "상품구분",
+        "카테고리",
+        "공급사",
+        "매입가",
+        "판매가",
         "마진%",
-        "godWeight(g)",
-        "boxInCnt",
-        "safetyStock",
-        "firstInDt",
+        "중량(g)",
+        "박스입수",
+        "안전재고",
+        "최초입고일",
     )
 
     def __init__(self, tab: "FasstoTab") -> None:
@@ -687,8 +687,8 @@ class _GoodsSubTab(QWidget):
 
 
 class _GoodsElementSubTab(QWidget):
-    PARENT_COLS = ("cstGodCd", "godNm", "useYn", "구성품 수")
-    CHILD_COLS = ("cstGodCd", "godBarcd", "godNm", "godTypeNm", "qty")
+    PARENT_COLS = ("상품코드", "상품명", "사용", "구성품 수")
+    CHILD_COLS = ("상품코드", "바코드", "상품명", "구성품구분", "수량")
 
     def __init__(self, tab: "FasstoTab") -> None:
         super().__init__()
@@ -804,18 +804,18 @@ class _StockSubTab(QWidget):
 
     COLUMNS = (
         "상태",
-        "cstGodCd",
-        "godNm",
-        "godBarcd",
-        "whCd",
-        "stockQty",
-        "canStockQty",
-        "badStockQty",
-        "safetyStock",
-        "distTermDt",
-        "supNm",
-        "slipNo",
-        "goodsSerialNo",
+        "상품코드",
+        "상품명",
+        "바코드",
+        "창고",
+        "총재고",
+        "가용재고",
+        "불량재고",
+        "안전재고",
+        "유통기한",
+        "공급사",
+        "전표번호",
+        "시리얼",
     )
 
     def __init__(self, tab: "FasstoTab") -> None:
@@ -943,20 +943,20 @@ class _StockSubTab(QWidget):
 
 class _WarehousingSubTab(QWidget):
     COLUMNS_LIST = (
-        "slipNo",
-        "ordDt",
-        "whNm",
-        "wrkStatNm",
-        "supNm",
-        "sku",
-        "ordQty",
-        "inQty",
-        "tarQty",
-        "inWayNm",
-        "parcelComp",
-        "parcelInvoiceNo",
+        "전표번호",
+        "입고예정일",
+        "창고",
+        "작업상태",
+        "공급사",
+        "SKU",
+        "요청수량",
+        "입고수량",
+        "검수수량",
+        "입고경로",
+        "택배사",
+        "송장번호",
     )
-    DETAIL_COLS = ("cstGodCd", "godNm", "ordQty", "inQty", "tarQty", "goodsSerialNo")
+    DETAIL_COLS = ("상품코드", "상품명", "요청수량", "입고수량", "검수수량", "시리얼")
 
     def __init__(self, tab: "FasstoTab") -> None:
         super().__init__()
@@ -1149,21 +1149,21 @@ class _WarehousingSubTab(QWidget):
 
 class _DeliverySubTab(QWidget):
     COLUMNS = (
-        "slipNo",
-        "outDt",
-        "ordDt",
-        "salChanel",
-        "wrkStatNm",
-        "outDivNm",
-        "ordQty",
-        "custNm",
-        "custTelNo",
-        "invoiceNo",
-        "parcelNm",
-        "whNm",
-        "updTime",
+        "전표번호",
+        "출고일",
+        "주문일",
+        "판매채널",
+        "작업상태",
+        "출고구분",
+        "주문수량",
+        "수취인",
+        "연락처",
+        "송장번호",
+        "택배사",
+        "창고",
+        "수정시각",
     )
-    DETAIL_COLS = ("cstGodCd", "godNm", "ordQty", "godDiv")
+    DETAIL_COLS = ("상품코드", "상품명", "주문수량", "상품구분")
 
     def __init__(self, tab: "FasstoTab") -> None:
         super().__init__()
@@ -1374,23 +1374,23 @@ class _DeliveryParcelSubTab(QWidget):
     """택배 출고 상세 — 지연(delayNm) / 배송누락(dlvMisYn=Y) 강조."""
 
     COLUMNS = (
-        "slipNo",
-        "packDt",
-        "crgStNm",
-        "boxDivNm",
-        "boxNm",
-        "invoiceNo",
-        "parcelNm",
-        "godNm",
-        "packQty",
-        "sku",
-        "custNm",
-        "shopNm",
-        "salChanel",
-        "delayNm",
-        "dlvMisYn",
-        "rtnOrdDt",
-        "custAddr",
+        "전표번호",
+        "포장일",
+        "배송상태",
+        "박스구분",
+        "박스명",
+        "송장번호",
+        "택배사",
+        "상품명",
+        "포장수량",
+        "SKU",
+        "수취인",
+        "판매처",
+        "판매채널",
+        "지연",
+        "배송누락",
+        "반품예정일",
+        "주소",
     )
 
     def __init__(self, tab: "FasstoTab") -> None:
@@ -1524,26 +1524,26 @@ class _RevenueSubTab(QWidget):
     """출고 상품 상세 — 요약 + TOP 상품 + 일별 추이 + 원본 테이블."""
 
     COLUMNS = (
-        "outDt",
-        "slipNo",
-        "sellerChannel",
-        "orderNo",
-        "productOrderNo",
-        "custNm",
-        "cstGodCd",
-        "godNm",
-        "godDiv",
-        "outQty",
-        "markedPr",
-        "sellingPr",
-        "dcAmt",
-        "sellerDcAmt",
-        "naverDcAmt",
+        "출고일",
+        "전표번호",
+        "판매채널",
+        "주문번호",
+        "상품주문번호",
+        "수취인",
+        "상품코드",
+        "상품명",
+        "상품구분",
+        "출고수량",
+        "정상가",
+        "판매가",
+        "할인액",
+        "판매자할인",
+        "네이버할인",
         "소계(판매)",
     )
-    TOP_COLS = ("순위", "cstGodCd", "godNm", "수량", "실매출", "비중%")
+    TOP_COLS = ("순위", "상품코드", "상품명", "수량", "실매출", "비중%")
     DAILY_COLS = ("일자", "건수", "수량", "실매출")
-    CHANNEL_COLS = ("sellerChannel", "건수", "수량합", "실매출", "비중%")
+    CHANNEL_COLS = ("판매채널", "건수", "수량합", "실매출", "비중%")
 
     def __init__(self, tab: "FasstoTab") -> None:
         super().__init__()

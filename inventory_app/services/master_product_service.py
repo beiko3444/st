@@ -22,6 +22,10 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from inventory_app.models import ChannelMasterLink, ChannelProduct, MasterProduct
 from inventory_app.services.local_cache import ChannelProductCache
+from inventory_app.services.master_remote_client import (
+    MasterRemoteClient,
+    MasterRemoteError,
+)
 from inventory_app.services.shared_stock_grouping import product_identity_key
 
 
@@ -107,14 +111,37 @@ class MasterProductService:
       cache 에서 masters/links 를 읽어 MasterAggregation 반환.
     """
 
-    def __init__(self, cache: Optional[ChannelProductCache] = None) -> None:
+    def __init__(
+        self,
+        cache: Optional[ChannelProductCache] = None,
+        remote: Optional[MasterRemoteClient] = None,
+    ) -> None:
         self.cache = cache or ChannelProductCache()
+        self.remote = remote  # None 이면 로컬 단독 (레거시) 모드
+
+    def has_remote(self) -> bool:
+        return self.remote is not None
 
     # ------------------------------------------------------------------
-    # Master CRUD (passthrough, 편의)
+    # 원격 → 로컬 캐시 동기화
+    # ------------------------------------------------------------------
+
+    def refresh_from_remote(self) -> None:
+        """Pi 의 마스터/링크 전량을 로컬 캐시에 적재.
+        Pi 미설정/오류 시 MasterRemoteError 가 raise 되며 로컬 캐시는 건드리지 않는다.
+        """
+        if self.remote is None:
+            return
+        masters = self.remote.list_masters()
+        links = self.remote.list_all_links()
+        self.cache.replace_all_masters_and_links(masters, links)
+
+    # ------------------------------------------------------------------
+    # Master CRUD (write-through: remote 우선, 성공 시 로컬 캐시 반영)
     # ------------------------------------------------------------------
 
     def list_masters(self) -> List[MasterProduct]:
+        # 읽기는 로컬 캐시에서만 (속도/오프라인 내성). 신선도는 refresh_from_remote() 로 관리.
         return self.cache.list_masters()
 
     def create_master(
@@ -123,12 +150,25 @@ class MasterProductService:
         unit_cost: int | None = None,
         memo: str | None = None,
     ) -> MasterProduct:
+        if self.remote is not None:
+            master = self.remote.create_master(name, unit_cost=unit_cost, memo=memo)
+            self.cache.upsert_master_row(master)
+            return master
         return self.cache.create_master(name, unit_cost=unit_cost, memo=memo)
 
     def update_master(self, master_id: int, **kwargs) -> None:
+        if self.remote is not None:
+            master = self.remote.update_master(master_id, **kwargs)
+            self.cache.upsert_master_row(master)
+            return
         self.cache.update_master(master_id, **kwargs)
 
     def delete_master(self, master_id: int) -> None:
+        if self.remote is not None:
+            self.remote.delete_master(master_id)
+            # 로컬도 삭제 (FK CASCADE 로 링크도 같이 사라짐)
+            self.cache.delete_master(master_id)
+            return
         self.cache.delete_master(master_id)
 
     def set_representative(
@@ -137,10 +177,16 @@ class MasterProductService:
         channel: str | None,
         product_key: str | None,
     ) -> None:
+        if self.remote is not None:
+            master = self.remote.set_master_representative(
+                master_id, channel, product_key
+            )
+            self.cache.upsert_master_row(master)
+            return
         self.cache.set_master_representative(master_id, channel, product_key)
 
     # ------------------------------------------------------------------
-    # Link CRUD (passthrough)
+    # Link CRUD (write-through)
     # ------------------------------------------------------------------
 
     def link(
@@ -150,12 +196,24 @@ class MasterProductService:
         master_id: int,
         multiplier: int = 1,
     ) -> None:
+        if self.remote is not None:
+            link = self.remote.link(channel, product_key, master_id, multiplier)
+            self.cache.upsert_link_row(link)
+            return
         self.cache.link_channel_product(channel, product_key, master_id, multiplier)
 
     def unlink(self, channel: str, product_key: str) -> None:
+        if self.remote is not None:
+            self.remote.unlink(channel, product_key)
+            self.cache.unlink_channel_product(channel, product_key)
+            return
         self.cache.unlink_channel_product(channel, product_key)
 
     def set_multiplier(self, channel: str, product_key: str, multiplier: int) -> None:
+        if self.remote is not None:
+            link = self.remote.set_link_multiplier(channel, product_key, multiplier)
+            self.cache.upsert_link_row(link)
+            return
         self.cache.set_link_multiplier(channel, product_key, multiplier)
 
     def get_link(self, channel: str, product_key: str) -> ChannelMasterLink | None:
