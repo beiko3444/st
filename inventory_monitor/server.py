@@ -98,6 +98,19 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
+        elif path == "/sales/totals":
+            # /sales/totals?days=30 → 최근 N일 재고차감 누적 (SKU별)
+            raw_days = qs.get("days", ["30"])[0]
+            try:
+                n_days = max(1, min(365, int(raw_days)))
+            except (TypeError, ValueError):
+                n_days = 30
+            try:
+                totals = db.get_sales_totals_rolling(n_days)
+                self._send_json({"days": n_days, "totals": totals})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
         elif path == "/sales/dates":
             # 판매가 있었던 날짜 목록
             try:

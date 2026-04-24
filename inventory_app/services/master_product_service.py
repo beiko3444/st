@@ -55,6 +55,10 @@ class MasterProductRow:
     coupang_sales: Optional[int] = None
     naver_today_sales: Optional[int] = None
     coupang_today_sales: Optional[int] = None
+    # 판매가: 채널의 대표 링크(미설정 시 첫 링크) 의 raw price.
+    # multiplier 적용하지 않음 — 판매가는 팩 단위 그대로 노출.
+    naver_price: Optional[int] = None
+    coupang_price: Optional[int] = None
     image_url: Optional[str] = None
     naver_url: Optional[str] = None
     coupang_url: Optional[str] = None
@@ -381,3 +385,20 @@ class MasterProductService:
             representative = master_row.linked[0]
 
         master_row.image_url = representative.image_url
+
+        # 채널별 판매가: 대표 링크가 해당 채널이면 그걸 우선, 아니면 해당 채널 첫 링크
+        naver_price: Optional[int] = None
+        coupang_price: Optional[int] = None
+        if representative.channel == "naver":
+            naver_price = representative.price
+        elif representative.channel == "coupang":
+            coupang_price = representative.price
+        for link in master_row.linked:
+            if naver_price is None and link.channel == "naver" and link.price is not None:
+                naver_price = link.price
+            if coupang_price is None and link.channel == "coupang" and link.price is not None:
+                coupang_price = link.price
+            if naver_price is not None and coupang_price is not None:
+                break
+        master_row.naver_price = naver_price
+        master_row.coupang_price = coupang_price

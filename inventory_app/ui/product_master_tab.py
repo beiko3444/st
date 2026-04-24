@@ -2,23 +2,27 @@
 
 사용자가 만드는 마스터 상품 카탈로그 + 채널 상품과의 연결 상태 관리.
 
-책임:
-- 마스터 CRUD (이름 / 원가 / 메모)
-- 마스터에 연결된 채널 상품 목록 표시 (multiplier, 재고, 판매량)
-- 대표 이미지 지정 (연결된 채널 상품 중 하나)
-- 연결 해제 / multiplier 수정
-- 전체 "미연결 채널 상품" 요약 (연결은 Channel 탭 우클릭 메뉴에서)
+레이아웃:
+- 탭 본체: 마스터 상품 테이블 (풀스크린)
+- 행 더블클릭 / "상세" 버튼 → `MasterDetailDialog` 팝업 (이름/원가/메모/링크 편집)
+
+이전 버전은 splitter 로 상세 패널을 화면 일부에 박았는데 상품등록 탭 자체가 비좁아져
+다이얼로그로 분리함.
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
+import httpx
 
 from PySide6.QtCore import QObject, Qt, Signal, Slot
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -28,7 +32,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -53,6 +56,8 @@ _MASTER_COLS = [
     "이미지",
     "이름",
     "원가",
+    "네이버가",
+    "쿠팡가",
     "네이버재고",
     "쿠팡재고",
     "총재고",
@@ -90,164 +95,213 @@ def _format_price(value: Optional[int]) -> str:
     return f"{int(value):,}원"
 
 
+def _number_item(text: str, sort_value) -> QTableWidgetItem:
+    item = QTableWidgetItem(text)
+    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    if sort_value is not None:
+        item.setData(Qt.UserRole, sort_value)
+    return item
+
+
 class _ImageSignals(QObject):
     loaded = Signal(str, object)  # url, bytes|None
 
 
-class ProductMasterTab(QWidget):
-    """상품등록 탭 위젯.
+class _ImageLoader:
+    """탭 / 다이얼로그가 공유하는 async 이미지 로더 + 픽스맵 캐시."""
 
-    외부 연동:
-    - `masters_changed` 시그널: 마스터/링크가 수정되면 방출됨.
-      MainWindow 가 재고관리/매출비교 등 다른 탭 새로고침을 걸 때 사용.
+    def __init__(self) -> None:
+        self._cache: Dict[str, QPixmap] = {}
+        self._pending: set[str] = set()
+        self._executor = ThreadPoolExecutor(max_workers=4)
+        self.signals = _ImageSignals()
+
+    @property
+    def cache(self) -> Dict[str, QPixmap]:
+        return self._cache
+
+    def request(self, url: str) -> Optional[QPixmap]:
+        if not url:
+            return None
+        pm = self._cache.get(url)
+        if pm is not None and not pm.isNull():
+            return pm
+        if url not in self._pending:
+            self._pending.add(url)
+            self._executor.submit(self._worker, url)
+        return None
+
+    def _worker(self, url: str) -> None:
+        data = None
+        try:
+            data = get_image_bytes(url)
+        except Exception:  # noqa: BLE001
+            data = None
+        self.signals.loaded.emit(url, data)
+
+    def accept_loaded(self, url: str, data) -> Optional[QPixmap]:
+        self._pending.discard(url)
+        if not data:
+            return None
+        pm = QPixmap()
+        if not pm.loadFromData(data):
+            return None
+        self._cache[url] = pm
+        return pm
+
+
+def _fetch_rolling_sales_totals(
+    monitor_url: str,
+    days: int = 30,
+    timeout: float = 10.0,
+) -> Optional[Dict[Tuple[str, str], int]]:
+    """Pi 의 /sales/totals?days=N 호출 → {(channel, product_identity_key): qty} 맵.
+
+    실패 시 None 반환 (호출부는 API 값 그대로 사용).
+    """
+    if not monitor_url:
+        return None
+    url = f"{monitor_url.rstrip('/')}/sales/totals?days={int(days)}"
+    try:
+        resp = httpx.get(url, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(payload, dict):
+        return None
+    totals: Dict[Tuple[str, str], int] = {}
+    for row in payload.get("totals") or []:
+        if not isinstance(row, dict):
+            continue
+        channel = str(row.get("channel") or "").strip().lower()
+        pid = str(row.get("product_id") or "").strip()
+        iid = row.get("item_id")
+        iid_str = str(iid) if iid not in (None, "") else ""
+        try:
+            qty = int(row.get("qty_sold") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if not channel or not pid or qty < 0:
+            continue
+        key = (channel, f"id:{pid}|item:{iid_str}")
+        totals[key] = qty
+    return totals
+
+
+def _apply_rolling_sales_override(
+    rows_by_channel: Dict[str, List[ChannelProduct]],
+    totals: Dict[Tuple[str, str], int],
+) -> None:
+    """rows 의 sales 필드를 Pi 재고차감 카운팅값으로 교체 (in-place).
+
+    해당 SKU 이벤트가 0이면 sales=0 으로 세팅 (API 30일 값을 쓰지 않고).
+    """
+    for channel, rows in rows_by_channel.items():
+        for row in rows:
+            key = (channel, product_identity_key(row))
+            row.sales = int(totals.get(key, 0))
+
+
+def _assign_pixmap(
+    label: QLabel,
+    url: Optional[str],
+    size: int,
+    loader: _ImageLoader,
+    *,
+    text_if_none: str = "-",
+) -> None:
+    if not url:
+        label.setText(text_if_none)
+        return
+    pm = loader.request(url)
+    if pm is not None:
+        label.setPixmap(pm.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+    else:
+        label.setText(text_if_none)
+
+
+# ---------------------------------------------------------------------------
+# 상세 다이얼로그
+# ---------------------------------------------------------------------------
+
+
+class MasterDetailDialog(QDialog):
+    """마스터 상품 상세 편집 팝업.
+
+    - 이름/원가/메모 편집 + 저장
+    - 연결된 채널 상품 리스트 + 배수/대표/해제 액션
+    - 마스터 삭제
     """
 
-    masters_changed = Signal()
+    changed = Signal()  # 저장/삭제/링크 수정 발생 시 방출 → 탭 refresh
 
     def __init__(
         self,
-        cache: Optional[ChannelProductCache] = None,
-        monitor_url: Optional[str] = None,
+        service: MasterProductService,
+        loader: _ImageLoader,
+        master_id: Optional[int],
+        aggregation: MasterAggregation,
+        parent: Optional[QWidget] = None,
     ) -> None:
-        super().__init__()
-        self.cache = cache or ChannelProductCache()
-        self.monitor_url = (str(monitor_url).strip() if monitor_url else "")
-        self.service = build_master_service(
-            cache=self.cache, monitor_url=self.monitor_url
+        super().__init__(parent)
+        self.service = service
+        self.loader = loader
+        self.master_id = master_id  # None = create mode
+        self._aggregation = aggregation
+        self._dirty = False
+        self.loader.signals.loaded.connect(self._on_image_loaded)
+        self.setWindowTitle(
+            "새 마스터 상품" if master_id is None else "마스터 상품 상세"
         )
-        self._remote_refresh_warning: str = ""
-
-        self._current_aggregation: MasterAggregation | None = None
-        self._current_master_id: int | None = None
-
-        self._image_cache: Dict[str, QPixmap] = {}
-        self._image_pending: set[str] = set()
-        self._image_executor = ThreadPoolExecutor(max_workers=4)
-        self._image_signals = _ImageSignals()
-        self._image_signals.loaded.connect(self._on_image_loaded)
-
+        self.resize(820, 640)
         self._build_ui()
-        self.refresh()
-
-    # ------------------------------------------------------------------
-    # UI construction
-    # ------------------------------------------------------------------
+        if master_id is None:
+            self._setup_create_mode()
+        else:
+            self._load_from_aggregation()
 
     def _build_ui(self) -> None:
-        root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(10, 10, 10, 10)
-        root_layout.setSpacing(8)
-
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(8)
-        self.new_master_button = QPushButton("새 마스터")
-        self.new_master_button.clicked.connect(self._on_new_master)
-        self.refresh_button = QPushButton("새로고침")
-        self.refresh_button.clicked.connect(self.refresh)
-        self.summary_label = QLabel("")
-        self.summary_label.setStyleSheet("color: #475569;")
-        toolbar.addWidget(self.new_master_button)
-        toolbar.addWidget(self.refresh_button)
-        toolbar.addStretch(1)
-        toolbar.addWidget(self.summary_label)
-        root_layout.addLayout(toolbar)
-
-        splitter = QSplitter(Qt.Horizontal)
-
-        # --- Left: master table -----------------------------------------
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(4)
-
-        self.master_table = QTableWidget(0, len(_MASTER_COLS))
-        self.master_table.setHorizontalHeaderLabels(_MASTER_COLS)
-        self.master_table.verticalHeader().setVisible(False)
-        self.master_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.master_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.master_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.master_table.setAlternatingRowColors(True)
-        self.master_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
-        self.master_table.itemSelectionChanged.connect(self._on_master_selected)
-        # 컬럼 너비 전략:
-        # - 이미지/이름은 Interactive (사용자가 드래그 가능) + 기본폭 지정
-        # - 숫자 컬럼은 Interactive + 고정 폭 (ResizeToContents 는 행마다 폭이 튀어서 산만)
-        #   테이블 전체가 화면보다 넓으면 가로 스크롤 허용.
-        header = self.master_table.horizontalHeader()
-        header.setStretchLastSection(False)
-        for idx in range(len(_MASTER_COLS)):
-            header.setSectionResizeMode(idx, QHeaderView.Interactive)
-        # 너비 설정: 이미지 56, 이름 260, 숫자 80~110
-        _col_widths = {
-            0: 56,    # 이미지
-            1: 260,   # 이름
-            2: 80,    # 원가
-            3: 86,    # 네이버재고
-            4: 80,    # 쿠팡재고
-            5: 80,    # 총재고
-            6: 110,   # 재고원가
-            7: 92,    # 네이버(오늘)
-            8: 84,    # 쿠팡(오늘)
-            9: 86,    # 오늘판매
-            10: 116,  # 네이버판매(30일)
-            11: 110,  # 쿠팡판매(30일)
-            12: 108,  # 총판매(30일)
-            13: 56,   # 연결
-        }
-        for col, w in _col_widths.items():
-            self.master_table.setColumnWidth(col, w)
-        self.master_table.verticalHeader().setDefaultSectionSize(48)
-        # 총합 컬럼은 굵게 강조 (총재고 / 오늘판매 / 총판매30일)
-        for total_col in (5, 9, 12):
-            header_item = self.master_table.horizontalHeaderItem(total_col)
-            if header_item is not None:
-                f = header_item.font()
-                f.setBold(True)
-                header_item.setFont(f)
-
-        left_layout.addWidget(self.master_table, 1)
-
-        # --- Right: detail panel ----------------------------------------
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(8)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 12)
+        layout.setSpacing(10)
 
         header_row = QHBoxLayout()
         self.detail_image = QLabel()
-        self.detail_image.setFixedSize(96, 96)
+        self.detail_image.setFixedSize(120, 120)
         self.detail_image.setStyleSheet(
             "border: 1px solid #cbd5e1; background: #f8fafc; border-radius: 6px;"
         )
         self.detail_image.setAlignment(Qt.AlignCenter)
         self.detail_image.setText("이미지 없음")
 
-        header_form = QVBoxLayout()
-        header_form.setSpacing(4)
+        form = QVBoxLayout()
+        form.setSpacing(6)
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("마스터 이름")
+        self.name_edit.returnPressed.connect(self._on_save_master)
         self.cost_edit = QLineEdit()
         self.cost_edit.setPlaceholderText("원가 (숫자)")
+        self.cost_edit.returnPressed.connect(self._on_save_master)
         name_row = QHBoxLayout()
         name_row.addWidget(QLabel("이름"))
         name_row.addWidget(self.name_edit, 1)
         cost_row = QHBoxLayout()
         cost_row.addWidget(QLabel("원가"))
         cost_row.addWidget(self.cost_edit, 1)
-        header_form.addLayout(name_row)
-        header_form.addLayout(cost_row)
+        form.addLayout(name_row)
+        form.addLayout(cost_row)
+        form.addWidget(QLabel("메모"))
+        self.memo_edit = QPlainTextEdit()
+        self.memo_edit.setFixedHeight(80)
+        form.addWidget(self.memo_edit, 1)
 
         header_row.addWidget(self.detail_image)
-        header_row.addLayout(header_form, 1)
-        right_layout.addLayout(header_row)
-
-        right_layout.addWidget(QLabel("메모"))
-        self.memo_edit = QPlainTextEdit()
-        self.memo_edit.setFixedHeight(64)
-        right_layout.addWidget(self.memo_edit)
+        header_row.addLayout(form, 1)
+        layout.addLayout(header_row)
 
         action_row = QHBoxLayout()
-        action_row.setSpacing(6)
         self.save_master_button = QPushButton("저장")
         self.save_master_button.clicked.connect(self._on_save_master)
         self.delete_master_button = QPushButton("마스터 삭제")
@@ -255,14 +309,14 @@ class ProductMasterTab(QWidget):
         action_row.addWidget(self.save_master_button)
         action_row.addWidget(self.delete_master_button)
         action_row.addStretch(1)
-        right_layout.addLayout(action_row)
+        layout.addLayout(action_row)
 
         separator = QFrame()
         separator.setFrameShape(QFrame.HLine)
         separator.setStyleSheet("color: #e2e8f0;")
-        right_layout.addWidget(separator)
+        layout.addWidget(separator)
 
-        right_layout.addWidget(QLabel("연결된 채널 상품"))
+        layout.addWidget(QLabel("연결된 채널 상품"))
         self.links_table = QTableWidget(0, len(_LINK_COLS))
         self.links_table.setHorizontalHeaderLabels(_LINK_COLS)
         self.links_table.verticalHeader().setVisible(False)
@@ -275,205 +329,68 @@ class ProductMasterTab(QWidget):
         links_header.setSectionResizeMode(1, QHeaderView.Stretch)
         for idx in (0, 2, 3, 4, 5, 6, 7, 8):
             links_header.setSectionResizeMode(idx, QHeaderView.ResizeToContents)
-        right_layout.addWidget(self.links_table, 1)
+        layout.addWidget(self.links_table, 1)
 
-        splitter.addWidget(left)
-        splitter.addWidget(right)
-        # 마스터 테이블이 화면 다수 차지 (컬럼 14개). detail 은 고정폭 느낌으로.
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([1120, 520])
-        root_layout.addWidget(splitter, 1)
-
-        self._set_detail_enabled(False)
+        button_box = QDialogButtonBox(QDialogButtonBox.Close)
+        button_box.rejected.connect(self.accept)
+        layout.addWidget(button_box)
 
     # ------------------------------------------------------------------
-    # Refresh pipeline
+    # Data load
     # ------------------------------------------------------------------
 
-    def refresh(self) -> None:
-        """Pi 에서 마스터/링크 최신 상태 fetch 후 채널 raw rows 와 집계.
-        Pi 실패 시 로컬 캐시 기반으로 진행하고 요약 영역에 경고를 남긴다.
-        """
-        self._remote_refresh_warning = ""
-        if self.service.has_remote():
-            try:
-                self.service.refresh_from_remote()
-            except MasterRemoteError as exc:
-                if exc.status == 0:
-                    # 네트워크/DNS 오류 — Pi 가 꺼져있거나 LAN 밖. 조용히 로컬 캐시 사용.
-                    self._remote_refresh_warning = "Pi 오프라인 (로컬 캐시 사용)"
-                else:
-                    self._remote_refresh_warning = f"Pi 동기화 실패 (HTTP {exc.status})"
-        rows_by_channel: Dict[str, List[ChannelProduct]] = {
-            "naver": self.cache.load_rows("naver"),
-            "coupang": self.cache.load_rows("coupang"),
-        }
-        self._current_aggregation = self.service.aggregate(rows_by_channel)
-        self._render_master_table()
-        self._render_summary()
-        # 선택 유지
-        if self._current_master_id is not None:
-            self._select_master_in_table(self._current_master_id)
-        else:
-            self._clear_detail()
-
-    def _render_summary(self) -> None:
-        if self._current_aggregation is None:
-            self.summary_label.setText("")
-            return
-        total_masters = len(self._current_aggregation.masters)
-        unlinked_count = sum(
-            len(rows)
-            for rows in self._current_aggregation.unlinked_by_channel.values()
-        )
-        warn = getattr(self, "_remote_refresh_warning", "") or ""
-        base = f"마스터 {total_masters}개 · 미연결 채널상품 {unlinked_count}개"
-        if warn:
-            self.summary_label.setText(f"{base}  |  ⚠ {warn}")
-        else:
-            self.summary_label.setText(base)
-
-    def _render_master_table(self) -> None:
-        if self._current_aggregation is None:
-            self.master_table.setRowCount(0)
-            return
-        masters = self._current_aggregation.masters
-        self.master_table.setSortingEnabled(False)
-        self.master_table.setRowCount(len(masters))
-        for row_idx, master_row in enumerate(masters):
-            self._populate_master_row(row_idx, master_row)
-        self.master_table.setSortingEnabled(True)
-
-    def _populate_master_row(self, row_idx: int, master_row: MasterProductRow) -> None:
-        master = master_row.master
-
-        image_label = QLabel()
-        image_label.setAlignment(Qt.AlignCenter)
-        image_label.setFixedSize(48, 48)
-        if master_row.image_url:
-            self._assign_pixmap(image_label, master_row.image_url, 44)
-        else:
-            image_label.setText("-")
-        self.master_table.setCellWidget(row_idx, 0, image_label)
-
-        name_item = QTableWidgetItem(master.name)
-        name_item.setData(Qt.UserRole, master.id)
-        self.master_table.setItem(row_idx, 1, name_item)
-
-        cost_text = _format_price(master.unit_cost) if master.unit_cost is not None else "-"
-        self.master_table.setItem(row_idx, 2, self._number_item(cost_text, master.unit_cost))
-        self.master_table.setItem(
-            row_idx, 3, self._number_item(_format_int(master_row.naver_stock), master_row.naver_stock)
-        )
-        self.master_table.setItem(
-            row_idx, 4, self._number_item(_format_int(master_row.coupang_stock), master_row.coupang_stock)
-        )
-        self.master_table.setItem(
-            row_idx, 5, self._number_item(_format_int(master_row.total_stock), master_row.total_stock)
-        )
-        if master.unit_cost is not None and master_row.total_stock is not None:
-            stock_cost = int(master.unit_cost) * int(master_row.total_stock)
-        else:
-            stock_cost = None
-        self.master_table.setItem(
-            row_idx, 6, self._number_item(_format_price(stock_cost), stock_cost)
-        )
-        self.master_table.setItem(
-            row_idx, 7,
-            self._number_item(_format_int(master_row.naver_today_sales), master_row.naver_today_sales),
-        )
-        self.master_table.setItem(
-            row_idx, 8,
-            self._number_item(_format_int(master_row.coupang_today_sales), master_row.coupang_today_sales),
-        )
-        self.master_table.setItem(
-            row_idx, 9,
-            self._number_item(_format_int(master_row.total_today_sales), master_row.total_today_sales),
-        )
-        self.master_table.setItem(
-            row_idx, 10, self._number_item(_format_int(master_row.naver_sales), master_row.naver_sales)
-        )
-        self.master_table.setItem(
-            row_idx, 11, self._number_item(_format_int(master_row.coupang_sales), master_row.coupang_sales)
-        )
-        self.master_table.setItem(
-            row_idx, 12, self._number_item(_format_int(master_row.total_sales), master_row.total_sales)
-        )
-        link_count = len(master_row.linked)
-        self.master_table.setItem(
-            row_idx, 13, self._number_item(str(link_count), link_count)
-        )
-
-    @staticmethod
-    def _number_item(text: str, sort_value) -> QTableWidgetItem:
-        item = QTableWidgetItem(text)
-        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        if sort_value is not None:
-            item.setData(Qt.UserRole, sort_value)
-        return item
-
-    # ------------------------------------------------------------------
-    # Selection + detail rendering
-    # ------------------------------------------------------------------
-
-    def _on_master_selected(self) -> None:
-        rows = self.master_table.selectionModel().selectedRows()
-        if not rows:
-            self._current_master_id = None
-            self._clear_detail()
-            return
-        row_idx = rows[0].row()
-        name_item = self.master_table.item(row_idx, 1)
-        if name_item is None:
-            self._clear_detail()
-            return
-        master_id = name_item.data(Qt.UserRole)
-        if master_id is None:
-            self._clear_detail()
-            return
-        self._current_master_id = int(master_id)
-        self._render_detail(self._current_master_id)
-
-    def _find_master_row(self, master_id: int) -> MasterProductRow | None:
-        if self._current_aggregation is None:
+    def _find_master_row(self) -> Optional[MasterProductRow]:
+        if self.master_id is None:
             return None
-        for master_row in self._current_aggregation.masters:
-            if master_row.master.id == master_id:
-                return master_row
+        for mr in self._aggregation.masters:
+            if mr.master.id == self.master_id:
+                return mr
         return None
 
-    def _select_master_in_table(self, master_id: int) -> None:
-        for row in range(self.master_table.rowCount()):
-            name_item = self.master_table.item(row, 1)
-            if name_item is None:
-                continue
-            if int(name_item.data(Qt.UserRole) or 0) == master_id:
-                self.master_table.selectRow(row)
-                return
-        self._current_master_id = None
-        self._clear_detail()
+    def _setup_create_mode(self) -> None:
+        # 이름 입력 후 Enter/저장 시 create_master 실행.
+        self.detail_image.clear()
+        self.detail_image.setText("이미지 없음")
+        self.name_edit.setFocus()
+        # 삭제 및 링크 테이블은 의미 없음 (아직 생성 안 됨)
+        self.delete_master_button.setEnabled(False)
+        self.links_table.setEnabled(False)
 
-    def _render_detail(self, master_id: int) -> None:
-        master_row = self._find_master_row(master_id)
-        if master_row is None:
-            self._clear_detail()
+    def _reload_aggregation(self) -> None:
+        # 다이얼로그 내부에서 링크 변경 후 자체 재집계 (탭 전체 refresh 전에)
+        rows_by_channel: Dict[str, List[ChannelProduct]] = {
+            "naver": self.service.cache.load_rows("naver"),
+            "coupang": self.service.cache.load_rows("coupang"),
+        }
+        monitor_url = getattr(self.parent(), "monitor_url", "") if self.parent() else ""
+        if monitor_url:
+            totals = _fetch_rolling_sales_totals(monitor_url, days=30)
+            if totals is not None:
+                _apply_rolling_sales_override(rows_by_channel, totals)
+        self._aggregation = self.service.aggregate(rows_by_channel)
+
+    def _load_from_aggregation(self) -> None:
+        mr = self._find_master_row()
+        if mr is None:
+            # 마스터가 삭제됐거나 aggregation 이 stale — 다이얼로그 강제 종료
+            self.close()
             return
-        master = master_row.master
-        self._set_detail_enabled(True)
+        master = mr.master
         self.name_edit.setText(master.name)
         self.cost_edit.setText("" if master.unit_cost is None else str(master.unit_cost))
         self.memo_edit.blockSignals(True)
         self.memo_edit.setPlainText(master.memo or "")
         self.memo_edit.blockSignals(False)
 
-        if master_row.image_url:
-            self._assign_pixmap(self.detail_image, master_row.image_url, 92, text_if_none="이미지 없음")
+        if mr.image_url:
+            _assign_pixmap(
+                self.detail_image, mr.image_url, 116, self.loader, text_if_none="이미지 없음"
+            )
         else:
             self.detail_image.clear()
             self.detail_image.setText("이미지 없음")
 
-        self._render_links(master_row)
+        self._render_links(mr)
 
     def _render_links(self, master_row: MasterProductRow) -> None:
         self.links_table.setRowCount(len(master_row.linked))
@@ -494,24 +411,13 @@ class ProductMasterTab(QWidget):
 
         name_item = QTableWidgetItem(link.name)
         name_item.setToolTip(link.name)
-        name_item.setData(Qt.UserRole, (link.channel, link.product_key))
         self.links_table.setItem(row_idx, 1, name_item)
 
-        self.links_table.setItem(
-            row_idx, 2, self._number_item(f"×{link.multiplier}", link.multiplier)
-        )
-        self.links_table.setItem(
-            row_idx, 3, self._number_item(_format_int(link.stock), link.stock)
-        )
-        self.links_table.setItem(
-            row_idx, 4, self._number_item(_format_int(link.sales), link.sales)
-        )
-        self.links_table.setItem(
-            row_idx, 5, self._number_item(_format_int(link.today_sales), link.today_sales)
-        )
-        self.links_table.setItem(
-            row_idx, 6, self._number_item(_format_price(link.price), link.price)
-        )
+        self.links_table.setItem(row_idx, 2, _number_item(f"×{link.multiplier}", link.multiplier))
+        self.links_table.setItem(row_idx, 3, _number_item(_format_int(link.stock), link.stock))
+        self.links_table.setItem(row_idx, 4, _number_item(_format_int(link.sales), link.sales))
+        self.links_table.setItem(row_idx, 5, _number_item(_format_int(link.today_sales), link.today_sales))
+        self.links_table.setItem(row_idx, 6, _number_item(_format_price(link.price), link.price))
 
         rep_item = QTableWidgetItem("★" if is_rep else "")
         rep_item.setTextAlignment(Qt.AlignCenter)
@@ -544,60 +450,18 @@ class ProductMasterTab(QWidget):
         action_layout.addWidget(unlink_btn)
         self.links_table.setCellWidget(row_idx, 8, action_widget)
 
-    def _clear_detail(self) -> None:
-        self._set_detail_enabled(False)
-        self.name_edit.clear()
-        self.cost_edit.clear()
-        self.memo_edit.clear()
-        self.detail_image.clear()
-        self.detail_image.setText("이미지 없음")
-        self.links_table.setRowCount(0)
-
-    def _set_detail_enabled(self, enabled: bool) -> None:
-        for widget in (
-            self.name_edit,
-            self.cost_edit,
-            self.memo_edit,
-            self.save_master_button,
-            self.delete_master_button,
-            self.links_table,
-        ):
-            widget.setEnabled(enabled)
-
     # ------------------------------------------------------------------
-    # Master CRUD handlers
+    # Handlers
     # ------------------------------------------------------------------
-
-    def _on_new_master(self) -> None:
-        name, ok = QInputDialog.getText(self, "새 마스터", "마스터 이름:")
-        if not ok:
-            return
-        name = str(name or "").strip()
-        if not name:
-            QMessageBox.warning(self, "이름 필요", "이름을 입력해주세요.")
-            return
-        try:
-            master = self.service.create_master(name=name)
-        except ValueError as exc:
-            QMessageBox.warning(self, "실패", str(exc))
-            return
-        except MasterRemoteError as exc:
-            QMessageBox.critical(self, "파이 서버 오류", f"마스터 생성 실패: {exc}")
-            return
-        self._current_master_id = master.id
-        self.refresh()
-        self.masters_changed.emit()
 
     def _on_save_master(self) -> None:
-        if self._current_master_id is None:
-            return
         new_name = self.name_edit.text().strip()
         if not new_name:
             QMessageBox.warning(self, "이름 필요", "마스터 이름은 비워둘 수 없어요.")
             return
         cost_text = self.cost_edit.text().strip()
-        cost_value: int | None
         clear_cost = False
+        cost_value: int | None
         if not cost_text:
             cost_value = None
             clear_cost = True
@@ -609,28 +473,37 @@ class ProductMasterTab(QWidget):
                 return
         memo_text = self.memo_edit.toPlainText().strip()
         try:
-            self.service.update_master(
-                self._current_master_id,
-                name=new_name,
-                unit_cost=cost_value,
-                clear_unit_cost=clear_cost,
-                memo=memo_text if memo_text else None,
-                clear_memo=not bool(memo_text),
-            )
+            if self.master_id is None:
+                # 생성 모드
+                master = self.service.create_master(
+                    name=new_name,
+                    unit_cost=cost_value,
+                    memo=memo_text if memo_text else None,
+                )
+                self.master_id = master.id
+            else:
+                self.service.update_master(
+                    self.master_id,
+                    name=new_name,
+                    unit_cost=cost_value,
+                    clear_unit_cost=clear_cost,
+                    memo=memo_text if memo_text else None,
+                    clear_memo=not bool(memo_text),
+                )
         except ValueError as exc:
             QMessageBox.warning(self, "실패", str(exc))
             return
         except MasterRemoteError as exc:
-            QMessageBox.critical(self, "파이 서버 오류", f"마스터 수정 실패: {exc}")
+            QMessageBox.critical(self, "파이 서버 오류", f"마스터 저장 실패: {exc}")
             return
-        self.refresh()
-        self.masters_changed.emit()
+        self._dirty = True
+        self.changed.emit()
+        # 저장 성공 시 다이얼로그 닫기 (엔터키 UX)
+        self.accept()
 
     def _on_delete_master(self) -> None:
-        if self._current_master_id is None:
-            return
-        master_row = self._find_master_row(self._current_master_id)
-        name = master_row.master.name if master_row else str(self._current_master_id)
+        mr = self._find_master_row()
+        name = mr.master.name if mr else str(self.master_id)
         reply = QMessageBox.question(
             self,
             "마스터 삭제",
@@ -639,17 +512,13 @@ class ProductMasterTab(QWidget):
         if reply != QMessageBox.Yes:
             return
         try:
-            self.service.delete_master(self._current_master_id)
+            self.service.delete_master(self.master_id)
         except MasterRemoteError as exc:
             QMessageBox.critical(self, "파이 서버 오류", f"마스터 삭제 실패: {exc}")
             return
-        self._current_master_id = None
-        self.refresh()
-        self.masters_changed.emit()
-
-    # ------------------------------------------------------------------
-    # Link handlers
-    # ------------------------------------------------------------------
+        self._dirty = True
+        self.changed.emit()
+        self.accept()
 
     def _on_edit_multiplier(self, channel: str, product_key: str, current: int) -> None:
         value, ok = QInputDialog.getInt(
@@ -668,21 +537,21 @@ class ProductMasterTab(QWidget):
         except MasterRemoteError as exc:
             QMessageBox.critical(self, "파이 서버 오류", f"배수 변경 실패: {exc}")
             return
-        self.refresh()
-        self.masters_changed.emit()
+        self._dirty = True
+        self.changed.emit()
+        self._reload_aggregation()
+        self._load_from_aggregation()
 
     def _on_set_representative(self, channel: str, product_key: str) -> None:
-        if self._current_master_id is None:
-            return
         try:
-            self.service.set_representative(
-                self._current_master_id, channel, product_key
-            )
+            self.service.set_representative(self.master_id, channel, product_key)
         except MasterRemoteError as exc:
             QMessageBox.critical(self, "파이 서버 오류", f"대표 지정 실패: {exc}")
             return
-        self.refresh()
-        self.masters_changed.emit()
+        self._dirty = True
+        self.changed.emit()
+        self._reload_aggregation()
+        self._load_from_aggregation()
 
     def _on_unlink(self, channel: str, product_key: str) -> None:
         reply = QMessageBox.question(
@@ -695,60 +564,290 @@ class ProductMasterTab(QWidget):
         except MasterRemoteError as exc:
             QMessageBox.critical(self, "파이 서버 오류", f"연결 해제 실패: {exc}")
             return
-        self.refresh()
-        self.masters_changed.emit()
-
-    # ------------------------------------------------------------------
-    # Image loading
-    # ------------------------------------------------------------------
-
-    def _assign_pixmap(
-        self,
-        label: QLabel,
-        url: str,
-        size: int,
-        text_if_none: str = "-",
-    ) -> None:
-        pixmap = self._image_cache.get(url)
-        if pixmap is not None and not pixmap.isNull():
-            label.setPixmap(pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            return
-        label.setText(text_if_none)
-        if url in self._image_pending:
-            return
-        self._image_pending.add(url)
-        self._image_executor.submit(self._fetch_image_worker, url)
-
-    def _fetch_image_worker(self, url: str) -> None:
-        data = None
-        try:
-            data = get_image_bytes(url)
-        except Exception:  # noqa: BLE001
-            data = None
-        self._image_signals.loaded.emit(url, data)
+        self._dirty = True
+        self.changed.emit()
+        self._reload_aggregation()
+        self._load_from_aggregation()
 
     @Slot(str, object)
     def _on_image_loaded(self, url: str, data) -> None:
-        self._image_pending.discard(url)
-        if not data:
+        pm = self.loader.accept_loaded(url, data)
+        if pm is None:
             return
-        pixmap = QPixmap()
-        if not pixmap.loadFromData(data):
+        mr = self._find_master_row()
+        if mr and mr.image_url == url:
+            self.detail_image.setPixmap(
+                pm.scaled(116, 116, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+
+
+# ---------------------------------------------------------------------------
+# 상품등록 탭
+# ---------------------------------------------------------------------------
+
+
+class ProductMasterTab(QWidget):
+    """상품등록 탭 — 마스터 테이블만 표시. 상세는 더블클릭으로 팝업."""
+
+    masters_changed = Signal()
+
+    def __init__(
+        self,
+        cache: Optional[ChannelProductCache] = None,
+        monitor_url: Optional[str] = None,
+    ) -> None:
+        super().__init__()
+        self.cache = cache or ChannelProductCache()
+        self.monitor_url = (str(monitor_url).strip() if monitor_url else "")
+        self.service = build_master_service(
+            cache=self.cache, monitor_url=self.monitor_url
+        )
+        self._remote_refresh_warning: str = ""
+        self._current_aggregation: MasterAggregation | None = None
+
+        self._loader = _ImageLoader()
+        self._loader.signals.loaded.connect(self._on_image_loaded)
+
+        self._build_ui()
+        self.refresh()
+
+    def _build_ui(self) -> None:
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(10, 10, 10, 10)
+        root_layout.setSpacing(8)
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
+        self.new_master_button = QPushButton("새 마스터")
+        self.new_master_button.clicked.connect(self._on_new_master)
+        self.refresh_button = QPushButton("새로고침")
+        self.refresh_button.clicked.connect(self.refresh)
+        self.detail_button = QPushButton("상세")
+        self.detail_button.setToolTip("선택된 마스터 상품 상세 편집 (행 더블클릭으로도 가능)")
+        self.detail_button.clicked.connect(self._on_detail_button_clicked)
+        self.summary_label = QLabel("")
+        self.summary_label.setStyleSheet("color: #475569;")
+        toolbar.addWidget(self.new_master_button)
+        toolbar.addWidget(self.detail_button)
+        toolbar.addWidget(self.refresh_button)
+        toolbar.addStretch(1)
+        toolbar.addWidget(self.summary_label)
+        root_layout.addLayout(toolbar)
+
+        self.master_table = QTableWidget(0, len(_MASTER_COLS))
+        self.master_table.setHorizontalHeaderLabels(_MASTER_COLS)
+        self.master_table.verticalHeader().setVisible(False)
+        self.master_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.master_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.master_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.master_table.setAlternatingRowColors(True)
+        self.master_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.master_table.doubleClicked.connect(self._on_row_double_clicked)
+        header = self.master_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        for idx in range(len(_MASTER_COLS)):
+            header.setSectionResizeMode(idx, QHeaderView.Interactive)
+        _col_widths = {
+            0: 56, 1: 260, 2: 80, 3: 92, 4: 88, 5: 86, 6: 80, 7: 80,
+            8: 110, 9: 92, 10: 84, 11: 86, 12: 116, 13: 110, 14: 108, 15: 56,
+        }
+        for col, w in _col_widths.items():
+            self.master_table.setColumnWidth(col, w)
+        self.master_table.verticalHeader().setDefaultSectionSize(48)
+        for total_col in (7, 11, 14):
+            header_item = self.master_table.horizontalHeaderItem(total_col)
+            if header_item is not None:
+                f = header_item.font()
+                f.setBold(True)
+                header_item.setFont(f)
+
+        root_layout.addWidget(self.master_table, 1)
+
+    # ------------------------------------------------------------------
+    # Refresh pipeline
+    # ------------------------------------------------------------------
+
+    def refresh(self) -> None:
+        self._remote_refresh_warning = ""
+        if self.service.has_remote():
+            try:
+                self.service.refresh_from_remote()
+            except MasterRemoteError as exc:
+                if exc.status == 0:
+                    self._remote_refresh_warning = "Pi 오프라인 (로컬 캐시 사용)"
+                else:
+                    self._remote_refresh_warning = f"Pi 동기화 실패 (HTTP {exc.status})"
+        rows_by_channel: Dict[str, List[ChannelProduct]] = {
+            "naver": self.cache.load_rows("naver"),
+            "coupang": self.cache.load_rows("coupang"),
+        }
+        # 30일 판매량은 API 누적값 대신 Pi 재고차감 이벤트 기반 롤링 합계로 덮어쓴다.
+        # Pi 미연결/오류 시 원본 API 값 유지.
+        if self.monitor_url:
+            totals = _fetch_rolling_sales_totals(self.monitor_url, days=30)
+            if totals is not None:
+                _apply_rolling_sales_override(rows_by_channel, totals)
+            elif not self._remote_refresh_warning:
+                self._remote_refresh_warning = "판매 집계 미동기화 (Pi /sales/totals 실패)"
+        self._current_aggregation = self.service.aggregate(rows_by_channel)
+        self._render_master_table()
+        self._render_summary()
+
+    def _render_summary(self) -> None:
+        if self._current_aggregation is None:
+            self.summary_label.setText("")
             return
-        self._image_cache[url] = pixmap
-        # 현재 열려있는 detail 의 이미지 라벨 업데이트
+        total_masters = len(self._current_aggregation.masters)
+        unlinked_count = sum(
+            len(rows)
+            for rows in self._current_aggregation.unlinked_by_channel.values()
+        )
+        warn = self._remote_refresh_warning or ""
+        base = f"마스터 {total_masters}개 · 미연결 채널상품 {unlinked_count}개"
+        self.summary_label.setText(f"{base}  |  ⚠ {warn}" if warn else base)
+
+    def _render_master_table(self) -> None:
+        if self._current_aggregation is None:
+            self.master_table.setRowCount(0)
+            return
+        masters = self._current_aggregation.masters
+        self.master_table.setSortingEnabled(False)
+        self.master_table.setRowCount(len(masters))
+        for row_idx, master_row in enumerate(masters):
+            self._populate_master_row(row_idx, master_row)
+        self.master_table.setSortingEnabled(True)
+
+    def _populate_master_row(self, row_idx: int, master_row: MasterProductRow) -> None:
+        master = master_row.master
+
+        image_label = QLabel()
+        image_label.setAlignment(Qt.AlignCenter)
+        image_label.setFixedSize(48, 48)
+        _assign_pixmap(image_label, master_row.image_url, 44, self._loader)
+        self.master_table.setCellWidget(row_idx, 0, image_label)
+
+        name_item = QTableWidgetItem(master.name)
+        name_item.setData(Qt.UserRole, master.id)
+        self.master_table.setItem(row_idx, 1, name_item)
+
+        cost_text = _format_price(master.unit_cost) if master.unit_cost is not None else "-"
+        self.master_table.setItem(row_idx, 2, _number_item(cost_text, master.unit_cost))
+        self.master_table.setItem(
+            row_idx, 3, _number_item(_format_price(master_row.naver_price), master_row.naver_price)
+        )
+        self.master_table.setItem(
+            row_idx, 4, _number_item(_format_price(master_row.coupang_price), master_row.coupang_price)
+        )
+        self.master_table.setItem(
+            row_idx, 5, _number_item(_format_int(master_row.naver_stock), master_row.naver_stock)
+        )
+        self.master_table.setItem(
+            row_idx, 6, _number_item(_format_int(master_row.coupang_stock), master_row.coupang_stock)
+        )
+        self.master_table.setItem(
+            row_idx, 7, _number_item(_format_int(master_row.total_stock), master_row.total_stock)
+        )
+        if master.unit_cost is not None and master_row.total_stock is not None:
+            stock_cost = int(master.unit_cost) * int(master_row.total_stock)
+        else:
+            stock_cost = None
+        self.master_table.setItem(
+            row_idx, 8, _number_item(_format_price(stock_cost), stock_cost)
+        )
+        self.master_table.setItem(
+            row_idx, 9, _number_item(_format_int(master_row.naver_today_sales), master_row.naver_today_sales)
+        )
+        self.master_table.setItem(
+            row_idx, 10, _number_item(_format_int(master_row.coupang_today_sales), master_row.coupang_today_sales)
+        )
+        self.master_table.setItem(
+            row_idx, 11, _number_item(_format_int(master_row.total_today_sales), master_row.total_today_sales)
+        )
+        self.master_table.setItem(
+            row_idx, 12, _number_item(_format_int(master_row.naver_sales), master_row.naver_sales)
+        )
+        self.master_table.setItem(
+            row_idx, 13, _number_item(_format_int(master_row.coupang_sales), master_row.coupang_sales)
+        )
+        self.master_table.setItem(
+            row_idx, 14, _number_item(_format_int(master_row.total_sales), master_row.total_sales)
+        )
+        link_count = len(master_row.linked)
+        self.master_table.setItem(row_idx, 15, _number_item(str(link_count), link_count))
+
+    # ------------------------------------------------------------------
+    # Table interaction
+    # ------------------------------------------------------------------
+
+    def _selected_master_id(self) -> Optional[int]:
+        rows = self.master_table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        name_item = self.master_table.item(rows[0].row(), 1)
+        if name_item is None:
+            return None
+        data = name_item.data(Qt.UserRole)
+        return int(data) if data is not None else None
+
+    def _on_row_double_clicked(self, _index) -> None:
+        master_id = self._selected_master_id()
+        if master_id is not None:
+            self._open_detail_dialog(master_id)
+
+    def _on_detail_button_clicked(self) -> None:
+        master_id = self._selected_master_id()
+        if master_id is None:
+            QMessageBox.information(self, "선택 필요", "먼저 테이블에서 마스터를 선택하세요.")
+            return
+        self._open_detail_dialog(master_id)
+
+    def _open_detail_dialog(self, master_id: int) -> None:
         if self._current_aggregation is None:
             return
-        master_row = (
-            self._find_master_row(self._current_master_id)
-            if self._current_master_id is not None
-            else None
+        dlg = MasterDetailDialog(
+            service=self.service,
+            loader=self._loader,
+            master_id=master_id,
+            aggregation=self._current_aggregation,
+            parent=self,
         )
-        if master_row and master_row.image_url == url:
-            self.detail_image.setPixmap(
-                pixmap.scaled(92, 92, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            )
-        # 마스터 테이블의 이미지 라벨 찾아 업데이트
+        dlg.changed.connect(self._on_dialog_changed)
+        dlg.exec()
+        # 다이얼로그 닫힘 — 최신 집계로 refresh
+        self.refresh()
+
+    def _on_dialog_changed(self) -> None:
+        self.masters_changed.emit()
+
+    # ------------------------------------------------------------------
+    # Create master
+    # ------------------------------------------------------------------
+
+    def _on_new_master(self) -> None:
+        # 상세 다이얼로그를 create 모드로 바로 연다. 이름 입력 후 Enter/저장.
+        if self._current_aggregation is None:
+            return
+        dlg = MasterDetailDialog(
+            service=self.service,
+            loader=self._loader,
+            master_id=None,
+            aggregation=self._current_aggregation,
+            parent=self,
+        )
+        dlg.changed.connect(self._on_dialog_changed)
+        dlg.exec()
+        self.refresh()
+
+    # ------------------------------------------------------------------
+    # Image async update
+    # ------------------------------------------------------------------
+
+    @Slot(str, object)
+    def _on_image_loaded(self, url: str, data) -> None:
+        pm = self._loader.accept_loaded(url, data)
+        if pm is None or self._current_aggregation is None:
+            return
+        # 테이블 내 해당 URL 참조 행 업데이트
         for row in range(self.master_table.rowCount()):
             widget = self.master_table.cellWidget(row, 0)
             if not isinstance(widget, QLabel):
@@ -757,20 +856,28 @@ class ProductMasterTab(QWidget):
             if name_item is None:
                 continue
             master_id = int(name_item.data(Qt.UserRole) or 0)
-            mrow = self._find_master_row(master_id)
-            if mrow and mrow.image_url == url:
+            mr = self._find_master_row(master_id)
+            if mr and mr.image_url == url:
                 widget.setPixmap(
-                    pixmap.scaled(44, 44, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    pm.scaled(44, 44, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 )
+
+    def _find_master_row(self, master_id: int) -> Optional[MasterProductRow]:
+        if self._current_aggregation is None:
+            return None
+        for mr in self._current_aggregation.masters:
+            if mr.master.id == master_id:
+                return mr
+        return None
 
     # ------------------------------------------------------------------
     # External API
     # ------------------------------------------------------------------
 
     def open_master_for_channel(self, channel: str, product_key: str) -> None:
-        """채널 탭에서 링크 직후 호출 — 해당 링크의 마스터로 포커스 이동."""
+        """채널 탭에서 링크 직후 호출 — 해당 마스터 상세 팝업 띄움."""
         link = self.service.get_link(channel, product_key)
         if link is None:
             return
-        self._current_master_id = link.master_id
         self.refresh()
+        self._open_detail_dialog(link.master_id)

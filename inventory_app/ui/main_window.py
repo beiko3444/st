@@ -1371,30 +1371,20 @@ class ChannelTab(QWidget):
             master_id = option_to_master[pick]
             master_label = pick
 
-        # 각 row 에 대해 multiplier 입력
+        # 배수는 기본 1 로 자동 연결. 수정 필요하면 상품등록 탭 상세 팝업에서 변경.
+        # 기존 링크가 있으면 해당 multiplier 유지.
         linked_count = 0
         for row in rows:
-            current = self.master_link_map.get(product_identity_key(row))
-            existing_link = self.master_service.get_link(self.channel_code, product_identity_key(row))
-            default_mult = existing_link.multiplier if existing_link else 1
-            value, mok = QInputDialog.getInt(
-                self,
-                f"배수 입력 — {master_label}",
-                f"[{self._display_name(row)}]\n"
-                "채널 상품 1건이 마스터 몇 단위?",
-                max(1, int(default_mult)),
-                1,
-                10_000,
-                1,
+            existing_link = self.master_service.get_link(
+                self.channel_code, product_identity_key(row)
             )
-            if not mok:
-                continue
+            multiplier = existing_link.multiplier if existing_link else 1
             try:
                 self.master_service.link(
                     self.channel_code,
                     product_identity_key(row),
                     master_id,
-                    multiplier=int(value),
+                    multiplier=int(multiplier),
                 )
             except MasterRemoteError as exc:
                 QMessageBox.critical(self, "파이 서버 오류", f"연결 실패: {exc}")
@@ -3250,14 +3240,27 @@ class KeywordRevenueTab(QWidget):
 
 
 class SalesDailyTab(QWidget):
-    """판매일보 탭 — 캘린더에서 날짜 클릭 시 해당 일자 판매 내역을 표시."""
+    """판매일보 탭 — 캘린더에서 날짜 클릭 시 해당 일자 판매 내역을 마스터 단위로 집계.
+
+    마스터 기준 행:
+    - 채널 상품의 qty_sold × link.multiplier 를 합산 (마스터 단위로 환산)
+    - 채널별 (네이버/쿠팡) 소계 + 추정매출 표시
+    - 총 판매수량 내림차순 정렬 ("재고 빠진 순")
+    - 마스터에 연결되지 않은 이벤트는 하단 "미연결" 섹션에 따로
+    """
 
     image_downloaded = Signal(str, object)
 
-    def __init__(self, monitor_url: str | None = None, timeout: int = 30) -> None:
+    def __init__(
+        self,
+        monitor_url: str | None = None,
+        timeout: int = 30,
+        cache: ChannelProductCache | None = None,
+    ) -> None:
         super().__init__()
         self.monitor_url = monitor_url
         self.timeout = timeout
+        self.cache = cache or ChannelProductCache()
         self._loaded_once = False
         self.image_cache: dict[str, QPixmap] = {}
         self._image_pending: set[str] = set()
@@ -3288,20 +3291,29 @@ class SalesDailyTab(QWidget):
         left.addStretch(1)
         layout.addLayout(left, 0)
 
-        # 오른쪽: 판매 테이블
+        # 오른쪽: 마스터 단위 판매 집계 테이블
         right = QVBoxLayout()
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["이미지", "상품명", "채널", "판매수량", "단가", "추정매출", "시각"]
+            [
+                "이미지",
+                "마스터 상품",
+                "총판매",
+                "네이버",
+                "쿠팡",
+                "추정매출",
+                "비고",
+            ]
         )
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Fixed)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
-        for c, w in [(0, 52), (2, 60), (3, 72), (4, 80), (5, 90), (6, 130)]:
+        for c, w in [(0, 56), (2, 84), (3, 80), (4, 80), (5, 110), (6, 120)]:
             self.table.setColumnWidth(c, w)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
+        self.table.setSortingEnabled(False)  # 이미 정렬해 넣음 (재고 빠진 순)
         right.addWidget(self.table, 1)
         layout.addLayout(right, 1)
 
@@ -3470,81 +3482,168 @@ class SalesDailyTab(QWidget):
             self.summary_label.setText(f"조회 실패: {e}")
             return
 
-        summary = data.get("summary", {})
         sales = data.get("sales", [])
 
-        # 채널별 분리 집계
-        naver_qty = sum(s.get("qty_sold", 0) for s in sales if s.get("channel") == "naver")
-        coupang_qty = sum(s.get("qty_sold", 0) for s in sales if s.get("channel") == "coupang")
-        naver_rev = sum(
-            s.get("qty_sold", 0) * s["price"] for s in sales
-            if s.get("channel") == "naver" and s.get("price")
-        )
-        coupang_rev = sum(
-            s.get("qty_sold", 0) * s["price"] for s in sales
-            if s.get("channel") == "coupang" and s.get("price")
-        )
-        total_qty = naver_qty + coupang_qty
-        total_rev = naver_rev + coupang_rev
+        # 마스터/링크 로드 (각 이벤트를 마스터로 귀속)
+        try:
+            links = self.cache.load_all_links()
+            masters_by_id = {m.id: m for m in self.cache.list_masters()}
+        except Exception:  # noqa: BLE001
+            links = {}
+            masters_by_id = {}
 
-        naver_line = f"네이버: <b>{naver_qty}건</b> / ₩{naver_rev:,.0f}" if naver_qty else ""
-        coupang_line = f"쿠팡: <b>{coupang_qty}건</b> / ₩{coupang_rev:,.0f}" if coupang_qty else ""
-        channel_lines = "<br>".join(l for l in [naver_line, coupang_line] if l) or "판매 없음"
+        # 마스터별 집계 + 미연결 버킷
+        agg: dict[int, dict] = {}
+        unlinked: list[dict] = []
+        for event in sales:
+            if not isinstance(event, dict):
+                continue
+            channel = str(event.get("channel") or "").strip().lower()
+            pid = str(event.get("product_id") or "").strip()
+            iid_raw = event.get("item_id")
+            iid = str(iid_raw) if iid_raw not in (None, "") else ""
+            product_key = f"id:{pid}|item:{iid}" if pid else ""
+            qty = int(event.get("qty_sold") or 0)
+            price = event.get("price")
+            try:
+                price_val = int(price) if price is not None else 0
+            except (TypeError, ValueError):
+                price_val = 0
+            revenue = qty * price_val
 
-        self.summary_label.setText(
-            f"<b>{date_str} 판매일보</b><br>"
-            f"{channel_lines}<br>"
-            f"─────────────<br>"
-            f"합계: <b>{total_qty}건</b> / ₩{total_rev:,.0f}"
+            link = links.get((channel, product_key))
+            if link is None or link.master_id not in masters_by_id:
+                unlinked.append({
+                    "channel": channel,
+                    "name": event.get("name") or product_key or "(미상)",
+                    "qty": qty,
+                    "revenue": revenue,
+                })
+                continue
+            multiplier = max(1, int(link.multiplier))
+            master_qty_delta = qty * multiplier
+            entry = agg.setdefault(
+                link.master_id,
+                {
+                    "naver_qty": 0,
+                    "coupang_qty": 0,
+                    "revenue": 0,
+                    "sample_image": None,
+                    "sample_name": None,
+                },
+            )
+            if channel == "naver":
+                entry["naver_qty"] += master_qty_delta
+            elif channel == "coupang":
+                entry["coupang_qty"] += master_qty_delta
+            entry["revenue"] += revenue
+            if not entry["sample_image"]:
+                entry["sample_image"] = event.get("image_url")
+            if not entry["sample_name"]:
+                entry["sample_name"] = event.get("name")
+
+        # 정렬: 총 판매수량 내림차순
+        rows: list[tuple[int, dict, int]] = []
+        for master_id, data_row in agg.items():
+            total = data_row["naver_qty"] + data_row["coupang_qty"]
+            rows.append((master_id, data_row, total))
+        rows.sort(key=lambda t: (-t[2], masters_by_id[t[0]].name))
+
+        total_qty = sum(t[2] for t in rows)
+        total_revenue = sum(t[1]["revenue"] for t in rows)
+        unlinked_qty = sum(u["qty"] for u in unlinked)
+        unlinked_revenue = sum(u["revenue"] for u in unlinked)
+
+        lines = [f"<b>{date_str} 판매일보 (마스터 단위)</b>"]
+        lines.append(
+            f"마스터 {len(rows)}개 · 총 <b>{total_qty:,}건</b> / ₩{total_revenue:,.0f}"
         )
+        if unlinked:
+            lines.append(
+                f"미연결 {len(unlinked)}건 · {unlinked_qty:,}수량 / ₩{unlinked_revenue:,.0f}"
+            )
+        self.summary_label.setText("<br>".join(lines))
 
-        # 테이블
-        self.table.setRowCount(len(sales))
+        # 테이블 렌더
+        total_rows = len(rows) + (len(unlinked) if unlinked else 0)
+        self.table.setRowCount(total_rows)
         token = self.render_token
-        for i, s in enumerate(sales):
-            self.table.setRowHeight(i, 50)
-
+        row_idx = 0
+        for master_id, data_row, total in rows:
+            self.table.setRowHeight(row_idx, 50)
+            master = masters_by_id[master_id]
             # 이미지
+            img_url = data_row["sample_image"]
             img_container = ClickableImageContainer()
             img_label = ProductImageLabel()
-            img_url = s.get("image_url")
-            product_url = self._sale_product_url(s)
-            img_label.set_product_url(product_url)
             img_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-            img_container.set_product_url(product_url)
-            img_container.clicked.connect(self._open_sale_product_page)
             img_layout = QHBoxLayout(img_container)
             img_layout.setContentsMargins(3, 3, 3, 3)
             img_layout.setSpacing(0)
             img_layout.addWidget(img_label, 0, Qt.AlignCenter)
             if img_url:
                 self._request_image(img_label, img_url, token)
-            self.table.setCellWidget(i, 0, img_container)
+            self.table.setCellWidget(row_idx, 0, img_container)
 
-            # 상품명
-            name = s.get("name", "")
-            ch = "N" if s.get("channel") == "naver" else "C"
-            qty = s.get("qty_sold", 0)
-            price = s.get("price")
-            rev = (qty * price) if price else None
-            recorded = s.get("recorded_at", "")
-            time_part = recorded[11:16] if len(recorded) >= 16 else recorded
-
-            items = [
-                (1, name, name),
-                (2, ch, ch),
-                (3, f"{qty}", qty),
-                (4, f"₩{price:,}" if price else "-", price or 0),
-                (5, f"₩{rev:,}" if rev else "-", rev or 0),
-                (6, time_part, recorded),
-            ]
-            for col, text, sort_val in items:
-                item = SortableTableItem(text)
+            def _mk_num(text: str, sort_val) -> QTableWidgetItem:
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 item.setData(Qt.UserRole, sort_val)
-                item.setTextAlignment(Qt.AlignCenter if col != 1 else Qt.AlignVCenter | Qt.AlignLeft)
-                self.table.setItem(i, col, item)
+                return item
 
-        self.table.setSortingEnabled(True)
+            name_item = QTableWidgetItem(master.name)
+            name_item.setData(Qt.UserRole, master.id)
+            self.table.setItem(row_idx, 1, name_item)
+            self.table.setItem(row_idx, 2, _mk_num(f"{total:,}", total))
+            self.table.setItem(
+                row_idx, 3,
+                _mk_num(f"{data_row['naver_qty']:,}" if data_row['naver_qty'] else "-", data_row['naver_qty']),
+            )
+            self.table.setItem(
+                row_idx, 4,
+                _mk_num(f"{data_row['coupang_qty']:,}" if data_row['coupang_qty'] else "-", data_row['coupang_qty']),
+            )
+            self.table.setItem(
+                row_idx, 5,
+                _mk_num(f"₩{data_row['revenue']:,}" if data_row['revenue'] else "-", data_row['revenue']),
+            )
+            self.table.setItem(row_idx, 6, QTableWidgetItem(""))
+            row_idx += 1
+
+        # 미연결 섹션 (옅은 배경 + 비고 표시)
+        for u in unlinked:
+            self.table.setRowHeight(row_idx, 44)
+            self.table.setCellWidget(row_idx, 0, QWidget())
+            ch_label = "네이버" if u["channel"] == "naver" else ("쿠팡" if u["channel"] == "coupang" else u["channel"])
+            name_item = QTableWidgetItem(str(u["name"] or ""))
+            name_item.setForeground(QColor("#dc2626"))
+            self.table.setItem(row_idx, 1, name_item)
+
+            def _mk_num2(text: str, sort_val) -> QTableWidgetItem:
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                item.setData(Qt.UserRole, sort_val)
+                item.setForeground(QColor("#dc2626"))
+                return item
+
+            qty_val = u["qty"]
+            self.table.setItem(row_idx, 2, _mk_num2(f"{qty_val:,}", qty_val))
+            self.table.setItem(
+                row_idx, 3,
+                _mk_num2(f"{qty_val:,}" if u["channel"] == "naver" else "-", qty_val if u["channel"] == "naver" else 0),
+            )
+            self.table.setItem(
+                row_idx, 4,
+                _mk_num2(f"{qty_val:,}" if u["channel"] == "coupang" else "-", qty_val if u["channel"] == "coupang" else 0),
+            )
+            self.table.setItem(
+                row_idx, 5,
+                _mk_num2(f"₩{u['revenue']:,}" if u['revenue'] else "-", u['revenue']),
+            )
+            note_item = QTableWidgetItem(f"미연결 ({ch_label})")
+            note_item.setForeground(QColor("#dc2626"))
+            self.table.setItem(row_idx, 6, note_item)
+            row_idx += 1
 
     def _request_image(self, label: QLabel, url: str, token: int) -> None:
         normalized = url.strip()
@@ -3656,6 +3755,7 @@ class MainWindow(QMainWindow):
         self.sales_daily_tab = SalesDailyTab(
             monitor_url=config.monitor_url,
             timeout=config.timeout_seconds,
+            cache=self.product_master_tab.cache,
         )
         self.revenue_tab = RevenueTab(
             fetch_fn=self.revenue_service.fetch,

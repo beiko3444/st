@@ -348,6 +348,73 @@ class InventoryHistoryDB:
             ]
             return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
+    def get_sales_totals_rolling(self, days: int = 30) -> List[dict]:
+        """최근 N일간 (오늘 포함) 재고차감 이벤트를 SKU 단위로 합산.
+
+        반환: [{channel, product_id, item_id, qty_sold}, ...]
+        - qty_sold 는 get_sales_for_date 와 동일한 diff 로직을 N일로 확장
+        - qty_sold == 0 인 SKU 는 제외
+        """
+        n = max(1, int(days))
+        with self._guard, self._connection() as conn:
+            cursor = conn.execute(
+                """
+                WITH pairs AS (
+                    SELECT
+                        a.channel,
+                        a.product_id,
+                        a.item_id,
+                        CASE
+                            WHEN a.channel = 'naver'
+                                 AND a.today_sales IS NOT NULL
+                            THEN CASE
+                                WHEN b.today_sales IS NOT NULL
+                                     AND DATE(b.recorded_at) = DATE(a.recorded_at)
+                                THEN MAX(0, a.today_sales - b.today_sales)
+                                ELSE MAX(0, a.today_sales)
+                            END
+                            WHEN a.channel = 'coupang'
+                                 AND a.sales IS NOT NULL
+                                 AND b.sales IS NOT NULL
+                            THEN MAX(0, a.sales - b.sales)
+                            WHEN a.stock IS NOT NULL
+                                 AND b.stock IS NOT NULL
+                            THEN (b.stock - a.stock)
+                            ELSE 0
+                        END AS qty_sold
+                    FROM inventory_history a
+                    JOIN inventory_history b
+                        ON a.channel = b.channel
+                        AND a.product_id = b.product_id
+                        AND (a.item_id = b.item_id OR (a.item_id IS NULL AND b.item_id IS NULL))
+                        AND b.id = (
+                            SELECT MAX(id) FROM inventory_history c
+                            WHERE c.channel = a.channel
+                              AND c.product_id = a.product_id
+                              AND (c.item_id = a.item_id OR (c.item_id IS NULL AND a.item_id IS NULL))
+                              AND c.id < a.id
+                        )
+                    WHERE DATE(a.recorded_at) >= DATE('now', 'localtime', ?)
+                )
+                SELECT channel, product_id, item_id, SUM(qty_sold) AS qty
+                FROM pairs
+                WHERE qty_sold > 0
+                GROUP BY channel, product_id, item_id
+                HAVING qty > 0
+                """,
+                (f'-{n - 1} days',),
+            )
+            cols = ["channel", "product_id", "item_id", "qty_sold"]
+            return [
+                {
+                    "channel": row[0],
+                    "product_id": row[1],
+                    "item_id": row[2],
+                    "qty_sold": int(row[3] or 0),
+                }
+                for row in cursor.fetchall()
+            ]
+
     def get_sales_dates(self) -> dict[str, int]:
         """판매(재고 감소)가 있었던 날짜별 건수 반환. {'2026-04-08': 5, ...}"""
         with self._guard, self._connection() as conn:
