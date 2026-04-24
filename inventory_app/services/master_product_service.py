@@ -104,6 +104,17 @@ def _accumulate(
     return int(current or 0) + int(addition or 0)
 
 
+def build_master_service(
+    cache: Optional[ChannelProductCache] = None,
+    monitor_url: Optional[str] = None,
+) -> "MasterProductService":
+    """monitor_url 이 있으면 Pi write-through 모드, 없으면 로컬 단독 모드."""
+    remote = None
+    if monitor_url and str(monitor_url).strip():
+        remote = MasterRemoteClient(str(monitor_url).strip())
+    return MasterProductService(cache=cache, remote=remote)
+
+
 class MasterProductService:
     """마스터 상품 + 채널 링크 기반 집계 서비스.
 

@@ -43,7 +43,9 @@ from inventory_app.services.master_product_service import (
     MasterAggregation,
     MasterProductRow,
     MasterProductService,
+    build_master_service,
 )
+from inventory_app.services.master_remote_client import MasterRemoteError
 from inventory_app.services.shared_stock_grouping import product_identity_key
 
 
@@ -99,10 +101,18 @@ class ProductMasterTab(QWidget):
 
     masters_changed = Signal()
 
-    def __init__(self, cache: Optional[ChannelProductCache] = None) -> None:
+    def __init__(
+        self,
+        cache: Optional[ChannelProductCache] = None,
+        monitor_url: Optional[str] = None,
+    ) -> None:
         super().__init__()
         self.cache = cache or ChannelProductCache()
-        self.service = MasterProductService(cache=self.cache)
+        self.monitor_url = (str(monitor_url).strip() if monitor_url else "")
+        self.service = build_master_service(
+            cache=self.cache, monitor_url=self.monitor_url
+        )
+        self._remote_refresh_warning: str = ""
 
         self._current_aggregation: MasterAggregation | None = None
         self._current_master_id: int | None = None
@@ -254,7 +264,15 @@ class ProductMasterTab(QWidget):
     # ------------------------------------------------------------------
 
     def refresh(self) -> None:
-        """캐시에서 모든 마스터 + 링크 + 채널 raw rows 를 다시 읽어 집계."""
+        """Pi 에서 마스터/링크 최신 상태 fetch 후 채널 raw rows 와 집계.
+        Pi 실패 시 로컬 캐시 기반으로 진행하고 요약 영역에 경고를 남긴다.
+        """
+        self._remote_refresh_warning = ""
+        if self.service.has_remote():
+            try:
+                self.service.refresh_from_remote()
+            except MasterRemoteError as exc:
+                self._remote_refresh_warning = f"Pi 동기화 실패 (로컬 캐시 사용): {exc}"
         rows_by_channel: Dict[str, List[ChannelProduct]] = {
             "naver": self.cache.load_rows("naver"),
             "coupang": self.cache.load_rows("coupang"),
@@ -277,9 +295,12 @@ class ProductMasterTab(QWidget):
             len(rows)
             for rows in self._current_aggregation.unlinked_by_channel.values()
         )
-        self.summary_label.setText(
-            f"마스터 {total_masters}개 · 미연결 채널상품 {unlinked_count}개"
-        )
+        warn = getattr(self, "_remote_refresh_warning", "") or ""
+        base = f"마스터 {total_masters}개 · 미연결 채널상품 {unlinked_count}개"
+        if warn:
+            self.summary_label.setText(f"{base}  |  ⚠ {warn}")
+        else:
+            self.summary_label.setText(base)
 
     def _render_master_table(self) -> None:
         if self._current_aggregation is None:
@@ -516,6 +537,9 @@ class ProductMasterTab(QWidget):
         except ValueError as exc:
             QMessageBox.warning(self, "실패", str(exc))
             return
+        except MasterRemoteError as exc:
+            QMessageBox.critical(self, "파이 서버 오류", f"마스터 생성 실패: {exc}")
+            return
         self._current_master_id = master.id
         self.refresh()
         self.masters_changed.emit()
@@ -552,6 +576,9 @@ class ProductMasterTab(QWidget):
         except ValueError as exc:
             QMessageBox.warning(self, "실패", str(exc))
             return
+        except MasterRemoteError as exc:
+            QMessageBox.critical(self, "파이 서버 오류", f"마스터 수정 실패: {exc}")
+            return
         self.refresh()
         self.masters_changed.emit()
 
@@ -567,7 +594,11 @@ class ProductMasterTab(QWidget):
         )
         if reply != QMessageBox.Yes:
             return
-        self.service.delete_master(self._current_master_id)
+        try:
+            self.service.delete_master(self._current_master_id)
+        except MasterRemoteError as exc:
+            QMessageBox.critical(self, "파이 서버 오류", f"마스터 삭제 실패: {exc}")
+            return
         self._current_master_id = None
         self.refresh()
         self.masters_changed.emit()
@@ -588,14 +619,24 @@ class ProductMasterTab(QWidget):
         )
         if not ok:
             return
-        self.service.set_multiplier(channel, product_key, int(value))
+        try:
+            self.service.set_multiplier(channel, product_key, int(value))
+        except MasterRemoteError as exc:
+            QMessageBox.critical(self, "파이 서버 오류", f"배수 변경 실패: {exc}")
+            return
         self.refresh()
         self.masters_changed.emit()
 
     def _on_set_representative(self, channel: str, product_key: str) -> None:
         if self._current_master_id is None:
             return
-        self.service.set_representative(self._current_master_id, channel, product_key)
+        try:
+            self.service.set_representative(
+                self._current_master_id, channel, product_key
+            )
+        except MasterRemoteError as exc:
+            QMessageBox.critical(self, "파이 서버 오류", f"대표 지정 실패: {exc}")
+            return
         self.refresh()
         self.masters_changed.emit()
 
@@ -605,7 +646,11 @@ class ProductMasterTab(QWidget):
         )
         if reply != QMessageBox.Yes:
             return
-        self.service.unlink(channel, product_key)
+        try:
+            self.service.unlink(channel, product_key)
+        except MasterRemoteError as exc:
+            QMessageBox.critical(self, "파이 서버 오류", f"연결 해제 실패: {exc}")
+            return
         self.refresh()
         self.masters_changed.emit()
 

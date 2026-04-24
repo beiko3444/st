@@ -53,7 +53,11 @@ from inventory_app.services.keyword_services import (
     NaverKeywordRevenueService,
 )
 from inventory_app.services.local_cache import ChannelProductCache
-from inventory_app.services.master_product_service import MasterProductService
+from inventory_app.services.master_product_service import (
+    MasterProductService,
+    build_master_service,
+)
+from inventory_app.services.master_remote_client import MasterRemoteError
 from inventory_app.services.shared_stock_grouping import product_identity_key
 from inventory_app.services.revenue_services import (
     RevenueChannelSummary,
@@ -305,7 +309,9 @@ class ChannelTab(QWidget):
         self.rows: List[ChannelProduct] = []
         self.filtered_rows: List[ChannelProduct] = []
         self.cache = ChannelProductCache()
-        self.master_service = MasterProductService(cache=self.cache)
+        self.master_service = build_master_service(
+            cache=self.cache, monitor_url=self.monitor_url
+        )
         self.favorite_keys: set[str] = self.cache.load_favorite_keys(self.channel_name)
         self.name_overrides = self.cache.load_name_overrides(self.channel_name)
         # product_key -> master_id (이 채널에 속한 링크만)
@@ -1356,6 +1362,9 @@ class ChannelTab(QWidget):
             except ValueError as exc:
                 QMessageBox.warning(self, "실패", str(exc))
                 return
+            except MasterRemoteError as exc:
+                QMessageBox.critical(self, "파이 서버 오류", f"마스터 생성 실패: {exc}")
+                return
             master_id = new_master.id
             master_label = f"#{new_master.id} · {new_master.name}"
         else:
@@ -1380,12 +1389,16 @@ class ChannelTab(QWidget):
             )
             if not mok:
                 continue
-            self.master_service.link(
-                self.channel_code,
-                product_identity_key(row),
-                master_id,
-                multiplier=int(value),
-            )
+            try:
+                self.master_service.link(
+                    self.channel_code,
+                    product_identity_key(row),
+                    master_id,
+                    multiplier=int(value),
+                )
+            except MasterRemoteError as exc:
+                QMessageBox.critical(self, "파이 서버 오류", f"연결 실패: {exc}")
+                break
             linked_count += 1
 
         if linked_count == 0:
@@ -1406,7 +1419,13 @@ class ChannelTab(QWidget):
         for row in rows:
             if not self.is_row_linked(row):
                 continue
-            self.master_service.unlink(self.channel_code, product_identity_key(row))
+            try:
+                self.master_service.unlink(
+                    self.channel_code, product_identity_key(row)
+                )
+            except MasterRemoteError as exc:
+                QMessageBox.critical(self, "파이 서버 오류", f"연결 해제 실패: {exc}")
+                break
             unlinked += 1
         if unlinked == 0:
             return
@@ -3632,7 +3651,7 @@ class MainWindow(QMainWindow):
             monitor_url=config.monitor_url,
             timeout_seconds=config.timeout_seconds,
         )
-        self.product_master_tab = ProductMasterTab()
+        self.product_master_tab = ProductMasterTab(monitor_url=config.monitor_url)
         self.inventory_tab = InventoryManagementTab()
         self.sales_daily_tab = SalesDailyTab(
             monitor_url=config.monitor_url,
