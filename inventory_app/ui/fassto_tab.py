@@ -1,22 +1,34 @@
 """파스토 풀필먼트 운영 콘솔 탭.
 
-기존 main_window.py의 탭 패턴을 따라 단일 QWidget으로 구성합니다.
-내부에 5개 서브탭 (개요/상품/재고/입고/출고)을 가집니다.
+서브탭 구성:
+  - 개요
+  - 상품 (마진/검색/CSV)
+  - 세트상품 (부모-자식 2단)
+  - 재고 (안전재고 경보, 하이라이트)
+  - 입고 (날짜 프리셋, 상세 품목)
+  - 출고 (상태 색상, 상세 품목)
+  - 택배출고 (지연/배송누락 강조)
+  - 매출 상세 (요약 + TOP 상품 + 일별 추이)
 
-네트워크 호출은 모두 QThread 워커(FasstoJob)로 위임하여 UI를 블록하지 않습니다.
+모든 네트워크 호출은 QThread 워커(FasstoJob)로 위임합니다.
+모든 테이블은 숫자 정렬 지원(SortableItem), CSV 내보내기 제공.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import csv
+from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QDate, QObject, QThread, Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDateEdit,
+    QFileDialog,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -26,6 +38,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSplitter,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -38,10 +51,19 @@ from inventory_app.config import AppConfig
 from inventory_app.connectors.fassto import (
     FasstoApiError,
     FasstoConnector,
+    FasstoDeliveryGoodDetailRow,
+    FasstoGoodsElementRow,
+    FasstoGoodsRow,
+    FasstoStockRow,
     extract_fassto_list,
     normalize_fassto_deliveries,
+    normalize_fassto_delivery_good_details,
+    normalize_fassto_delivery_parcels,
     normalize_fassto_goods,
+    normalize_fassto_goods_elements,
     normalize_fassto_stocks,
+    normalize_fassto_warehousings,
+    summarize_delivery_good_details,
 )
 
 
@@ -58,9 +80,7 @@ class JobResult:
 
 
 class FasstoJob(QObject):
-    """QThread 안에서 돌릴 단일 호출 워커."""
-
-    finished = Signal(object)  # JobResult
+    finished = Signal(object)
 
     def __init__(self, func: Callable[[], Any]) -> None:
         super().__init__()
@@ -104,18 +124,104 @@ def _run_async(
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Formatting / color
 # ---------------------------------------------------------------------------
 
 
 def _fmt_api_date(d: date) -> str:
-    """Fassto API 는 경로 파라미터에 YYYY-MM-DD 형식을 요구 (Swagger 스펙)."""
     return d.strftime("%Y-%m-%d")
 
 
-def _default_range() -> tuple[date, date]:
+def _month_range() -> tuple[date, date]:
     today = date.today()
-    return today - timedelta(days=7), today
+    return today - timedelta(days=30), today
+
+
+def _fmt_num(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if f == int(f):
+        return f"{int(f):,}"
+    return f"{f:,.2f}"
+
+
+def _fmt_money(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return f"{int(round(f)):,}"
+
+
+def _fmt_yyyymmdd(value: Any) -> str:
+    s = str(value or "").strip()
+    if len(s) == 8 and s.isdigit():
+        return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+    return s
+
+
+# Colors
+_BG_DANGER = QColor(255, 220, 220)
+_BG_WARN = QColor(255, 240, 205)
+_BG_OK = QColor(225, 245, 225)
+_BG_INFO = QColor(225, 235, 255)
+_FG_DANGER = QColor(180, 0, 0)
+_FG_WARN = QColor(170, 110, 0)
+_FG_OK = QColor(0, 115, 50)
+_FG_MUTED = QColor(120, 120, 120)
+
+
+# ---------------------------------------------------------------------------
+# Table helpers: Cell + SortableItem + _fill_table + CSV export
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Cell:
+    """Enhanced cell: text + optional numeric sort key + optional colors."""
+
+    text: str = ""
+    sort_key: Any = None
+    fg: Optional[QColor] = None
+    bg: Optional[QColor] = None
+    align: Optional[int] = None
+
+
+class _SortableItem(QTableWidgetItem):
+    """Sort by UserRole numeric value if present, else fallback to string."""
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        a = self.data(Qt.UserRole)
+        b = other.data(Qt.UserRole)
+        if a is not None and b is not None:
+            try:
+                return float(a) < float(b)
+            except (TypeError, ValueError):
+                pass
+        return super().__lt__(other)
+
+
+def _make_item(value: Any) -> QTableWidgetItem:
+    if isinstance(value, Cell):
+        item = _SortableItem(value.text)
+        if value.sort_key is not None:
+            item.setData(Qt.UserRole, value.sort_key)
+        if value.fg is not None:
+            item.setForeground(value.fg)
+        if value.bg is not None:
+            item.setBackground(value.bg)
+        if value.align is not None:
+            item.setTextAlignment(value.align)
+    else:
+        item = QTableWidgetItem("" if value is None else str(value))
+    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+    return item
 
 
 def _fill_table(
@@ -123,16 +229,137 @@ def _fill_table(
     headers: Sequence[str],
     rows: Sequence[Sequence[Any]],
 ) -> None:
+    was_sorting = table.isSortingEnabled()
+    table.setSortingEnabled(False)
     table.clear()
     table.setColumnCount(len(headers))
     table.setHorizontalHeaderLabels(list(headers))
     table.setRowCount(len(rows))
     for r, row in enumerate(rows):
         for c, value in enumerate(row):
-            item = QTableWidgetItem("" if value is None else str(value))
-            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-            table.setItem(r, c, item)
+            table.setItem(r, c, _make_item(value))
     table.resizeColumnsToContents()
+    table.setSortingEnabled(was_sorting)
+
+
+def _num_cell(value: float, formatter: Callable[[Any], str] = _fmt_num, **kw: Any) -> Cell:
+    return Cell(text=formatter(value), sort_key=float(value or 0), **kw)
+
+
+def _export_table_to_csv(
+    table: QTableWidget, parent: QWidget, default_name: str
+) -> None:
+    if table.rowCount() == 0:
+        QMessageBox.information(parent, "안내", "저장할 데이터가 없습니다. 먼저 조회하세요.")
+        return
+    path, _ = QFileDialog.getSaveFileName(
+        parent,
+        "CSV 저장",
+        f"{default_name}_{date.today().isoformat()}.csv",
+        "CSV Files (*.csv)",
+    )
+    if not path:
+        return
+    try:
+        headers = []
+        for c in range(table.columnCount()):
+            h = table.horizontalHeaderItem(c)
+            headers.append(h.text() if h else "")
+        # Excel 한글 호환을 위해 utf-8-sig
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(headers)
+            for r in range(table.rowCount()):
+                row = []
+                for c in range(table.columnCount()):
+                    item = table.item(r, c)
+                    row.append(item.text() if item else "")
+                w.writerow(row)
+        QMessageBox.information(
+            parent, "저장 완료", f"{path}\n{table.rowCount()}건 저장"
+        )
+    except Exception as exc:  # noqa: BLE001
+        QMessageBox.warning(parent, "저장 실패", str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Date presets + range validation
+# ---------------------------------------------------------------------------
+
+
+class _DatePresetBar(QWidget):
+    """오늘/7일/30일/당월/지난달 빠른 선택 버튼."""
+
+    def __init__(self, start_edit: QDateEdit, end_edit: QDateEdit) -> None:
+        super().__init__()
+        self._start = start_edit
+        self._end = end_edit
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        for label, handler in [
+            ("오늘", self._today),
+            ("7일", self._seven),
+            ("30일", self._thirty),
+            ("당월", self._current_month),
+            ("지난달", self._last_month),
+        ]:
+            btn = QPushButton(label)
+            btn.setFixedWidth(56)
+            btn.clicked.connect(handler)
+            row.addWidget(btn)
+
+    def _set(self, s: date, e: date) -> None:
+        self._start.setDate(QDate(s.year, s.month, s.day))
+        self._end.setDate(QDate(e.year, e.month, e.day))
+
+    def _today(self) -> None:
+        today = date.today()
+        self._set(today, today)
+
+    def _seven(self) -> None:
+        today = date.today()
+        self._set(today - timedelta(days=6), today)
+
+    def _thirty(self) -> None:
+        today = date.today()
+        self._set(today - timedelta(days=29), today)
+
+    def _current_month(self) -> None:
+        today = date.today()
+        self._set(today.replace(day=1), today)
+
+    def _last_month(self) -> None:
+        today = date.today()
+        first_this = today.replace(day=1)
+        last_prev = first_this - timedelta(days=1)
+        first_prev = last_prev.replace(day=1)
+        self._set(first_prev, last_prev)
+
+
+def _normalize_range(
+    start_edit: QDateEdit, end_edit: QDateEdit, parent: QWidget
+) -> Optional[Tuple[str, str]]:
+    """start>end면 스왑 확인. 반환값 None이면 취소."""
+    s = start_edit.date().toPython()
+    e = end_edit.date().toPython()
+    if s > e:
+        btn = QMessageBox.question(
+            parent,
+            "날짜 범위 확인",
+            f"시작일({s})이 종료일({e})보다 뒤입니다. 자동으로 바꿀까요?",
+        )
+        if btn != QMessageBox.Yes:
+            return None
+        start_edit.setDate(QDate(e.year, e.month, e.day))
+        end_edit.setDate(QDate(s.year, s.month, s.day))
+        s, e = e, s
+    return _fmt_api_date(s), _fmt_api_date(e)
+
+
+# ---------------------------------------------------------------------------
+# Error formatting
+# ---------------------------------------------------------------------------
 
 
 def _format_fassto_error(error: str | None, details: Any = None) -> str:
@@ -166,6 +393,58 @@ def _format_fassto_error(error: str | None, details: Any = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Business color helpers
+# ---------------------------------------------------------------------------
+
+
+def _goods_margin_cell(sal_pr: float, in_pr: float) -> Cell:
+    """마진율% 셀: 낮을수록 빨강/주황."""
+    if sal_pr <= 0:
+        return Cell(text="")
+    margin = (sal_pr - in_pr) / sal_pr * 100.0
+    text = f"{margin:.1f}%"
+    if margin < 0:
+        return Cell(text=text, sort_key=margin, fg=_FG_DANGER, bg=_BG_DANGER)
+    if margin < 20:
+        return Cell(text=text, sort_key=margin, fg=_FG_DANGER)
+    if margin < 30:
+        return Cell(text=text, sort_key=margin, fg=_FG_WARN)
+    return Cell(text=text, sort_key=margin, fg=_FG_OK)
+
+
+def _stock_alert_cells(
+    can_stock: float, safety: float
+) -> Tuple[str, Optional[QColor], Optional[QColor]]:
+    """(라벨, fg, bg) — 안전재고 대비 경보 레벨."""
+    if safety <= 0:
+        # safetyStock 설정 없음 — can_stock이 0이면 위험 표시
+        if can_stock <= 0:
+            return "품절", _FG_DANGER, _BG_DANGER
+        return "-", None, None
+    if can_stock <= 0:
+        return "품절", _FG_DANGER, _BG_DANGER
+    if can_stock <= safety:
+        return "부족", _FG_DANGER, _BG_DANGER
+    if can_stock <= safety * 1.5:
+        return "경고", _FG_WARN, _BG_WARN
+    return "정상", _FG_OK, None
+
+
+def _delivery_status_cell(status_code: str, status_name: str) -> Cell:
+    name = status_name or status_code or ""
+    lower = (status_code or "") + "|" + (status_name or "")
+    if "취소" in lower or "CANCEL" in lower.upper():
+        return Cell(text=name, fg=_FG_DANGER, bg=_BG_DANGER)
+    if "부족" in lower or "SHORTAGE" in lower.upper():
+        return Cell(text=name, fg=_FG_WARN, bg=_BG_WARN)
+    if "완료" in lower or "DONE" in lower.upper() or status_code == "3":
+        return Cell(text=name, fg=_FG_OK, bg=_BG_OK)
+    if "작업" in lower or "WORKING" in lower.upper():
+        return Cell(text=name, fg=_FG_MUTED, bg=_BG_INFO)
+    return Cell(text=name)
+
+
+# ---------------------------------------------------------------------------
 # Sub-tabs
 # ---------------------------------------------------------------------------
 
@@ -178,23 +457,32 @@ class _OverviewSubTab(QWidget):
 
         self.status_label = QLabel("—")
         self.status_label.setWordWrap(True)
-        self.status_label.setObjectName("fasstoStatusLabel")
 
         self.config_box = QGroupBox("설정 상태")
-        config_form = QFormLayout(self.config_box)
+        cf = QFormLayout(self.config_box)
         self.lbl_api_url = QLabel("-")
         self.lbl_cst_cd = QLabel("-")
         self.lbl_configured = QLabel("-")
-        config_form.addRow("API URL", self.lbl_api_url)
-        config_form.addRow("고객사 코드", self.lbl_cst_cd)
-        config_form.addRow("설정 완료", self.lbl_configured)
+        cf.addRow("API URL", self.lbl_api_url)
+        cf.addRow("고객사 코드", self.lbl_cst_cd)
+        cf.addRow("설정 완료", self.lbl_configured)
 
         self.remote_box = QGroupBox("파스토 원격 요약")
-        remote_form = QFormLayout(self.remote_box)
+        rf = QFormLayout(self.remote_box)
         self.lbl_goods_count = QLabel("-")
+        self.lbl_element_count = QLabel("-")
         self.lbl_stock_rows = QLabel("-")
-        remote_form.addRow("상품 수", self.lbl_goods_count)
-        remote_form.addRow("재고 레코드 수", self.lbl_stock_rows)
+        self.lbl_stock_sum = QLabel("-")
+        self.lbl_can_sum = QLabel("-")
+        self.lbl_bad_sum = QLabel("-")
+        self.lbl_alert = QLabel("-")
+        rf.addRow("상품(goods) 수", self.lbl_goods_count)
+        rf.addRow("세트상품 수", self.lbl_element_count)
+        rf.addRow("재고 레코드 수", self.lbl_stock_rows)
+        rf.addRow("총재고(stockQty) 합", self.lbl_stock_sum)
+        rf.addRow("가용재고(canStockQty) 합", self.lbl_can_sum)
+        rf.addRow("불량재고(badStockQty) 합", self.lbl_bad_sum)
+        rf.addRow("재고 경보 (안전재고 이하)", self.lbl_alert)
 
         btn_row = QHBoxLayout()
         self.refresh_btn = QPushButton("연결 테스트 & 요약 조회")
@@ -229,28 +517,81 @@ class _OverviewSubTab(QWidget):
 
         def work() -> dict:
             goods_env = self._tab.connector.get_goods_list()
+            element_env = self._tab.connector.get_goods_elements()
             stock_env = self._tab.connector.get_stock_list()
+            goods = normalize_fassto_goods(extract_fassto_list(goods_env))
+            stocks = normalize_fassto_stocks(extract_fassto_list(stock_env))
+            # safetyStock 매핑
+            safety_by_code = {g.cstGodCd.upper(): g.safetyStock for g in goods if g.cstGodCd}
+            alert = 0
+            for s in stocks:
+                safety = safety_by_code.get((s.cstGodCd or "").upper(), 0.0)
+                if safety > 0 and s.canStockQty <= safety:
+                    alert += 1
+                elif safety <= 0 and s.canStockQty <= 0:
+                    alert += 1
             return {
-                "goods": len(extract_fassto_list(goods_env)),
-                "stocks": len(extract_fassto_list(stock_env)),
+                "goods": len(goods),
+                "elements": len(extract_fassto_list(element_env)),
+                "stock_rows": len(stocks),
+                "stock_sum": sum(s.stockQty for s in stocks),
+                "can_sum": sum(s.canStockQty for s in stocks),
+                "bad_sum": sum(s.badStockQty for s in stocks),
+                "alert": alert,
             }
 
         def done(result: JobResult) -> None:
             self.refresh_btn.setEnabled(True)
             if not result.ok:
                 self.status_label.setText(f"❌ 실패: {result.error}")
-                self.lbl_goods_count.setText("-")
-                self.lbl_stock_rows.setText("-")
+                for w in (
+                    self.lbl_goods_count,
+                    self.lbl_element_count,
+                    self.lbl_stock_rows,
+                    self.lbl_stock_sum,
+                    self.lbl_can_sum,
+                    self.lbl_bad_sum,
+                    self.lbl_alert,
+                ):
+                    w.setText("-")
                 return
             self.status_label.setText("✅ 파스토 연결 성공")
-            self.lbl_goods_count.setText(str(result.data["goods"]))
-            self.lbl_stock_rows.setText(str(result.data["stocks"]))
+            d = result.data
+            self.lbl_goods_count.setText(_fmt_num(d["goods"]))
+            self.lbl_element_count.setText(_fmt_num(d["elements"]))
+            self.lbl_stock_rows.setText(_fmt_num(d["stock_rows"]))
+            self.lbl_stock_sum.setText(_fmt_num(d["stock_sum"]))
+            self.lbl_can_sum.setText(_fmt_num(d["can_sum"]))
+            self.lbl_bad_sum.setText(_fmt_num(d["bad_sum"]))
+            alert = d["alert"]
+            self.lbl_alert.setText(f"{alert}건" + (" ⚠" if alert else ""))
+            if alert:
+                self.lbl_alert.setStyleSheet(
+                    "color: #b40000; font-weight: bold;"
+                )
+            else:
+                self.lbl_alert.setStyleSheet("")
 
         _run_async(self, work, done)
 
 
 class _GoodsSubTab(QWidget):
-    COLUMNS = ("cstGodCd", "godNm", "godType", "giftDiv", "barcode", "useYn")
+    COLUMNS = (
+        "cstGodCd",
+        "godNm",
+        "godBarcd",
+        "useYn",
+        "giftDivNm",
+        "cateNm",
+        "supNm",
+        "inPr",
+        "salPr",
+        "마진%",
+        "godWeight(g)",
+        "boxInCnt",
+        "safetyStock",
+        "firstInDt",
+    )
 
     def __init__(self, tab: "FasstoTab") -> None:
         super().__init__()
@@ -260,9 +601,18 @@ class _GoodsSubTab(QWidget):
         top = QHBoxLayout()
         self.refresh_btn = QPushButton("상품 목록 조회")
         self.refresh_btn.clicked.connect(self._refresh)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("상품명/코드/바코드 검색")
+        self.search_edit.textChanged.connect(self._apply_filter)
+        self.export_btn = QPushButton("CSV 저장")
+        self.export_btn.clicked.connect(
+            lambda: _export_table_to_csv(self.table, self, "fassto_goods")
+        )
         self.status = QLabel("")
         top.addWidget(self.refresh_btn)
-        top.addWidget(self.status, 1)
+        top.addWidget(self.search_edit, 1)
+        top.addWidget(self.export_btn)
+        top.addWidget(self.status)
 
         self.table = QTableWidget(0, len(self.COLUMNS))
         self.table.setHorizontalHeaderLabels(self.COLUMNS)
@@ -270,6 +620,8 @@ class _GoodsSubTab(QWidget):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSortingEnabled(True)
+
+        self._all_rows: List[FasstoGoodsRow] = []
 
         layout.addLayout(top)
         layout.addWidget(self.table, 1)
@@ -289,18 +641,182 @@ class _GoodsSubTab(QWidget):
             if not result.ok:
                 self.status.setText(f"❌ {result.error}")
                 return
-            rows = [
-                (r.cstGodCd, r.godNm, r.godType, r.giftDiv, r.barcode or "", r.useYn or "")
-                for r in result.data
-            ]
-            _fill_table(self.table, self.COLUMNS, rows)
-            self.status.setText(f"총 {len(rows)}건")
+            self._all_rows = result.data
+            self._apply_filter()
 
         _run_async(self, work, done)
 
+    def _apply_filter(self) -> None:
+        q = self.search_edit.text().strip().lower()
+        rows_src = self._all_rows
+        if q:
+            rows_src = [
+                r
+                for r in self._all_rows
+                if q in (r.cstGodCd or "").lower()
+                or q in (r.godNm or "").lower()
+                or q in (r.barcode or "").lower()
+            ]
+        rows: List[List[Any]] = []
+        for r in rows_src:
+            use_yn_cell = (
+                Cell(text="Y", fg=_FG_OK)
+                if (r.useYn or "").upper() == "Y"
+                else Cell(text=r.useYn or "", fg=_FG_MUTED)
+            )
+            rows.append(
+                [
+                    r.cstGodCd,
+                    r.godNm,
+                    r.barcode or "",
+                    use_yn_cell,
+                    r.giftDivNm or "",
+                    r.cateNm or "",
+                    r.supNm or "",
+                    _num_cell(r.inPr, _fmt_money),
+                    _num_cell(r.salPr, _fmt_money),
+                    _goods_margin_cell(r.salPr, r.inPr),
+                    _num_cell(r.godWeight),
+                    _num_cell(r.boxInCnt),
+                    _num_cell(r.safetyStock),
+                    _fmt_yyyymmdd(r.firstInDt) if r.firstInDt else "",
+                ]
+            )
+        _fill_table(self.table, self.COLUMNS, rows)
+        self.status.setText(f"총 {len(rows)}건 (전체 {len(self._all_rows)}건)")
+
+
+class _GoodsElementSubTab(QWidget):
+    PARENT_COLS = ("cstGodCd", "godNm", "useYn", "구성품 수")
+    CHILD_COLS = ("cstGodCd", "godBarcd", "godNm", "godTypeNm", "qty")
+
+    def __init__(self, tab: "FasstoTab") -> None:
+        super().__init__()
+        self._tab = tab
+        layout = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        self.refresh_btn = QPushButton("세트상품 조회")
+        self.refresh_btn.clicked.connect(self._refresh)
+        self.export_parent_btn = QPushButton("부모 CSV")
+        self.export_parent_btn.clicked.connect(
+            lambda: _export_table_to_csv(self.parent_table, self, "fassto_set_parents")
+        )
+        self.export_child_btn = QPushButton("구성품 CSV")
+        self.export_child_btn.clicked.connect(
+            lambda: _export_table_to_csv(self.child_table, self, "fassto_set_children")
+        )
+        self.status = QLabel("")
+        top.addWidget(self.refresh_btn)
+        top.addWidget(self.export_parent_btn)
+        top.addWidget(self.export_child_btn)
+        top.addWidget(self.status, 1)
+
+        splitter = QSplitter(Qt.Vertical)
+
+        self.parent_table = QTableWidget(0, len(self.PARENT_COLS))
+        self.parent_table.setHorizontalHeaderLabels(self.PARENT_COLS)
+        self.parent_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.parent_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.parent_table.setSortingEnabled(True)
+        self.parent_table.itemSelectionChanged.connect(self._on_parent_selected)
+
+        child_box = QGroupBox("선택한 세트의 구성품")
+        child_layout = QVBoxLayout(child_box)
+        self.child_table = QTableWidget(0, len(self.CHILD_COLS))
+        self.child_table.setHorizontalHeaderLabels(self.CHILD_COLS)
+        self.child_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.child_table.setSortingEnabled(True)
+        child_layout.addWidget(self.child_table)
+
+        splitter.addWidget(self.parent_table)
+        splitter.addWidget(child_box)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
+
+        layout.addLayout(top)
+        layout.addWidget(splitter, 1)
+
+        self._rows: List[FasstoGoodsElementRow] = []
+
+    def _refresh(self) -> None:
+        if not self._tab.require_configured(self):
+            return
+        self.status.setText("조회 중...")
+        self.refresh_btn.setEnabled(False)
+
+        def work() -> list:
+            env = self._tab.connector.get_goods_elements()
+            return normalize_fassto_goods_elements(extract_fassto_list(env))
+
+        def done(result: JobResult) -> None:
+            self.refresh_btn.setEnabled(True)
+            if not result.ok:
+                self.status.setText(f"❌ {result.error}")
+                return
+            self._rows = result.data
+            rows = [
+                [
+                    r.cstGodCd,
+                    r.godNm or "",
+                    r.useYn or "",
+                    _num_cell(len(r.elements)),
+                ]
+                for r in self._rows
+            ]
+            _fill_table(self.parent_table, self.PARENT_COLS, rows)
+            self.status.setText(f"총 {len(rows)}건")
+            if rows:
+                self.parent_table.selectRow(0)
+            else:
+                _fill_table(self.child_table, self.CHILD_COLS, [])
+
+        _run_async(self, work, done)
+
+    def _on_parent_selected(self) -> None:
+        selected = self.parent_table.currentRow()
+        if selected < 0:
+            _fill_table(self.child_table, self.CHILD_COLS, [])
+            return
+        code_item = self.parent_table.item(selected, 0)
+        if code_item is None:
+            return
+        code = code_item.text()
+        target = next((r for r in self._rows if r.cstGodCd == code), None)
+        if target is None:
+            _fill_table(self.child_table, self.CHILD_COLS, [])
+            return
+        rows = [
+            [
+                e.cstGodCd,
+                e.godBarcd or "",
+                e.godNm or "",
+                e.godTypeNm or "",
+                _num_cell(e.qty),
+            ]
+            for e in target.elements
+        ]
+        _fill_table(self.child_table, self.CHILD_COLS, rows)
+
 
 class _StockSubTab(QWidget):
-    COLUMNS = ("cstGodCd", "stockQty", "canStockQty", "badStockQty", "goodsSerialNo")
+    """재고 탭 — goods·stock 병합 후 safetyStock 경보 색 코딩."""
+
+    COLUMNS = (
+        "상태",
+        "cstGodCd",
+        "godNm",
+        "godBarcd",
+        "whCd",
+        "stockQty",
+        "canStockQty",
+        "badStockQty",
+        "safetyStock",
+        "distTermDt",
+        "supNm",
+        "slipNo",
+        "goodsSerialNo",
+    )
 
     def __init__(self, tab: "FasstoTab") -> None:
         super().__init__()
@@ -310,9 +826,20 @@ class _StockSubTab(QWidget):
         top = QHBoxLayout()
         self.refresh_btn = QPushButton("재고 조회")
         self.refresh_btn.clicked.connect(self._refresh)
-        self.status = QLabel("기준: 가용재고 canStockQty")
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("상품명/코드/바코드 검색")
+        self.search_edit.textChanged.connect(self._apply_filter)
+        self.alert_only = QCheckBox("경보만")
+        self.alert_only.toggled.connect(self._apply_filter)
+        self.export_btn = QPushButton("CSV 저장")
+        self.export_btn.clicked.connect(
+            lambda: _export_table_to_csv(self.table, self, "fassto_stock")
+        )
+        self.status = QLabel("기준: 가용재고 canStockQty, 안전재고는 goods.safetyStock")
         top.addWidget(self.refresh_btn)
-        top.addWidget(self.status, 1)
+        top.addWidget(self.search_edit, 1)
+        top.addWidget(self.alert_only)
+        top.addWidget(self.export_btn)
 
         self.table = QTableWidget(0, len(self.COLUMNS))
         self.table.setHorizontalHeaderLabels(self.COLUMNS)
@@ -321,49 +848,122 @@ class _StockSubTab(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSortingEnabled(True)
 
+        self._stocks: List[FasstoStockRow] = []
+        self._safety_by_code: Dict[str, float] = {}
+        self._totals = {"stock": 0.0, "can": 0.0, "bad": 0.0, "alert": 0}
+
         layout.addLayout(top)
+        layout.addWidget(self.status)
         layout.addWidget(self.table, 1)
 
     def _refresh(self) -> None:
         if not self._tab.require_configured(self):
             return
-        self.status.setText("조회 중...")
+        self.status.setText("조회 중... (goods + stock)")
         self.refresh_btn.setEnabled(False)
 
-        def work() -> list:
-            env = self._tab.connector.get_stock_list()
-            return normalize_fassto_stocks(extract_fassto_list(env))
+        def work() -> dict:
+            goods = normalize_fassto_goods(
+                extract_fassto_list(self._tab.connector.get_goods_list())
+            )
+            stocks = normalize_fassto_stocks(
+                extract_fassto_list(self._tab.connector.get_stock_list())
+            )
+            safety = {
+                (g.cstGodCd or "").upper(): g.safetyStock for g in goods if g.cstGodCd
+            }
+            return {"stocks": stocks, "safety": safety}
 
         def done(result: JobResult) -> None:
             self.refresh_btn.setEnabled(True)
             if not result.ok:
                 self.status.setText(f"❌ {result.error}")
                 return
-            rows = [
-                (
-                    r.cstGodCd,
-                    int(r.stockQty) if r.stockQty == int(r.stockQty) else r.stockQty,
-                    int(r.canStockQty) if r.canStockQty == int(r.canStockQty) else r.canStockQty,
-                    int(r.badStockQty) if r.badStockQty == int(r.badStockQty) else r.badStockQty,
-                    r.goodsSerialNo or "",
-                )
-                for r in result.data
-            ]
-            _fill_table(self.table, self.COLUMNS, rows)
-            self.status.setText(f"총 {len(rows)}건 (기준: canStockQty)")
+            self._stocks = result.data["stocks"]
+            self._safety_by_code = result.data["safety"]
+            self._totals = {
+                "stock": sum(r.stockQty for r in self._stocks),
+                "can": sum(r.canStockQty for r in self._stocks),
+                "bad": sum(r.badStockQty for r in self._stocks),
+                "alert": 0,
+            }
+            self._apply_filter()
 
         _run_async(self, work, done)
 
+    def _apply_filter(self) -> None:
+        q = self.search_edit.text().strip().lower()
+        alert_only = self.alert_only.isChecked()
+        rows: List[List[Any]] = []
+        alert_count = 0
+        for r in self._stocks:
+            safety = self._safety_by_code.get((r.cstGodCd or "").upper(), 0.0)
+            label, fg, bg = _stock_alert_cells(r.canStockQty, safety)
+            is_alert = label in ("품절", "부족", "경고")
+            if is_alert:
+                alert_count += 1
+
+            if q and not (
+                q in (r.cstGodCd or "").lower()
+                or q in (r.godNm or "").lower()
+                or q in (r.godBarcd or "").lower()
+            ):
+                continue
+            if alert_only and not is_alert:
+                continue
+
+            row_bg = bg
+            rows.append(
+                [
+                    Cell(text=label, fg=fg, bg=bg),
+                    Cell(text=r.cstGodCd, bg=row_bg),
+                    Cell(text=r.godNm or "", bg=row_bg),
+                    Cell(text=r.godBarcd or "", bg=row_bg),
+                    Cell(text=r.whCd or "", bg=row_bg),
+                    _num_cell(r.stockQty, bg=row_bg),
+                    _num_cell(r.canStockQty, fg=fg, bg=row_bg),
+                    _num_cell(r.badStockQty, bg=row_bg),
+                    _num_cell(safety, bg=row_bg),
+                    Cell(text=_fmt_yyyymmdd(r.distTermDt) if r.distTermDt else "", bg=row_bg),
+                    Cell(text=r.supNm or "", bg=row_bg),
+                    Cell(text=r.slipNo or "", bg=row_bg),
+                    Cell(text=r.goodsSerialNo or "", bg=row_bg),
+                ]
+            )
+        self._totals["alert"] = alert_count
+        _fill_table(self.table, self.COLUMNS, rows)
+        self.status.setText(
+            f"표시 {len(rows)}건 / 전체 {len(self._stocks)}건 · "
+            f"총재고 {_fmt_num(self._totals['stock'])} · "
+            f"가용 {_fmt_num(self._totals['can'])} · "
+            f"불량 {_fmt_num(self._totals['bad'])} · "
+            f"경보 {self._totals['alert']}건"
+        )
+
 
 class _WarehousingSubTab(QWidget):
-    COLUMNS_LIST = ("slipNo", "ordDt", "status", "statusNm", "custNm", "raw_summary")
+    COLUMNS_LIST = (
+        "slipNo",
+        "ordDt",
+        "whNm",
+        "wrkStatNm",
+        "supNm",
+        "sku",
+        "ordQty",
+        "inQty",
+        "tarQty",
+        "inWayNm",
+        "parcelComp",
+        "parcelInvoiceNo",
+    )
+    DETAIL_COLS = ("cstGodCd", "godNm", "ordQty", "inQty", "tarQty", "goodsSerialNo")
 
     def __init__(self, tab: "FasstoTab") -> None:
         super().__init__()
         self._tab = tab
         layout = QVBoxLayout(self)
 
-        start_d, end_d = _default_range()
+        start_d, end_d = _month_range()
 
         top = QHBoxLayout()
         self.start_edit = QDateEdit(QDate(start_d.year, start_d.month, start_d.day))
@@ -374,21 +974,28 @@ class _WarehousingSubTab(QWidget):
         self.end_edit.setDisplayFormat("yyyy-MM-dd")
         self.refresh_btn = QPushButton("기간 조회")
         self.refresh_btn.clicked.connect(self._refresh_list)
-        self.slip_edit = QLineEdit()
-        self.slip_edit.setPlaceholderText("전표번호(slipNo) 입력")
-        self.detail_btn = QPushButton("상세 조회")
-        self.detail_btn.clicked.connect(self._refresh_detail)
-        self.status = QLabel("")
+        self.export_btn = QPushButton("CSV 저장")
+        self.export_btn.clicked.connect(
+            lambda: _export_table_to_csv(self.table, self, "fassto_warehousing")
+        )
 
         top.addWidget(QLabel("시작"))
         top.addWidget(self.start_edit)
         top.addWidget(QLabel("종료"))
         top.addWidget(self.end_edit)
+        top.addWidget(_DatePresetBar(self.start_edit, self.end_edit))
         top.addWidget(self.refresh_btn)
-        top.addSpacing(16)
-        top.addWidget(self.slip_edit, 1)
-        top.addWidget(self.detail_btn)
-        top.addWidget(self.status)
+        top.addWidget(self.export_btn)
+
+        detail_row = QHBoxLayout()
+        self.slip_edit = QLineEdit()
+        self.slip_edit.setPlaceholderText("전표번호(slipNo)")
+        self.detail_btn = QPushButton("상세")
+        self.detail_btn.clicked.connect(self._refresh_detail)
+        self.status = QLabel("")
+        detail_row.addWidget(self.slip_edit, 1)
+        detail_row.addWidget(self.detail_btn)
+        detail_row.addWidget(self.status, 2)
 
         self.table = QTableWidget(0, len(self.COLUMNS_LIST))
         self.table.setHorizontalHeaderLabels(self.COLUMNS_LIST)
@@ -397,42 +1004,80 @@ class _WarehousingSubTab(QWidget):
         self.table.setSortingEnabled(True)
         self.table.cellClicked.connect(self._on_row_clicked)
 
-        self.detail_view = QTextEdit()
-        self.detail_view.setReadOnly(True)
-        self.detail_view.setPlaceholderText("전표를 선택하거나 번호 입력 후 상세 조회")
+        splitter = QSplitter(Qt.Vertical)
+        splitter.addWidget(self.table)
+
+        detail_box = QGroupBox("상세 — 헤더")
+        detail_layout = QVBoxLayout(detail_box)
+        self.header_view = QTextEdit()
+        self.header_view.setReadOnly(True)
+        self.header_view.setPlaceholderText("전표 선택 시 헤더가 표시됩니다.")
+        self.header_view.setMaximumHeight(140)
+        detail_layout.addWidget(self.header_view)
+
+        detail_goods = QGroupBox("상세 — 품목")
+        goods_layout = QVBoxLayout(detail_goods)
+        self.detail_table = QTableWidget(0, len(self.DETAIL_COLS))
+        self.detail_table.setHorizontalHeaderLabels(self.DETAIL_COLS)
+        self.detail_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.detail_table.setSortingEnabled(True)
+        goods_layout.addWidget(self.detail_table)
+
+        sub = QSplitter(Qt.Vertical)
+        sub.addWidget(detail_box)
+        sub.addWidget(detail_goods)
+        sub.setStretchFactor(0, 1)
+        sub.setStretchFactor(1, 2)
+        splitter.addWidget(sub)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
 
         layout.addLayout(top)
-        layout.addWidget(self.table, 2)
-        layout.addWidget(QLabel("상세"))
-        layout.addWidget(self.detail_view, 1)
+        layout.addLayout(detail_row)
+        layout.addWidget(splitter, 1)
 
     def _refresh_list(self) -> None:
         if not self._tab.require_configured(self):
             return
-        start = _fmt_api_date(self.start_edit.date().toPython())
-        end = _fmt_api_date(self.end_edit.date().toPython())
+        r = _normalize_range(self.start_edit, self.end_edit, self)
+        if not r:
+            return
+        start, end = r
         self.status.setText("조회 중...")
         self.refresh_btn.setEnabled(False)
 
         def work() -> list:
             env = self._tab.connector.get_warehousing_list(start, end)
-            return extract_fassto_list(env)
+            return normalize_fassto_warehousings(extract_fassto_list(env))
 
         def done(result: JobResult) -> None:
             self.refresh_btn.setEnabled(True)
             if not result.ok:
                 self.status.setText(f"❌ {result.error}")
                 return
-            rows = []
-            for row in result.data:
-                if not isinstance(row, dict):
-                    continue
-                slip = row.get("slipNo") or row.get("fmsSlipNo") or ""
-                ord_dt = row.get("ordDt") or row.get("inDt") or ""
-                status = row.get("status") or row.get("crgSt") or ""
-                status_nm = row.get("statusNm") or row.get("crgStNm") or ""
-                cust = row.get("custNm") or row.get("supplierNm") or ""
-                rows.append((slip, ord_dt, status, status_nm, cust, ", ".join(str(k) for k in row.keys())))
+            rows: List[List[Any]] = []
+            for r_ in result.data:
+                status_cell = _delivery_status_cell(r_.wrkStat or "", r_.wrkStatNm or "")
+                # ordQty == inQty ? 완료
+                qty_fg = None
+                if r_.tarQty and r_.tarQty > 0:
+                    qty_fg = _FG_WARN
+                rows.append(
+                    [
+                        r_.slipNo,
+                        _fmt_yyyymmdd(r_.ordDt),
+                        r_.whNm or "",
+                        status_cell,
+                        r_.supNm or "",
+                        _num_cell(r_.sku),
+                        _num_cell(r_.ordQty),
+                        _num_cell(r_.inQty),
+                        _num_cell(r_.tarQty, fg=qty_fg),
+                        r_.inWayNm or "",
+                        r_.parcelComp or "",
+                        r_.parcelInvoiceNo or "",
+                    ]
+                )
             _fill_table(self.table, self.COLUMNS_LIST, rows)
             self.status.setText(f"총 {len(rows)}건")
 
@@ -450,8 +1095,9 @@ class _WarehousingSubTab(QWidget):
         if not slip:
             QMessageBox.information(self, "안내", "전표번호를 입력하세요.")
             return
-        self.detail_view.setPlainText("조회 중...")
+        self.header_view.setPlainText("조회 중...")
         self.detail_btn.setEnabled(False)
+        _fill_table(self.detail_table, self.DETAIL_COLS, [])
 
         def work() -> Any:
             return self._tab.connector.get_warehousing_detail(slip)
@@ -459,10 +1105,44 @@ class _WarehousingSubTab(QWidget):
         def done(result: JobResult) -> None:
             self.detail_btn.setEnabled(True)
             if not result.ok:
-                self.detail_view.setPlainText(f"❌ {result.error}")
+                self.header_view.setPlainText(f"❌ {result.error}")
                 return
-            import json as _json
-            self.detail_view.setPlainText(_json.dumps(result.data, ensure_ascii=False, indent=2))
+            rows = extract_fassto_list(result.data)
+            if not rows:
+                self.header_view.setPlainText("데이터가 없습니다.")
+                return
+            header = rows[0] if isinstance(rows[0], dict) else {}
+            header_lines = [
+                f"전표: {header.get('slipNo', '')} / 발주번호: {header.get('ordNo') or '-'}",
+                f"일자: {_fmt_yyyymmdd(header.get('ordDt'))} / 창고: {header.get('whNm', '')} ({header.get('whCd', '')})",
+                f"공급사: {header.get('supNm', '')} / 입고방식: {header.get('inWayNm', '')} / 상태: {header.get('wrkStatNm', '')}",
+                f"수량(주문/입고/타겟): {_fmt_num(header.get('ordQty'))} / {_fmt_num(header.get('inQty'))} / {_fmt_num(header.get('tarQty'))} · SKU: {_fmt_num(header.get('sku'))}",
+                f"택배: {header.get('parcelComp', '')} / 송장: {header.get('parcelInvoiceNo') or '-'}",
+            ]
+            remark = (header.get("remark") or "").strip()
+            if remark:
+                header_lines.append(f"비고: {remark}")
+            self.header_view.setPlainText("\n".join(header_lines))
+
+            goods = header.get("goods") if isinstance(header.get("goods"), list) else []
+            detail_rows: List[List[Any]] = []
+            for g in goods:
+                if not isinstance(g, dict):
+                    continue
+                serial = g.get("goodsSerialNo")
+                if isinstance(serial, list):
+                    serial = ", ".join(str(v) for v in serial if v)
+                detail_rows.append(
+                    [
+                        g.get("cstGodCd", ""),
+                        g.get("godNm", ""),
+                        _num_cell(g.get("ordQty") or 0),
+                        _num_cell(g.get("inQty") or 0),
+                        _num_cell(g.get("tarQty") or 0),
+                        serial or "",
+                    ]
+                )
+            _fill_table(self.detail_table, self.DETAIL_COLS, detail_rows)
 
         _run_async(self, work, done)
 
@@ -470,22 +1150,27 @@ class _WarehousingSubTab(QWidget):
 class _DeliverySubTab(QWidget):
     COLUMNS = (
         "slipNo",
-        "ordNo",
+        "outDt",
         "ordDt",
-        "status",
-        "statusNm",
-        "outDiv",
+        "salChanel",
+        "wrkStatNm",
+        "outDivNm",
+        "ordQty",
         "custNm",
+        "custTelNo",
         "invoiceNo",
         "parcelNm",
+        "whNm",
+        "updTime",
     )
+    DETAIL_COLS = ("cstGodCd", "godNm", "ordQty", "godDiv")
 
     def __init__(self, tab: "FasstoTab") -> None:
         super().__init__()
         self._tab = tab
         layout = QVBoxLayout(self)
 
-        start_d, end_d = _default_range()
+        start_d, end_d = _month_range()
         top = QHBoxLayout()
         self.start_edit = QDateEdit(QDate(start_d.year, start_d.month, start_d.day))
         self.start_edit.setCalendarPopup(True)
@@ -495,46 +1180,90 @@ class _DeliverySubTab(QWidget):
         self.end_edit.setDisplayFormat("yyyy-MM-dd")
 
         self.status_combo = QComboBox()
-        # Swagger 스펙: ALL | ORDER | WORKING | DONE | PARTDONE | CANCEL | SHORTAGE
         self.status_combo.addItems(
             ["ALL", "ORDER", "WORKING", "DONE", "PARTDONE", "CANCEL", "SHORTAGE"]
         )
         self.status_combo.setEditable(True)
 
         self.out_div_combo = QComboBox()
-        # Swagger 스펙: 1(Parcel) | 2(Vehicle) | COUPANG | ONE_DAY
         self.out_div_combo.addItems(["1", "2", "COUPANG", "ONE_DAY"])
         self.out_div_combo.setEditable(True)
 
         self.refresh_btn = QPushButton("조회")
         self.refresh_btn.clicked.connect(self._refresh)
+        self.export_btn = QPushButton("CSV 저장")
+        self.export_btn.clicked.connect(
+            lambda: _export_table_to_csv(self.table, self, "fassto_delivery")
+        )
         self.status = QLabel("")
 
         top.addWidget(QLabel("시작"))
         top.addWidget(self.start_edit)
         top.addWidget(QLabel("종료"))
         top.addWidget(self.end_edit)
+        top.addWidget(_DatePresetBar(self.start_edit, self.end_edit))
         top.addWidget(QLabel("상태"))
         top.addWidget(self.status_combo)
         top.addWidget(QLabel("출고구분"))
         top.addWidget(self.out_div_combo)
         top.addWidget(self.refresh_btn)
-        top.addWidget(self.status, 1)
+        top.addWidget(self.export_btn)
+
+        detail_row = QHBoxLayout()
+        self.slip_edit = QLineEdit()
+        self.slip_edit.setPlaceholderText("전표번호(slipNo)")
+        self.detail_btn = QPushButton("상세")
+        self.detail_btn.clicked.connect(self._refresh_detail)
+        detail_row.addWidget(self.slip_edit, 1)
+        detail_row.addWidget(self.detail_btn)
+        detail_row.addWidget(self.status, 2)
 
         self.table = QTableWidget(0, len(self.COLUMNS))
         self.table.setHorizontalHeaderLabels(self.COLUMNS)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSortingEnabled(True)
+        self.table.cellClicked.connect(self._on_row_clicked)
+
+        splitter = QSplitter(Qt.Vertical)
+        splitter.addWidget(self.table)
+
+        detail_box = QGroupBox("상세 — 헤더")
+        detail_layout = QVBoxLayout(detail_box)
+        self.header_view = QTextEdit()
+        self.header_view.setReadOnly(True)
+        self.header_view.setPlaceholderText("전표 선택 시 헤더가 표시됩니다.")
+        self.header_view.setMaximumHeight(160)
+        detail_layout.addWidget(self.header_view)
+
+        detail_goods = QGroupBox("상세 — 품목")
+        goods_layout = QVBoxLayout(detail_goods)
+        self.detail_table = QTableWidget(0, len(self.DETAIL_COLS))
+        self.detail_table.setHorizontalHeaderLabels(self.DETAIL_COLS)
+        self.detail_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.detail_table.setSortingEnabled(True)
+        goods_layout.addWidget(self.detail_table)
+
+        sub = QSplitter(Qt.Vertical)
+        sub.addWidget(detail_box)
+        sub.addWidget(detail_goods)
+        sub.setStretchFactor(0, 1)
+        sub.setStretchFactor(1, 2)
+        splitter.addWidget(sub)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
 
         layout.addLayout(top)
-        layout.addWidget(self.table, 1)
+        layout.addLayout(detail_row)
+        layout.addWidget(splitter, 1)
 
     def _refresh(self) -> None:
         if not self._tab.require_configured(self):
             return
-        start = _fmt_api_date(self.start_edit.date().toPython())
-        end = _fmt_api_date(self.end_edit.date().toPython())
+        r = _normalize_range(self.start_edit, self.end_edit, self)
+        if not r:
+            return
+        start, end = r
         status = (self.status_combo.currentText() or "ALL").strip() or "ALL"
         out_div = (self.out_div_combo.currentText() or "1").strip() or "1"
 
@@ -550,24 +1279,547 @@ class _DeliverySubTab(QWidget):
             if not result.ok:
                 self.status.setText(f"❌ {result.error}")
                 return
-            rows = [
-                (
-                    r.slipNo,
-                    r.ordNo,
-                    r.ordDt,
-                    r.status,
-                    r.statusNm,
-                    r.outDiv,
-                    r.custNm,
-                    r.invoiceNo or "",
-                    r.parcelNm or "",
+            rows: List[List[Any]] = []
+            status_counter: Dict[str, int] = {}
+            for r_ in result.data:
+                key = r_.statusNm or r_.status or ""
+                status_counter[key] = status_counter.get(key, 0) + 1
+                rows.append(
+                    [
+                        r_.slipNo,
+                        _fmt_yyyymmdd(r_.outDt) if r_.outDt else "",
+                        _fmt_yyyymmdd(r_.ordDt),
+                        r_.salChanel or "",
+                        _delivery_status_cell(r_.status or "", r_.statusNm or ""),
+                        r_.outDivNm or r_.outDiv or "",
+                        _num_cell(r_.ordQty),
+                        r_.custNm or "",
+                        r_.custTelNo or "",
+                        r_.invoiceNo or "",
+                        r_.parcelNm or r_.parcelCd or "",
+                        r_.whNm or "",
+                        r_.updTime or "",
+                    ]
                 )
-                for r in result.data
-            ]
             _fill_table(self.table, self.COLUMNS, rows)
-            self.status.setText(f"총 {len(rows)}건")
+            status_line = " · ".join(
+                f"{k}: {v}" for k, v in sorted(status_counter.items())
+            )
+            self.status.setText(f"총 {len(rows)}건" + (f" — {status_line}" if status_line else ""))
 
         _run_async(self, work, done)
+
+    def _on_row_clicked(self, row: int, _col: int) -> None:
+        item = self.table.item(row, 0)
+        if item is not None:
+            self.slip_edit.setText(item.text())
+
+    def _refresh_detail(self) -> None:
+        if not self._tab.require_configured(self):
+            return
+        slip = self.slip_edit.text().strip()
+        if not slip:
+            QMessageBox.information(self, "안내", "전표번호를 입력하세요.")
+            return
+        self.header_view.setPlainText("조회 중...")
+        self.detail_btn.setEnabled(False)
+        _fill_table(self.detail_table, self.DETAIL_COLS, [])
+
+        def work() -> Any:
+            return self._tab.connector.get_delivery_detail(slip)
+
+        def done(result: JobResult) -> None:
+            self.detail_btn.setEnabled(True)
+            if not result.ok:
+                self.header_view.setPlainText(f"❌ {result.error}")
+                return
+            rows = extract_fassto_list(result.data)
+            if not rows:
+                self.header_view.setPlainText("데이터가 없습니다.")
+                return
+            header = rows[0] if isinstance(rows[0], dict) else {}
+            lines = [
+                f"전표: {header.get('slipNo', '')} / 주문번호: {header.get('ordNo') or '-'}",
+                f"출고일: {_fmt_yyyymmdd(header.get('outDt'))} / 주문일: {_fmt_yyyymmdd(header.get('ordDt'))}",
+                f"채널: {header.get('salChanel', '')} / 상태: {header.get('wrkStatNm', '')} / 출고방식: {header.get('outWayNm', '')}",
+                f"수령인: {header.get('custNm', '')} / {header.get('custTelNo') or ''}",
+                f"주소: {header.get('custAddr') or ''}",
+                f"송장: {header.get('parcelNm') or header.get('parcelCd') or ''} {header.get('invoiceNo') or ''}",
+                f"창고: {header.get('whNm', '')} ({header.get('whCd', '')})",
+            ]
+            remark = (header.get("remark") or "").strip()
+            if remark:
+                lines.append(f"비고: {remark}")
+            self.header_view.setPlainText("\n".join(lines))
+
+            goods = header.get("goods") if isinstance(header.get("goods"), list) else []
+            detail_rows: List[List[Any]] = []
+            for g in goods:
+                if not isinstance(g, dict):
+                    continue
+                detail_rows.append(
+                    [
+                        g.get("cstGodCd", ""),
+                        g.get("godNm", ""),
+                        _num_cell(g.get("ordQty") or g.get("outQty") or 0),
+                        g.get("godDiv", ""),
+                    ]
+                )
+            _fill_table(self.detail_table, self.DETAIL_COLS, detail_rows)
+
+        _run_async(self, work, done)
+
+
+class _DeliveryParcelSubTab(QWidget):
+    """택배 출고 상세 — 지연(delayNm) / 배송누락(dlvMisYn=Y) 강조."""
+
+    COLUMNS = (
+        "slipNo",
+        "packDt",
+        "crgStNm",
+        "boxDivNm",
+        "boxNm",
+        "invoiceNo",
+        "parcelNm",
+        "godNm",
+        "packQty",
+        "sku",
+        "custNm",
+        "shopNm",
+        "salChanel",
+        "delayNm",
+        "dlvMisYn",
+        "rtnOrdDt",
+        "custAddr",
+    )
+
+    def __init__(self, tab: "FasstoTab") -> None:
+        super().__init__()
+        self._tab = tab
+        layout = QVBoxLayout(self)
+
+        start_d, end_d = _month_range()
+        top = QHBoxLayout()
+        self.start_edit = QDateEdit(QDate(start_d.year, start_d.month, start_d.day))
+        self.start_edit.setCalendarPopup(True)
+        self.start_edit.setDisplayFormat("yyyy-MM-dd")
+        self.end_edit = QDateEdit(QDate(end_d.year, end_d.month, end_d.day))
+        self.end_edit.setCalendarPopup(True)
+        self.end_edit.setDisplayFormat("yyyy-MM-dd")
+        self.out_div_combo = QComboBox()
+        self.out_div_combo.addItems(["1", "2", "COUPANG", "ONE_DAY"])
+        self.out_div_combo.setEditable(True)
+        self.refresh_btn = QPushButton("조회")
+        self.refresh_btn.clicked.connect(self._refresh)
+        self.only_problems = QCheckBox("지연/누락만")
+        self.only_problems.toggled.connect(self._apply_filter)
+        self.export_btn = QPushButton("CSV 저장")
+        self.export_btn.clicked.connect(
+            lambda: _export_table_to_csv(self.table, self, "fassto_parcel")
+        )
+        self.status = QLabel("")
+
+        top.addWidget(QLabel("시작"))
+        top.addWidget(self.start_edit)
+        top.addWidget(QLabel("종료"))
+        top.addWidget(self.end_edit)
+        top.addWidget(_DatePresetBar(self.start_edit, self.end_edit))
+        top.addWidget(QLabel("출고구분"))
+        top.addWidget(self.out_div_combo)
+        top.addWidget(self.refresh_btn)
+        top.addWidget(self.only_problems)
+        top.addWidget(self.export_btn)
+        top.addWidget(self.status, 1)
+
+        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSortingEnabled(True)
+
+        self._rows_data: List[Any] = []
+
+        layout.addLayout(top)
+        layout.addWidget(self.table, 1)
+
+    def _refresh(self) -> None:
+        if not self._tab.require_configured(self):
+            return
+        r = _normalize_range(self.start_edit, self.end_edit, self)
+        if not r:
+            return
+        start, end = r
+        out_div = (self.out_div_combo.currentText() or "1").strip() or "1"
+
+        self.status.setText("조회 중...")
+        self.refresh_btn.setEnabled(False)
+
+        def work() -> list:
+            env = self._tab.connector.get_delivery_parcel_list(start, end, out_div)
+            return normalize_fassto_delivery_parcels(extract_fassto_list(env))
+
+        def done(result: JobResult) -> None:
+            self.refresh_btn.setEnabled(True)
+            if not result.ok:
+                self.status.setText(f"❌ {result.error}")
+                return
+            self._rows_data = result.data
+            self._apply_filter()
+
+        _run_async(self, work, done)
+
+    def _apply_filter(self) -> None:
+        only_problems = self.only_problems.isChecked()
+        rows: List[List[Any]] = []
+        problems = 0
+        for r in self._rows_data:
+            is_miss = (r.dlvMisYn or "").upper() == "Y"
+            is_delay = bool((r.delayNm or "").strip())
+            is_problem = is_miss or is_delay
+            if is_problem:
+                problems += 1
+            if only_problems and not is_problem:
+                continue
+
+            bg = _BG_DANGER if is_miss else (_BG_WARN if is_delay else None)
+            fg = _FG_DANGER if is_miss else (_FG_WARN if is_delay else None)
+            delay_cell = (
+                Cell(text=r.delayNm or "", fg=_FG_WARN, bg=_BG_WARN)
+                if is_delay
+                else Cell(text=r.delayNm or "")
+            )
+            miss_cell = (
+                Cell(text="Y", fg=_FG_DANGER, bg=_BG_DANGER)
+                if is_miss
+                else Cell(text=r.dlvMisYn or "")
+            )
+            rows.append(
+                [
+                    Cell(text=r.slipNo, bg=bg),
+                    Cell(text=_fmt_yyyymmdd(r.packDt) if r.packDt else "", bg=bg),
+                    Cell(text=r.crgStNm or r.crgSt or "", bg=bg),
+                    Cell(text=r.boxDivNm or "", bg=bg),
+                    Cell(text=r.boxNm or "", bg=bg),
+                    Cell(text=r.invoiceNo or "", bg=bg),
+                    Cell(text=r.parcelNm or r.parcelCd or "", bg=bg),
+                    Cell(text=r.godNm or "", bg=bg),
+                    _num_cell(r.packQty, bg=bg),
+                    _num_cell(r.sku, bg=bg),
+                    Cell(text=r.custNm or "", bg=bg),
+                    Cell(text=r.shopNm or "", bg=bg),
+                    Cell(text=r.salChanel or "", bg=bg),
+                    delay_cell,
+                    miss_cell,
+                    Cell(text=_fmt_yyyymmdd(r.rtnOrdDt) if r.rtnOrdDt else "", bg=bg),
+                    Cell(text=(r.custAddr or "")[:40], bg=bg),
+                ]
+            )
+        _fill_table(self.table, self.COLUMNS, rows)
+        self.status.setText(
+            f"표시 {len(rows)}건 / 전체 {len(self._rows_data)}건 · 지연+누락 {problems}건"
+        )
+
+
+class _RevenueSubTab(QWidget):
+    """출고 상품 상세 — 요약 + TOP 상품 + 일별 추이 + 원본 테이블."""
+
+    COLUMNS = (
+        "outDt",
+        "slipNo",
+        "sellerChannel",
+        "orderNo",
+        "productOrderNo",
+        "custNm",
+        "cstGodCd",
+        "godNm",
+        "godDiv",
+        "outQty",
+        "markedPr",
+        "sellingPr",
+        "dcAmt",
+        "sellerDcAmt",
+        "naverDcAmt",
+        "소계(판매)",
+    )
+    TOP_COLS = ("순위", "cstGodCd", "godNm", "수량", "실매출", "비중%")
+    DAILY_COLS = ("일자", "건수", "수량", "실매출")
+    CHANNEL_COLS = ("sellerChannel", "건수", "수량합", "실매출", "비중%")
+
+    def __init__(self, tab: "FasstoTab") -> None:
+        super().__init__()
+        self._tab = tab
+        layout = QVBoxLayout(self)
+
+        start_d, end_d = _month_range()
+        top = QHBoxLayout()
+        self.start_edit = QDateEdit(QDate(start_d.year, start_d.month, start_d.day))
+        self.start_edit.setCalendarPopup(True)
+        self.start_edit.setDisplayFormat("yyyy-MM-dd")
+        self.end_edit = QDateEdit(QDate(end_d.year, end_d.month, end_d.day))
+        self.end_edit.setCalendarPopup(True)
+        self.end_edit.setDisplayFormat("yyyy-MM-dd")
+        self.refresh_btn = QPushButton("조회")
+        self.refresh_btn.clicked.connect(self._refresh)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("상품명/코드/채널/주문번호 검색")
+        self.search_edit.textChanged.connect(self._apply_filter)
+        self.export_btn = QPushButton("CSV 저장")
+        self.export_btn.clicked.connect(
+            lambda: _export_table_to_csv(self.table, self, "fassto_revenue")
+        )
+        self.export_top_btn = QPushButton("TOP CSV")
+        self.export_top_btn.clicked.connect(
+            lambda: _export_table_to_csv(self.top_table, self, "fassto_revenue_top")
+        )
+        self.export_daily_btn = QPushButton("일별 CSV")
+        self.export_daily_btn.clicked.connect(
+            lambda: _export_table_to_csv(self.daily_table, self, "fassto_revenue_daily")
+        )
+
+        top.addWidget(QLabel("시작"))
+        top.addWidget(self.start_edit)
+        top.addWidget(QLabel("종료"))
+        top.addWidget(self.end_edit)
+        top.addWidget(_DatePresetBar(self.start_edit, self.end_edit))
+        top.addWidget(self.refresh_btn)
+        top.addWidget(self.search_edit, 1)
+        top.addWidget(self.export_btn)
+        top.addWidget(self.export_top_btn)
+        top.addWidget(self.export_daily_btn)
+
+        # 요약 박스 (8지표)
+        summary_box = QGroupBox("요약")
+        grid = QGridLayout(summary_box)
+        self.lbl_rows = QLabel("-")
+        self.lbl_qty = QLabel("-")
+        self.lbl_gross = QLabel("-")
+        self.lbl_selling = QLabel("-")
+        self.lbl_dc = QLabel("-")
+        self.lbl_seller_dc = QLabel("-")
+        self.lbl_naver_dc = QLabel("-")
+        self.lbl_avg_price = QLabel("-")
+        for col, (label, widget) in enumerate(
+            [
+                ("건수", self.lbl_rows),
+                ("총수량", self.lbl_qty),
+                ("정가매출", self.lbl_gross),
+                ("실매출(판매가)", self.lbl_selling),
+                ("할인합", self.lbl_dc),
+                ("판매자부담", self.lbl_seller_dc),
+                ("네이버부담", self.lbl_naver_dc),
+                ("평균판매가", self.lbl_avg_price),
+            ]
+        ):
+            lbl = QLabel(label)
+            lbl.setStyleSheet("color: #666;")
+            grid.addWidget(lbl, 0, col)
+            widget.setStyleSheet("font-weight: bold;")
+            grid.addWidget(widget, 1, col)
+
+        # 3개 요약 테이블을 좌우로
+        tri = QSplitter(Qt.Horizontal)
+
+        channel_box = QGroupBox("채널별 매출")
+        cb_layout = QVBoxLayout(channel_box)
+        self.channel_table = QTableWidget(0, len(self.CHANNEL_COLS))
+        self.channel_table.setHorizontalHeaderLabels(self.CHANNEL_COLS)
+        self.channel_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.channel_table.setSortingEnabled(True)
+        cb_layout.addWidget(self.channel_table)
+        tri.addWidget(channel_box)
+
+        top_box = QGroupBox("상품 TOP 15 (실매출 기준)")
+        tb_layout = QVBoxLayout(top_box)
+        self.top_table = QTableWidget(0, len(self.TOP_COLS))
+        self.top_table.setHorizontalHeaderLabels(self.TOP_COLS)
+        self.top_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.top_table.setSortingEnabled(True)
+        tb_layout.addWidget(self.top_table)
+        tri.addWidget(top_box)
+
+        daily_box = QGroupBox("일별 매출 추이")
+        db_layout = QVBoxLayout(daily_box)
+        self.daily_table = QTableWidget(0, len(self.DAILY_COLS))
+        self.daily_table.setHorizontalHeaderLabels(self.DAILY_COLS)
+        self.daily_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.daily_table.setSortingEnabled(True)
+        db_layout.addWidget(self.daily_table)
+        tri.addWidget(daily_box)
+
+        tri.setStretchFactor(0, 2)
+        tri.setStretchFactor(1, 3)
+        tri.setStretchFactor(2, 2)
+
+        self.status = QLabel("")
+
+        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSortingEnabled(True)
+
+        layout.addLayout(top)
+        layout.addWidget(summary_box)
+        layout.addWidget(tri, 1)
+        layout.addWidget(self.status)
+        layout.addWidget(self.table, 2)
+
+        self._all_rows: List[FasstoDeliveryGoodDetailRow] = []
+
+    def _refresh(self) -> None:
+        if not self._tab.require_configured(self):
+            return
+        r = _normalize_range(self.start_edit, self.end_edit, self)
+        if not r:
+            return
+        start, end = r
+        self.status.setText("조회 중...")
+        self.refresh_btn.setEnabled(False)
+
+        def work() -> list:
+            env = self._tab.connector.get_delivery_good_detail_list(start, end)
+            return normalize_fassto_delivery_good_details(extract_fassto_list(env))
+
+        def done(result: JobResult) -> None:
+            self.refresh_btn.setEnabled(True)
+            if not result.ok:
+                self.status.setText(f"❌ {result.error}")
+                return
+            self._all_rows = result.data
+            self._render_summary()
+            self._apply_filter()
+
+        _run_async(self, work, done)
+
+    def _render_summary(self) -> None:
+        summary = summarize_delivery_good_details(self._all_rows)
+        total_selling = summary["sellingAmount"]
+        self.lbl_rows.setText(_fmt_num(summary["rowCount"]))
+        self.lbl_qty.setText(_fmt_num(summary["totalQty"]))
+        self.lbl_gross.setText(_fmt_money(summary["grossAmount"]))
+        self.lbl_selling.setText(_fmt_money(total_selling))
+        self.lbl_dc.setText(_fmt_money(summary["discountAmount"]))
+        self.lbl_seller_dc.setText(_fmt_money(summary["sellerDiscountAmount"]))
+        self.lbl_naver_dc.setText(_fmt_money(summary["naverDiscountAmount"]))
+        avg = (total_selling / summary["totalQty"]) if summary["totalQty"] else 0
+        self.lbl_avg_price.setText(_fmt_money(avg))
+
+        # --- 채널별
+        by_channel: Dict[str, Dict[str, float]] = {}
+        for r in self._all_rows:
+            key = r.sellerChannel or "(미지정)"
+            b = by_channel.setdefault(key, {"rows": 0.0, "qty": 0.0, "rev": 0.0})
+            b["rows"] += 1
+            b["qty"] += r.outQty
+            b["rev"] += r.sellingPrAmount * r.outQty
+        ch_rows: List[List[Any]] = []
+        for ch, v in sorted(by_channel.items(), key=lambda kv: -kv[1]["rev"]):
+            pct = (v["rev"] / total_selling * 100) if total_selling else 0
+            ch_rows.append(
+                [
+                    ch,
+                    _num_cell(v["rows"]),
+                    _num_cell(v["qty"]),
+                    _num_cell(v["rev"], _fmt_money),
+                    _num_cell(pct, lambda x: f"{float(x):.1f}%"),
+                ]
+            )
+        _fill_table(self.channel_table, self.CHANNEL_COLS, ch_rows)
+
+        # --- 상품 TOP 15
+        by_prod: Dict[Tuple[str, str], Dict[str, float]] = {}
+        for r in self._all_rows:
+            key = (r.cstGodCd or "", r.godNm or "")
+            b = by_prod.setdefault(key, {"qty": 0.0, "rev": 0.0})
+            b["qty"] += r.outQty
+            b["rev"] += r.sellingPrAmount * r.outQty
+        prod_sorted = sorted(by_prod.items(), key=lambda kv: -kv[1]["rev"])
+        top_rows: List[List[Any]] = []
+        for rank, ((code, nm), v) in enumerate(prod_sorted[:15], start=1):
+            pct = (v["rev"] / total_selling * 100) if total_selling else 0
+            top_rows.append(
+                [
+                    _num_cell(rank),
+                    code,
+                    nm,
+                    _num_cell(v["qty"]),
+                    _num_cell(v["rev"], _fmt_money),
+                    _num_cell(pct, lambda x: f"{float(x):.1f}%"),
+                ]
+            )
+        _fill_table(self.top_table, self.TOP_COLS, top_rows)
+
+        # --- 일별 추이
+        by_day: Dict[str, Dict[str, float]] = {}
+        for r in self._all_rows:
+            d = _fmt_yyyymmdd(r.outDt) if r.outDt else ""
+            b = by_day.setdefault(d, {"rows": 0.0, "qty": 0.0, "rev": 0.0})
+            b["rows"] += 1
+            b["qty"] += r.outQty
+            b["rev"] += r.sellingPrAmount * r.outQty
+        max_rev = max((v["rev"] for v in by_day.values()), default=0)
+        daily_rows: List[List[Any]] = []
+        for d, v in sorted(by_day.items()):
+            bg = None
+            if max_rev > 0 and v["rev"] >= max_rev * 0.8:
+                bg = _BG_OK
+            daily_rows.append(
+                [
+                    Cell(text=d, bg=bg),
+                    _num_cell(v["rows"], bg=bg),
+                    _num_cell(v["qty"], bg=bg),
+                    _num_cell(v["rev"], _fmt_money, bg=bg),
+                ]
+            )
+        _fill_table(self.daily_table, self.DAILY_COLS, daily_rows)
+
+    def _apply_filter(self) -> None:
+        q = self.search_edit.text().strip().lower()
+        rows_src = self._all_rows
+        if q:
+            rows_src = [
+                r
+                for r in self._all_rows
+                if any(
+                    q in str(v).lower()
+                    for v in (
+                        r.godNm,
+                        r.cstGodCd,
+                        r.sellerChannel,
+                        r.orderNo,
+                        r.productOrderNo,
+                        r.custNm,
+                    )
+                    if v
+                )
+            ]
+        table_rows: List[List[Any]] = []
+        for r in rows_src:
+            subtotal = r.sellingPrAmount * r.outQty
+            table_rows.append(
+                [
+                    _fmt_yyyymmdd(r.outDt),
+                    r.slipNo,
+                    r.sellerChannel or "",
+                    r.orderNo or "",
+                    r.productOrderNo or "",
+                    r.custNm or "",
+                    r.cstGodCd or "",
+                    r.godNm or "",
+                    r.godDiv or "",
+                    _num_cell(r.outQty),
+                    _num_cell(r.markedPrAmount, _fmt_money),
+                    _num_cell(r.sellingPrAmount, _fmt_money),
+                    _num_cell(r.dcAmount, _fmt_money),
+                    _num_cell(r.sellerDcAmount, _fmt_money),
+                    _num_cell(r.naverDcAmount, _fmt_money),
+                    _num_cell(subtotal, _fmt_money),
+                ]
+            )
+        _fill_table(self.table, self.COLUMNS, table_rows)
+        self.status.setText(
+            f"표시 {len(table_rows)}건 (전체 {len(self._all_rows)}건)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -576,8 +1828,6 @@ class _DeliverySubTab(QWidget):
 
 
 class FasstoTab(QWidget):
-    """파스토 풀필먼트 운영 콘솔 (상위 탭)."""
-
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
         self._config = config
@@ -595,19 +1845,23 @@ class FasstoTab(QWidget):
         self._inner = QTabWidget()
         self._overview = _OverviewSubTab(self)
         self._goods = _GoodsSubTab(self)
+        self._elements = _GoodsElementSubTab(self)
         self._stock = _StockSubTab(self)
         self._warehousing = _WarehousingSubTab(self)
         self._delivery = _DeliverySubTab(self)
+        self._parcel = _DeliveryParcelSubTab(self)
+        self._revenue = _RevenueSubTab(self)
 
         self._inner.addTab(self._overview, "개요")
         self._inner.addTab(self._goods, "상품")
+        self._inner.addTab(self._elements, "세트상품")
         self._inner.addTab(self._stock, "재고")
         self._inner.addTab(self._warehousing, "입고")
         self._inner.addTab(self._delivery, "출고")
+        self._inner.addTab(self._parcel, "택배출고")
+        self._inner.addTab(self._revenue, "매출 상세")
 
         layout.addWidget(self._inner, 1)
-
-    # --- helpers exposed to sub-tabs ------------------------------------
 
     def is_configured(self) -> bool:
         return self.connector.is_configured()

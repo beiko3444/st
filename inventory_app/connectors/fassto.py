@@ -457,6 +457,30 @@ class FasstoGoodsRow:
     giftDiv: str
     barcode: Optional[str]
     useYn: Optional[str]
+    # 확장 필드 (파스토 실응답 기준)
+    godCd: Optional[str] = None
+    godTypeNm: Optional[str] = None
+    giftDivNm: Optional[str] = None
+    cstNm: Optional[str] = None
+    supCd: Optional[str] = None
+    supNm: Optional[str] = None
+    cateCd: Optional[str] = None
+    cateNm: Optional[str] = None
+    godPr: float = 0.0
+    inPr: float = 0.0
+    salPr: float = 0.0
+    godWeight: float = 0.0
+    godWidth: float = 0.0
+    godLength: float = 0.0
+    godHeight: float = 0.0
+    boxInCnt: float = 0.0
+    saleUnitQty: float = 0.0
+    safetyStock: float = 0.0
+    firstInDt: Optional[str] = None
+    distTermMgtYn: Optional[str] = None
+    useTermDay: Optional[str] = None
+    outCanDay: Optional[str] = None
+    origin: Optional[str] = None
     raw: Any = field(default=None, repr=False)
 
 
@@ -467,6 +491,16 @@ class FasstoStockRow:
     canStockQty: float
     badStockQty: float
     goodsSerialNo: Optional[str]
+    # 확장 필드
+    godCd: Optional[str] = None
+    godNm: Optional[str] = None
+    godBarcd: Optional[str] = None
+    whCd: Optional[str] = None
+    distTermDt: Optional[str] = None
+    distTermMgtYn: Optional[str] = None
+    giftDiv: Optional[str] = None
+    supNm: Optional[str] = None
+    slipNo: Optional[str] = None
     raw: Any = field(default=None, repr=False)
 
 
@@ -482,7 +516,169 @@ class FasstoDeliveryRow:
     invoiceNo: Optional[str]
     parcelCd: Optional[str]
     parcelNm: Optional[str]
+    # 확장 필드
+    outDt: Optional[str] = None
+    outDivNm: Optional[str] = None
+    mapSlipNo: Optional[str] = None
+    whCd: Optional[str] = None
+    whNm: Optional[str] = None
+    shopCd: Optional[str] = None
+    shopNm: Optional[str] = None
+    salChanel: Optional[str] = None
+    sku: float = 0.0
+    ordQty: float = 0.0
+    addGodOrdQty: float = 0.0
+    outWay: Optional[str] = None
+    outWayNm: Optional[str] = None
+    ordDiv: Optional[str] = None
+    custAddr: Optional[str] = None
+    custTelNo: Optional[str] = None
+    sendNm: Optional[str] = None
+    sendTelNo: Optional[str] = None
+    updUserNm: Optional[str] = None
+    updTime: Optional[str] = None
+    supCd: Optional[str] = None
+    supNm: Optional[str] = None
+    remark: Optional[str] = None
     raw: Any = field(default=None, repr=False)
+
+
+@dataclass
+class FasstoWarehousingRow:
+    """입고(Warehousing) 리스트 정규화 — 실응답 wrkStat/supNm 기준."""
+
+    slipNo: str
+    ordDt: str
+    ordNo: Optional[str]
+    whCd: Optional[str]
+    whNm: Optional[str]
+    supCd: Optional[str]
+    supNm: Optional[str]
+    sku: float
+    ordQty: float
+    inQty: float
+    tarQty: float
+    inWay: Optional[str]
+    inWayNm: Optional[str]
+    parcelComp: Optional[str]
+    parcelInvoiceNo: Optional[str]
+    wrkStat: Optional[str]
+    wrkStatNm: Optional[str]
+    remark: Optional[str]
+    raw: Any = field(default=None, repr=False)
+
+
+@dataclass
+class FasstoGoodsElementItem:
+    cstGodCd: str
+    godCd: Optional[str]
+    godBarcd: Optional[str]
+    godNm: Optional[str]
+    godType: Optional[str]
+    godTypeNm: Optional[str]
+    qty: float
+
+
+@dataclass
+class FasstoGoodsElementRow:
+    """세트/묶음상품 + 구성품 리스트."""
+
+    cstGodCd: str
+    godCd: Optional[str]
+    godNm: Optional[str]
+    useYn: Optional[str]
+    elements: List[FasstoGoodsElementItem] = field(default_factory=list)
+    raw: Any = field(default=None, repr=False)
+
+
+@dataclass
+class FasstoDeliveryParcelRow:
+    """택배 출고 상세 (박스/송장/반품 포함)."""
+
+    slipNo: str
+    outOrdSlipNo: Optional[str]
+    mapSlipNo: Optional[str]
+    ordNo: Optional[str]
+    ordSeq: Optional[str]
+    packDt: Optional[str]
+    boxDiv: Optional[str]
+    boxDivNm: Optional[str]
+    boxNm: Optional[str]
+    boxNo: Optional[str]
+    boxTp: Optional[str]
+    crgSt: Optional[str]
+    crgStNm: Optional[str]
+    delayCd: Optional[str]
+    delayNm: Optional[str]
+    dlvMisYn: Optional[str]
+    whCd: Optional[str]
+    shopCd: Optional[str]
+    shopNm: Optional[str]
+    salChanel: Optional[str]
+    cstNm: Optional[str]
+    godCd: Optional[str]
+    godNm: Optional[str]
+    custNm: Optional[str]
+    custAddr: Optional[str]
+    custTelNo: Optional[str]
+    invoiceNo: Optional[str]
+    parcelCd: Optional[str]
+    parcelNm: Optional[str]
+    parcelLinkYn: Optional[str]
+    packQty: float
+    packSeq: Optional[str]
+    pickSeq: Optional[str]
+    printCnt: Optional[str]
+    postYn: Optional[str]
+    sku: float
+    outDiv: Optional[str]
+    outDivNm: Optional[str]
+    shipReqTerm: Optional[str]
+    rtnOrdDt: Optional[str]
+    rtnAddr1: Optional[str]
+    rtnAddr2: Optional[str]
+    rtnTelNo: Optional[str]
+    rtnZipCd: Optional[str]
+    rtnCheck: Optional[str]
+    rtnEmpNm: Optional[str]
+    raw: Any = field(default=None, repr=False)
+
+
+@dataclass
+class FasstoDeliveryGoodDetailRow:
+    """출고 상품 상세 — 매출/할인 단가 포함."""
+
+    outDt: str
+    slipNo: str
+    outOrdSlipNo: Optional[str]
+    productOrderNo: Optional[str]
+    orderNo: Optional[str]
+    ordDiv: Optional[str]
+    invoiceNo: Optional[str]
+    sellerChannel: Optional[str]
+    custNm: Optional[str]
+    godCd: Optional[str]
+    cstGodCd: Optional[str]
+    godDiv: Optional[str]
+    godNm: Optional[str]
+    outQty: float
+    markedPrAmount: float
+    sellingPrAmount: float
+    dcAmount: float
+    sellerDcAmount: float
+    naverDcAmount: float
+    raw: Any = field(default=None, repr=False)
+
+
+def _serial_to_text(value: Any) -> Optional[str]:
+    """goodsSerialNo 가 list로 오는 케이스 대응."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        parts = [str(v).strip() for v in value if v is not None and str(v).strip()]
+        return ", ".join(parts) if parts else None
+    text = str(value).strip()
+    return text or None
 
 
 def normalize_fassto_goods(rows: Iterable[Mapping[str, Any]]) -> List[FasstoGoodsRow]:
@@ -500,7 +696,15 @@ def normalize_fassto_goods(rows: Iterable[Mapping[str, Any]]) -> List[FasstoGood
         )
         god_type = _to_text(_first_defined(row.get("godType"), row.get("goodsType"), "1")) or "1"
         gift_div = _to_text(_first_defined(row.get("giftDiv"), "01")) or "01"
-        barcode = _to_text(_first_defined(row.get("barcode"), row.get("barCd"), row.get("godBarcode"))) or None
+        # 파스토 실응답은 godBarcd. 과거 호환을 위해 barcode/barCd/godBarcode 도 허용.
+        barcode = _to_text(
+            _first_defined(
+                row.get("godBarcd"),
+                row.get("barcode"),
+                row.get("barCd"),
+                row.get("godBarcode"),
+            )
+        ) or None
         use_yn = _to_text(_first_defined(row.get("useYn"), row.get("use_yn"))) or None
         result.append(
             FasstoGoodsRow(
@@ -510,6 +714,29 @@ def normalize_fassto_goods(rows: Iterable[Mapping[str, Any]]) -> List[FasstoGood
                 giftDiv=gift_div,
                 barcode=barcode,
                 useYn=use_yn,
+                godCd=_to_text(row.get("godCd")) or None,
+                godTypeNm=_to_text(row.get("godTypeNm")) or None,
+                giftDivNm=_to_text(row.get("giftDivNm")) or None,
+                cstNm=_to_text(row.get("cstNm")) or None,
+                supCd=_to_text(row.get("supCd")) or None,
+                supNm=_to_text(row.get("supNm")) or None,
+                cateCd=_to_text(row.get("cateCd")) or None,
+                cateNm=_to_text(row.get("cateNm")) or None,
+                godPr=_to_number(row.get("godPr")),
+                inPr=_to_number(row.get("inPr")),
+                salPr=_to_number(row.get("salPr")),
+                godWeight=_to_number(row.get("godWeight")),
+                godWidth=_to_number(row.get("godWidth")),
+                godLength=_to_number(row.get("godLength")),
+                godHeight=_to_number(row.get("godHeight")),
+                boxInCnt=_to_number(row.get("boxInCnt")),
+                saleUnitQty=_to_number(row.get("saleUnitQty")),
+                safetyStock=_to_number(row.get("safetyStock")),
+                firstInDt=_to_text(row.get("firstInDt")) or None,
+                distTermMgtYn=_to_text(row.get("distTermMgtYn")) or None,
+                useTermDay=_to_text(row.get("useTermDay")) or None,
+                outCanDay=_to_text(row.get("outCanDay")) or None,
+                origin=_to_text(row.get("origin")) or None,
                 raw=row,
             )
         )
@@ -538,10 +765,18 @@ def normalize_fassto_stocks(rows: Iterable[Mapping[str, Any]]) -> List[FasstoSto
                 badStockQty=_to_number(
                     _first_defined(row.get("badStockQty"), row.get("badStockQnt"), row.get("badStock"), 0)
                 ),
-                goodsSerialNo=_to_text(
+                goodsSerialNo=_serial_to_text(
                     _first_defined(row.get("goodsSerialNo"), row.get("goodsSerno"), row.get("goodsSerialNumber"))
-                )
-                or None,
+                ),
+                godCd=_to_text(row.get("godCd")) or None,
+                godNm=_to_text(row.get("godNm")) or None,
+                godBarcd=_to_text(_first_defined(row.get("godBarcd"), row.get("barcode"))) or None,
+                whCd=_to_text(row.get("whCd")) or None,
+                distTermDt=_to_text(row.get("distTermDt")) or None,
+                distTermMgtYn=_to_text(row.get("distTermMgtYn")) or None,
+                giftDiv=_to_text(row.get("giftDiv")) or None,
+                supNm=_to_text(row.get("supNm")) or None,
+                slipNo=_to_text(row.get("slipNo")) or None,
                 raw=row,
             )
         )
@@ -557,13 +792,20 @@ def normalize_fassto_deliveries(rows: Iterable[Mapping[str, Any]]) -> List[Fasst
         ord_no = _to_text(_first_defined(row.get("ordNo"), row.get("orderNo"), row.get("custOrdNo")))
         if not slip_no and not ord_no:
             continue
+        # 파스토 실응답은 wrkStat/wrkStatNm. status/crgSt 도 과거 호환으로 유지.
+        status_code = _to_text(
+            _first_defined(row.get("wrkStat"), row.get("status"), row.get("crgSt"), "")
+        )
+        status_name = _to_text(
+            _first_defined(row.get("wrkStatNm"), row.get("statusNm"), row.get("crgStNm"), row.get("statusName"))
+        )
         result.append(
             FasstoDeliveryRow(
                 slipNo=slip_no,
                 ordNo=ord_no,
                 ordDt=_to_text(_first_defined(row.get("ordDt"), row.get("orderDate"), row.get("outReqDt"))),
-                status=_to_text(_first_defined(row.get("status"), row.get("crgSt"), row.get("wrkStat"), "")),
-                statusNm=_to_text(_first_defined(row.get("statusNm"), row.get("crgStNm"), row.get("statusName"))),
+                status=status_code,
+                statusNm=status_name,
                 outDiv=_to_text(_first_defined(row.get("outDiv"), row.get("deliveryDiv"), row.get("outType"))),
                 custNm=_to_text(_first_defined(row.get("custNm"), row.get("customerName"), row.get("recvNm"))),
                 invoiceNo=_to_text(
@@ -575,10 +817,251 @@ def normalize_fassto_deliveries(rows: Iterable[Mapping[str, Any]]) -> List[Fasst
                     _first_defined(row.get("parcelNm"), row.get("deliveryNm"), row.get("parcelComp"))
                 )
                 or None,
+                outDt=_to_text(row.get("outDt")) or None,
+                outDivNm=_to_text(row.get("outDivNm")) or None,
+                mapSlipNo=_to_text(row.get("mapSlipNo")) or None,
+                whCd=_to_text(row.get("whCd")) or None,
+                whNm=_to_text(row.get("whNm")) or None,
+                shopCd=_to_text(row.get("shopCd")) or None,
+                shopNm=_to_text(row.get("shopNm")) or None,
+                salChanel=_to_text(row.get("salChanel")) or None,
+                sku=_to_number(row.get("sku")),
+                ordQty=_to_number(row.get("ordQty")),
+                addGodOrdQty=_to_number(row.get("addGodOrdQty")),
+                outWay=_to_text(row.get("outWay")) or None,
+                outWayNm=_to_text(row.get("outWayNm")) or None,
+                ordDiv=_to_text(row.get("ordDiv")) or None,
+                custAddr=_to_text(row.get("custAddr")) or None,
+                custTelNo=_to_text(row.get("custTelNo")) or None,
+                sendNm=_to_text(row.get("sendNm")) or None,
+                sendTelNo=_to_text(row.get("sendTelNo")) or None,
+                updUserNm=_to_text(row.get("updUserNm")) or None,
+                updTime=_to_text(row.get("updTime")) or None,
+                supCd=_to_text(row.get("supCd")) or None,
+                supNm=_to_text(row.get("supNm")) or None,
+                remark=_to_text(row.get("remark")) or None,
                 raw=row,
             )
         )
     return result
+
+
+def normalize_fassto_warehousings(
+    rows: Iterable[Mapping[str, Any]],
+) -> List[FasstoWarehousingRow]:
+    """입고(Warehousing) 응답 정규화 — 실응답 wrkStat/supNm 기준."""
+    result: List[FasstoWarehousingRow] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        slip_no = _to_text(_first_defined(row.get("slipNo"), row.get("fmsSlipNo")))
+        if not slip_no:
+            continue
+        result.append(
+            FasstoWarehousingRow(
+                slipNo=slip_no,
+                ordDt=_to_text(_first_defined(row.get("ordDt"), row.get("inDt"))),
+                ordNo=_to_text(row.get("ordNo")) or None,
+                whCd=_to_text(row.get("whCd")) or None,
+                whNm=_to_text(row.get("whNm")) or None,
+                supCd=_to_text(row.get("supCd")) or None,
+                supNm=_to_text(row.get("supNm")) or None,
+                sku=_to_number(row.get("sku")),
+                ordQty=_to_number(row.get("ordQty")),
+                inQty=_to_number(row.get("inQty")),
+                tarQty=_to_number(row.get("tarQty")),
+                inWay=_to_text(row.get("inWay")) or None,
+                inWayNm=_to_text(row.get("inWayNm")) or None,
+                parcelComp=_to_text(row.get("parcelComp")) or None,
+                parcelInvoiceNo=_to_text(row.get("parcelInvoiceNo")) or None,
+                wrkStat=_to_text(_first_defined(row.get("wrkStat"), row.get("status"), row.get("crgSt")))
+                or None,
+                wrkStatNm=_to_text(
+                    _first_defined(row.get("wrkStatNm"), row.get("statusNm"), row.get("crgStNm"))
+                )
+                or None,
+                remark=_to_text(row.get("remark")) or None,
+                raw=row,
+            )
+        )
+    return result
+
+
+def normalize_fassto_goods_elements(
+    rows: Iterable[Mapping[str, Any]],
+) -> List[FasstoGoodsElementRow]:
+    """세트/묶음상품 구성 리스트 정규화."""
+    result: List[FasstoGoodsElementRow] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        cst_god_cd = _to_text(_first_defined(row.get("cstGodCd"), row.get("godCd")))
+        if not cst_god_cd:
+            continue
+        elements_raw = row.get("elementList") or row.get("elements") or []
+        elements: List[FasstoGoodsElementItem] = []
+        if isinstance(elements_raw, list):
+            for item in elements_raw:
+                if not isinstance(item, Mapping):
+                    continue
+                child_cst = _to_text(_first_defined(item.get("cstGodCd"), item.get("godCd")))
+                if not child_cst:
+                    continue
+                elements.append(
+                    FasstoGoodsElementItem(
+                        cstGodCd=child_cst,
+                        godCd=_to_text(item.get("godCd")) or None,
+                        godBarcd=_to_text(_first_defined(item.get("godBarcd"), item.get("barcode")))
+                        or None,
+                        godNm=_to_text(item.get("godNm")) or None,
+                        godType=_to_text(item.get("godType")) or None,
+                        godTypeNm=_to_text(item.get("godTypeNm")) or None,
+                        qty=_to_number(item.get("qty")),
+                    )
+                )
+        result.append(
+            FasstoGoodsElementRow(
+                cstGodCd=cst_god_cd,
+                godCd=_to_text(row.get("godCd")) or None,
+                godNm=_to_text(row.get("godNm")) or None,
+                useYn=_to_text(row.get("useYn")) or None,
+                elements=elements,
+                raw=row,
+            )
+        )
+    return result
+
+
+def normalize_fassto_delivery_parcels(
+    rows: Iterable[Mapping[str, Any]],
+) -> List[FasstoDeliveryParcelRow]:
+    """택배 출고 상세 (박스·송장·반품정보)."""
+    result: List[FasstoDeliveryParcelRow] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        slip_no = _to_text(_first_defined(row.get("slipNo"), row.get("outOrdSlipNo")))
+        if not slip_no:
+            continue
+        result.append(
+            FasstoDeliveryParcelRow(
+                slipNo=slip_no,
+                outOrdSlipNo=_to_text(row.get("outOrdSlipNo")) or None,
+                mapSlipNo=_to_text(row.get("mapSlipNo")) or None,
+                ordNo=_to_text(row.get("ordNo")) or None,
+                ordSeq=_to_text(row.get("ordSeq")) or None,
+                packDt=_to_text(row.get("packDt")) or None,
+                boxDiv=_to_text(row.get("boxDiv")) or None,
+                boxDivNm=_to_text(row.get("boxDivNm")) or None,
+                boxNm=_to_text(row.get("boxNm")) or None,
+                boxNo=_to_text(row.get("boxNo")) or None,
+                boxTp=_to_text(row.get("boxTp")) or None,
+                crgSt=_to_text(row.get("crgSt")) or None,
+                crgStNm=_to_text(row.get("crgStNm")) or None,
+                delayCd=_to_text(row.get("delayCd")) or None,
+                delayNm=_to_text(row.get("delayNm")) or None,
+                dlvMisYn=_to_text(row.get("dlvMisYn")) or None,
+                whCd=_to_text(row.get("whCd")) or None,
+                shopCd=_to_text(row.get("shopCd")) or None,
+                shopNm=_to_text(row.get("shopNm")) or None,
+                salChanel=_to_text(row.get("salChanel")) or None,
+                cstNm=_to_text(row.get("cstNm")) or None,
+                godCd=_to_text(row.get("godCd")) or None,
+                godNm=_to_text(row.get("godNm")) or None,
+                custNm=_to_text(row.get("custNm")) or None,
+                custAddr=_to_text(row.get("custAddr")) or None,
+                custTelNo=_to_text(row.get("custTelNo")) or None,
+                invoiceNo=_to_text(row.get("invoiceNo")) or None,
+                parcelCd=_to_text(row.get("parcelCd")) or None,
+                parcelNm=_to_text(row.get("parcelNm")) or None,
+                parcelLinkYn=_to_text(row.get("parcelLinkYn")) or None,
+                packQty=_to_number(row.get("packQty")),
+                packSeq=_to_text(row.get("packSeq")) or None,
+                pickSeq=_to_text(row.get("pickSeq")) or None,
+                printCnt=_to_text(row.get("printCnt")) or None,
+                postYn=_to_text(row.get("postYn")) or None,
+                sku=_to_number(row.get("sku")),
+                outDiv=_to_text(row.get("outDiv")) or None,
+                outDivNm=_to_text(row.get("outDivNm")) or None,
+                shipReqTerm=_to_text(row.get("shipReqTerm")) or None,
+                rtnOrdDt=_to_text(row.get("rtnOrdDt")) or None,
+                rtnAddr1=_to_text(row.get("rtnAddr1")) or None,
+                rtnAddr2=_to_text(row.get("rtnAddr2")) or None,
+                rtnTelNo=_to_text(row.get("rtnTelNo")) or None,
+                rtnZipCd=_to_text(row.get("rtnZipCd")) or None,
+                rtnCheck=_to_text(row.get("rtnCheck")) or None,
+                rtnEmpNm=_to_text(row.get("rtnEmpNm")) or None,
+                raw=row,
+            )
+        )
+    return result
+
+
+def normalize_fassto_delivery_good_details(
+    rows: Iterable[Mapping[str, Any]],
+) -> List[FasstoDeliveryGoodDetailRow]:
+    """출고 상품 상세 — 매출/할인 단가 포함."""
+    result: List[FasstoDeliveryGoodDetailRow] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        slip_no = _to_text(row.get("slipNo"))
+        out_dt = _to_text(row.get("outDt"))
+        if not slip_no and not out_dt:
+            continue
+        result.append(
+            FasstoDeliveryGoodDetailRow(
+                outDt=out_dt,
+                slipNo=slip_no,
+                outOrdSlipNo=_to_text(row.get("outOrdSlipNo")) or None,
+                productOrderNo=_to_text(row.get("productOrderNo")) or None,
+                orderNo=_to_text(row.get("orderNo")) or None,
+                ordDiv=_to_text(row.get("ordDiv")) or None,
+                invoiceNo=_to_text(row.get("invoiceNo")) or None,
+                sellerChannel=_to_text(row.get("sellerChannel")) or None,
+                custNm=_to_text(row.get("custNm")) or None,
+                godCd=_to_text(row.get("godCd")) or None,
+                cstGodCd=_to_text(row.get("cstGodCd")) or None,
+                godDiv=_to_text(row.get("godDiv")) or None,
+                godNm=_to_text(row.get("godNm")) or None,
+                outQty=_to_number(row.get("outQty")),
+                markedPrAmount=_to_number(row.get("markedPrAmount")),
+                sellingPrAmount=_to_number(row.get("sellingPrAmount")),
+                dcAmount=_to_number(row.get("dcAmount")),
+                sellerDcAmount=_to_number(row.get("sellerDcAmount")),
+                naverDcAmount=_to_number(row.get("naverDcAmount")),
+                raw=row,
+            )
+        )
+    return result
+
+
+def summarize_delivery_good_details(
+    rows: Sequence[FasstoDeliveryGoodDetailRow],
+) -> Dict[str, float]:
+    """매출·할인 합계 요약."""
+    total_qty = 0.0
+    gross_amount = 0.0
+    selling_amount = 0.0
+    discount_amount = 0.0
+    seller_discount = 0.0
+    naver_discount = 0.0
+    for r in rows:
+        total_qty += r.outQty
+        gross_amount += r.markedPrAmount * r.outQty
+        selling_amount += r.sellingPrAmount * r.outQty
+        discount_amount += r.dcAmount * r.outQty
+        seller_discount += r.sellerDcAmount * r.outQty
+        naver_discount += r.naverDcAmount * r.outQty
+    return {
+        "rowCount": float(len(rows)),
+        "totalQty": total_qty,
+        "grossAmount": gross_amount,
+        "sellingAmount": selling_amount,
+        "discountAmount": discount_amount,
+        "sellerDiscountAmount": seller_discount,
+        "naverDiscountAmount": naver_discount,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1008,6 +1491,11 @@ __all__ = [
     "FasstoGoodsRow",
     "FasstoStockRow",
     "FasstoDeliveryRow",
+    "FasstoWarehousingRow",
+    "FasstoGoodsElementItem",
+    "FasstoGoodsElementRow",
+    "FasstoDeliveryParcelRow",
+    "FasstoDeliveryGoodDetailRow",
     "GoodsSyncDecision",
     "StockCompareRow",
     "SYNC_STATUS_CREATE",
@@ -1025,6 +1513,11 @@ __all__ = [
     "normalize_fassto_goods",
     "normalize_fassto_stocks",
     "normalize_fassto_deliveries",
+    "normalize_fassto_warehousings",
+    "normalize_fassto_goods_elements",
+    "normalize_fassto_delivery_parcels",
+    "normalize_fassto_delivery_good_details",
+    "summarize_delivery_good_details",
     "normalize_product_code",
     "build_goods_payload",
     "decide_goods_sync",
