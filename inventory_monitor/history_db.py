@@ -463,6 +463,81 @@ class InventoryHistoryDB:
             )
             return {row[0]: row[1] for row in cursor.fetchall()}
 
+    def get_daily_sales_series(
+        self, start_date: str, end_date: str
+    ) -> List[dict]:
+        """기간별 일자×(channel, product_id, item_id) 단위 판매량 합계.
+
+        반환: [{date, channel, product_id, item_id, qty_sold, revenue}, ...]
+        """
+        with self._guard, self._connection() as conn:
+            cursor = conn.execute(
+                """
+                WITH pairs AS (
+                    SELECT
+                        DATE(a.recorded_at) AS sale_date,
+                        a.channel,
+                        a.product_id,
+                        a.item_id,
+                        a.price,
+                        CASE
+                            WHEN a.channel = 'naver'
+                                 AND a.today_sales IS NOT NULL
+                            THEN CASE
+                                WHEN b.today_sales IS NOT NULL
+                                     AND DATE(b.recorded_at) = DATE(a.recorded_at)
+                                THEN MAX(0, a.today_sales - b.today_sales)
+                                ELSE MAX(0, a.today_sales)
+                            END
+                            WHEN a.channel = 'coupang'
+                                 AND a.sales IS NOT NULL
+                                 AND b.sales IS NOT NULL
+                            THEN MAX(0, a.sales - b.sales)
+                            WHEN a.stock IS NOT NULL
+                                 AND b.stock IS NOT NULL
+                            THEN (b.stock - a.stock)
+                            ELSE 0
+                        END AS qty_sold
+                    FROM inventory_history a
+                    JOIN inventory_history b
+                        ON a.channel = b.channel
+                        AND a.product_id = b.product_id
+                        AND (a.item_id = b.item_id OR (a.item_id IS NULL AND b.item_id IS NULL))
+                        AND b.id = (
+                            SELECT MAX(id) FROM inventory_history c
+                            WHERE c.channel = a.channel
+                              AND c.product_id = a.product_id
+                              AND (c.item_id = a.item_id OR (c.item_id IS NULL AND a.item_id IS NULL))
+                              AND c.id < a.id
+                        )
+                    WHERE DATE(a.recorded_at) BETWEEN ? AND ?
+                )
+                SELECT
+                    sale_date,
+                    channel,
+                    product_id,
+                    item_id,
+                    SUM(qty_sold) AS qty_sold_sum,
+                    SUM(CASE WHEN price IS NOT NULL THEN qty_sold * price ELSE 0 END) AS revenue_sum
+                FROM pairs
+                WHERE qty_sold > 0
+                GROUP BY sale_date, channel, product_id, item_id
+                ORDER BY sale_date ASC
+                """,
+                (start_date, end_date),
+            )
+            cols = [
+                "date", "channel", "product_id", "item_id",
+                "qty_sold", "revenue",
+            ]
+            result: List[dict] = []
+            for row in cursor.fetchall():
+                d = dict(zip(cols, row))
+                d["qty_sold"] = int(d["qty_sold"] or 0)
+                d["revenue"] = int(d["revenue"] or 0)
+                result.append(d)
+            return result
+
     def get_daily_summary(self, date_str: str) -> dict:
         """특정 날짜의 판매 요약 (총 건수, 추정매출)."""
         rows = self.get_sales_for_date(date_str)

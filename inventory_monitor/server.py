@@ -111,6 +111,19 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
+        elif path == "/sales/series":
+            # /sales/series?start=YYYY-MM-DD&end=YYYY-MM-DD
+            start = qs.get("start", [None])[0]
+            end = qs.get("end", [None])[0]
+            if not start or not end:
+                self._send_json({"error": "start and end parameters required"}, 400)
+                return
+            try:
+                rows = db.get_daily_sales_series(start, end)
+                self._send_json({"start": start, "end": end, "rows": rows})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
         elif path == "/sales/dates":
             # 판매가 있었던 날짜 목록
             try:
