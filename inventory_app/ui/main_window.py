@@ -24,12 +24,16 @@ from PySide6.QtWidgets import (
     QApplication,
     QCalendarWidget,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFontDialog,
     QHeaderView,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -267,6 +271,74 @@ class ClickableLabel(QLabel):
             event.accept()
             return
         super().mousePressEvent(event)
+
+
+def _pick_master_with_search(
+    parent: QWidget,
+    title: str,
+    label_text: str,
+    options: List[str],
+    *,
+    create_label: str | None = None,
+) -> str | None:
+    """검색 가능한 마스터 선택 다이얼로그.
+
+    options 의 첫 번째 항목이 항상 보이도록 하고 (예: "+ 새 마스터 만들기"),
+    그 외 항목은 검색어로 필터링.
+    """
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(title)
+    dialog.resize(420, 360)
+
+    layout = QVBoxLayout(dialog)
+    layout.setContentsMargins(12, 12, 12, 12)
+    layout.setSpacing(8)
+
+    layout.addWidget(QLabel(label_text))
+
+    search_edit = QLineEdit()
+    search_edit.setPlaceholderText("마스터 이름/번호로 검색…")
+    search_edit.setClearButtonEnabled(True)
+    layout.addWidget(search_edit)
+
+    list_widget = QListWidget()
+    list_widget.setUniformItemSizes(True)
+    layout.addWidget(list_widget, 1)
+
+    button_box = QDialogButtonBox(
+        QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+    )
+    button_box.accepted.connect(dialog.accept)
+    button_box.rejected.connect(dialog.reject)
+    layout.addWidget(button_box)
+
+    def _populate(filter_text: str) -> None:
+        list_widget.clear()
+        q = filter_text.strip().lower()
+        for opt in options:
+            is_create = create_label is not None and opt == create_label
+            if not is_create and q and q not in opt.lower():
+                continue
+            item = QListWidgetItem(opt)
+            list_widget.addItem(item)
+        if list_widget.count() > 0:
+            list_widget.setCurrentRow(0)
+
+    _populate("")
+    search_edit.textChanged.connect(_populate)
+
+    # Enter 누르면 선택 확정, ↓ 누르면 리스트로 포커스 이동
+    def _on_search_return() -> None:
+        if list_widget.count() > 0:
+            dialog.accept()
+
+    search_edit.returnPressed.connect(_on_search_return)
+    list_widget.itemDoubleClicked.connect(lambda _it: dialog.accept())
+
+    if dialog.exec() != QDialog.Accepted:
+        return None
+    item = list_widget.currentItem()
+    return item.text() if item else None
 
 
 class ChannelTab(QWidget):
@@ -1338,15 +1410,14 @@ class ChannelTab(QWidget):
             if len(rows) == 1
             else f"{len(rows)}개 상품을 연결할 마스터 선택"
         )
-        pick, ok = QInputDialog.getItem(
+        pick = _pick_master_with_search(
             self,
             pick_title,
             "마스터 상품을 선택하거나 새로 만들어주세요.",
             options,
-            0,
-            False,
+            create_label=CREATE_LABEL,
         )
-        if not ok or not pick:
+        if pick is None:
             return
 
         if pick == CREATE_LABEL:

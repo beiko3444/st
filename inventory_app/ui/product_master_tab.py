@@ -702,8 +702,28 @@ class ProductMasterTab(QWidget):
             len(rows)
             for rows in self._current_aggregation.unlinked_by_channel.values()
         )
+        # 재고원가 합계: 단가 있는 마스터만 (단가 × 총재고) 합산
+        total_stock_cost = 0
+        for mr in self._current_aggregation.masters:
+            unit_cost = mr.master.unit_cost
+            stock = mr.total_stock
+            if unit_cost is None or stock is None:
+                continue
+            total_stock_cost += int(unit_cost) * int(stock)
+        # 오늘 판매금액: 각 채널 링크의 (오늘판매수량 × 채널 판매가) 합산
+        total_today_revenue = 0
+        for mr in self._current_aggregation.masters:
+            for link in mr.linked:
+                if link.today_sales is None or link.price is None:
+                    continue
+                total_today_revenue += int(link.today_sales) * int(link.price)
+        revenue_text = f"오늘 판매금액 {total_today_revenue:,}원"
+        cost_text = f"재고원가 합계 {total_stock_cost:,}원"
         warn = self._remote_refresh_warning or ""
-        base = f"마스터 {total_masters}개 · 미연결 채널상품 {unlinked_count}개"
+        base = (
+            f"{revenue_text}  |  {cost_text}  |  "
+            f"마스터 {total_masters}개 · 미연결 채널상품 {unlinked_count}개"
+        )
         self.summary_label.setText(f"{base}  |  ⚠ {warn}" if warn else base)
 
     def _render_master_table(self) -> None:
