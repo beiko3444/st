@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -261,6 +262,7 @@ class MasterDetailDialog(QDialog):
         master_id: Optional[int],
         aggregation: MasterAggregation,
         parent: Optional[QWidget] = None,
+        monitor_url: str = "",
     ) -> None:
         super().__init__(parent)
         self.service = service
@@ -268,11 +270,12 @@ class MasterDetailDialog(QDialog):
         self.master_id = master_id  # None = create mode
         self._aggregation = aggregation
         self._dirty = False
+        self._monitor_url = monitor_url
         self.loader.signals.loaded.connect(self._on_image_loaded)
         self.setWindowTitle(
             "새 마스터 상품" if master_id is None else "마스터 상품 상세"
         )
-        self.resize(820, 640)
+        self.resize(880, 720)
         self._build_ui()
         if master_id is None:
             self._setup_create_mode()
@@ -333,7 +336,13 @@ class MasterDetailDialog(QDialog):
         separator.setStyleSheet("color: #e2e8f0;")
         layout.addWidget(separator)
 
-        layout.addWidget(QLabel("연결된 채널 상품"))
+        # 탭: 연결된 채널 상품 / 30일 판매 추이
+        self.detail_tabs = QTabWidget()
+
+        # --- 연결 탭 ---
+        links_page = QWidget()
+        lp_layout = QVBoxLayout(links_page)
+        lp_layout.setContentsMargins(0, 6, 0, 0)
         self.links_table = QTableWidget(0, len(_LINK_COLS))
         self.links_table.setHorizontalHeaderLabels(_LINK_COLS)
         self.links_table.verticalHeader().setVisible(False)
@@ -346,7 +355,32 @@ class MasterDetailDialog(QDialog):
         links_header.setSectionResizeMode(1, QHeaderView.Stretch)
         for idx in (0, 2, 3, 4, 5, 6, 7, 8):
             links_header.setSectionResizeMode(idx, QHeaderView.ResizeToContents)
-        layout.addWidget(self.links_table, 1)
+        lp_layout.addWidget(self.links_table, 1)
+        self.detail_tabs.addTab(links_page, "연결된 채널 상품")
+
+        # --- 차트 탭 ---
+        chart_page = QWidget()
+        cp_layout = QVBoxLayout(chart_page)
+        cp_layout.setContentsMargins(0, 6, 0, 0)
+        cp_layout.setSpacing(6)
+        self.chart_summary = QLabel("탭 클릭 시 그래프를 불러옵니다.")
+        self.chart_summary.setStyleSheet(
+            "color: #475569; padding: 6px; background: #f8fafc;"
+            " border: 1px solid #e2e8f0; border-radius: 6px;"
+        )
+        cp_layout.addWidget(self.chart_summary)
+        self.chart = QChart()
+        self.chart.setAnimationOptions(QChart.SeriesAnimations)
+        self.chart.legend().setAlignment(Qt.AlignBottom)
+        self.chart_view = QChartView(self.chart)
+        self.chart_view.setRenderHint(QPainter.Antialiasing)
+        cp_layout.addWidget(self.chart_view, 1)
+        self.detail_tabs.addTab(chart_page, "30일 판매 추이")
+
+        self._chart_loaded = False
+        self.detail_tabs.currentChanged.connect(self._on_detail_tab_changed)
+
+        layout.addWidget(self.detail_tabs, 1)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Close)
         button_box.rejected.connect(self.accept)
@@ -597,119 +631,70 @@ class MasterDetailDialog(QDialog):
                 pm.scaled(116, 116, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             )
 
+    def _on_detail_tab_changed(self, idx: int) -> None:
+        # idx=1 → 차트 탭. 처음 진입 시에만 로드.
+        if idx == 1 and not self._chart_loaded and self.master_id is not None:
+            self._load_sales_chart()
 
-# ---------------------------------------------------------------------------
-# 상품등록 탭
-# ---------------------------------------------------------------------------
+    def _load_sales_chart(self) -> None:
+        """Pi /sales/series 30일치 응답을 마스터 단위로 환산해 라인 차트 그리기."""
+        self._chart_loaded = True
+        if not self._monitor_url:
+            self.chart_summary.setText(
+                "<span style='color:#dc2626'>monitor.url 미설정 — 그래프를 불러올 수 없습니다.</span>"
+            )
+            return
+        master_row = self._find_master_row()
+        if master_row is None:
+            self.chart_summary.setText("마스터 정보 없음")
+            return
 
-
-class MasterSalesChartDialog(QDialog):
-    """마스터 상품의 최근 30일 일별 판매량 직선 그래프.
-
-    Pi `/sales/series` 응답을 마스터 링크로 매핑 후 multiplier 적용해
-    네이버/쿠팡/전체 3개 라인을 그린다.
-    """
-
-    DAYS = 30
-
-    def __init__(
-        self,
-        master: MasterProduct,
-        master_row: MasterProductRow,
-        monitor_url: str,
-        timeout: int = 30,
-        parent: Optional[QWidget] = None,
-    ) -> None:
-        super().__init__(parent)
-        self.master = master
-        self.master_row = master_row
-        self.monitor_url = monitor_url.rstrip("/")
-        self.timeout = timeout
-
-        self.setWindowTitle(f"{master.name} — 최근 {self.DAYS}일 판매 추이")
-        self.resize(820, 460)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
-
-        title = QLabel(f"<b>{master.name}</b>  ·  최근 {self.DAYS}일 일별 판매량")
-        title.setStyleSheet("font-size: 14px; color: #0f172a;")
-        layout.addWidget(title)
-
-        self.summary_label = QLabel("불러오는 중...")
-        self.summary_label.setStyleSheet(
-            "color: #475569; padding: 6px; background: #f8fafc;"
-            " border: 1px solid #e2e8f0; border-radius: 6px;"
-        )
-        layout.addWidget(self.summary_label)
-
-        self.chart = QChart()
-        self.chart.setAnimationOptions(QChart.SeriesAnimations)
-        self.chart.legend().setAlignment(Qt.AlignBottom)
-        self.chart_view = QChartView(self.chart)
-        self.chart_view.setRenderHint(QPainter.Antialiasing)
-        layout.addWidget(self.chart_view, 1)
-
-        button_box = QDialogButtonBox(QDialogButtonBox.Close)
-        button_box.rejected.connect(self.reject)
-        button_box.accepted.connect(self.accept)
-        layout.addWidget(button_box)
-
-        # 비동기적으로 데이터 가져오면 좋지만 30일 데이터는 가벼우니 동기 호출.
-        self._load_and_render()
-
-    def _load_and_render(self) -> None:
         end_d = date.today()
-        start_d = end_d - timedelta(days=self.DAYS - 1)
-
+        start_d = end_d - timedelta(days=29)
         try:
             resp = httpx.get(
-                f"{self.monitor_url}/sales/series",
+                f"{self._monitor_url.rstrip('/')}/sales/series",
                 params={"start": start_d.isoformat(), "end": end_d.isoformat()},
-                timeout=self.timeout,
+                timeout=30,
             )
             resp.raise_for_status()
             payload = resp.json()
         except Exception as exc:  # noqa: BLE001
-            self.summary_label.setText(f"<span style='color:#dc2626'>조회 실패: {exc}</span>")
+            self.chart_summary.setText(
+                f"<span style='color:#dc2626'>그래프 조회 실패: {exc}</span>"
+            )
             return
 
         rows = payload.get("rows") or []
+        link_mult: Dict[Tuple[str, str], int] = {
+            (lk.channel, lk.product_key): max(1, int(lk.multiplier))
+            for lk in master_row.linked
+        }
 
-        # 마스터에 연결된 링크 (channel, product_key) → multiplier 맵
-        link_mult: Dict[Tuple[str, str], int] = {}
-        for link in self.master_row.linked:
-            link_mult[(link.channel, link.product_key)] = max(1, int(link.multiplier))
-
-        # 일자 → {naver, coupang, total} (마스터 단위)
         day_naver: Dict[str, int] = {}
         day_coupang: Dict[str, int] = {}
-        day_revenue: Dict[str, int] = {}
         total_qty = 0
         total_revenue = 0
-
         for r in rows:
             channel = str(r.get("channel") or "").strip().lower()
             pid = str(r.get("product_id") or "").strip()
             iid = r.get("item_id")
             iid_text = str(iid) if iid not in (None, "") else ""
             product_key = f"id:{pid}|item:{iid_text}" if pid else ""
-            multiplier = link_mult.get((channel, product_key))
-            if multiplier is None:
+            mult = link_mult.get((channel, product_key))
+            if mult is None:
                 continue
             day = str(r.get("date") or "")
-            qty_master = int(r.get("qty_sold") or 0) * multiplier
+            qty_master = int(r.get("qty_sold") or 0) * mult
             revenue = int(r.get("revenue") or 0)
             if channel == "naver":
                 day_naver[day] = day_naver.get(day, 0) + qty_master
             elif channel == "coupang":
                 day_coupang[day] = day_coupang.get(day, 0) + qty_master
-            day_revenue[day] = day_revenue.get(day, 0) + revenue
             total_qty += qty_master
             total_revenue += revenue
 
-        # 30일 모든 날짜에 대해 0 으로 채워 series 정렬 보장
+        # 30일 모든 날짜 채우기
         all_days: list[date] = []
         cur = start_d
         while cur <= end_d:
@@ -722,7 +707,6 @@ class MasterSalesChartDialog(QDialog):
         coupang_series.setName("쿠팡")
         total_series = QLineSeries()
         total_series.setName("합계")
-
         pen_total = QPen(Qt.black)
         pen_total.setWidth(2)
         total_series.setPen(pen_total)
@@ -740,7 +724,7 @@ class MasterSalesChartDialog(QDialog):
             coupang_series.append(ts, c)
             total_series.append(ts, t)
 
-        # 기존 차트 클리어
+        # reset chart
         for s in self.chart.series()[:]:
             self.chart.removeSeries(s)
         for ax in self.chart.axes():
@@ -771,11 +755,16 @@ class MasterSalesChartDialog(QDialog):
             QDateTime(end_d.year, end_d.month, end_d.day, 23, 59),
         )
 
-        self.summary_label.setText(
+        self.chart_summary.setText(
             f"기간 {start_d.isoformat()} ~ {end_d.isoformat()}  ·  "
-            f"총 판매 <b>{total_qty:,}건</b> (마스터 단위)  ·  "
-            f"매출 ₩{total_revenue:,}"
+            f"총 판매 <b>{total_qty:,}건</b>  ·  매출 ₩{total_revenue:,}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 상품등록 탭
+# ---------------------------------------------------------------------------
+
 
 
 class ProductMasterTab(QWidget):
@@ -1028,28 +1017,8 @@ class ProductMasterTab(QWidget):
 
     def _on_row_double_clicked(self, _index) -> None:
         master_id = self._selected_master_id()
-        if master_id is None:
-            return
-        self._open_sales_chart_dialog(master_id)
-
-    def _open_sales_chart_dialog(self, master_id: int) -> None:
-        if self._current_aggregation is None:
-            return
-        master_row = self._find_master_row(master_id)
-        if master_row is None:
-            return
-        if not self.monitor_url:
-            QMessageBox.information(
-                self, "라파 미연결", "monitor.url 이 설정돼 있어야 판매 추이 그래프를 그릴 수 있습니다."
-            )
-            return
-        dlg = MasterSalesChartDialog(
-            master=master_row.master,
-            master_row=master_row,
-            monitor_url=self.monitor_url,
-            parent=self,
-        )
-        dlg.exec()
+        if master_id is not None:
+            self._open_detail_dialog(master_id)
 
     def _on_detail_button_clicked(self) -> None:
         master_id = self._selected_master_id()
@@ -1067,6 +1036,7 @@ class ProductMasterTab(QWidget):
             master_id=master_id,
             aggregation=self._current_aggregation,
             parent=self,
+            monitor_url=self.monitor_url,
         )
         dlg.changed.connect(self._on_dialog_changed)
         dlg.exec()
@@ -1090,6 +1060,7 @@ class ProductMasterTab(QWidget):
             master_id=None,
             aggregation=self._current_aggregation,
             parent=self,
+            monitor_url=self.monitor_url,
         )
         dlg.changed.connect(self._on_dialog_changed)
         dlg.exec()

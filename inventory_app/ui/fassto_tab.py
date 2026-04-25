@@ -138,11 +138,10 @@ def _run_async(
     dispatcher = _AsyncDispatcher(parent, on_done)
 
     thread.started.connect(worker.run)
-    # AutoConnection: worker(작업 스레드) → dispatcher(메인 스레드) ⇒ QueuedConnection.
-    worker.finished.connect(dispatcher.handle)
-    # quit 은 thread 본체(메인에서 만든 객체)로 큐잉돼 안전.
-    worker.finished.connect(thread.quit)
-    # finished 후 객체 정리.
+    # 명시적 QueuedConnection — 어떤 환경(번들 vs 개발)이든 worker(작업 스레드)
+    # 에서 emit 된 신호가 메인 스레드 이벤트 루프에 큐잉되도록 강제.
+    worker.finished.connect(dispatcher.handle, Qt.QueuedConnection)
+    worker.finished.connect(thread.quit, Qt.QueuedConnection)
     thread.finished.connect(worker.deleteLater)
     thread.finished.connect(dispatcher.deleteLater)
     thread.finished.connect(thread.deleteLater)
