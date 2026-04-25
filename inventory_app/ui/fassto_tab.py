@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from PySide6.QtCore import QDate, QObject, QThread, Qt, Signal
+from PySide6.QtCore import QDate, QObject, QThread, Qt, Signal, Slot
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -102,24 +102,50 @@ class FasstoJob(QObject):
             self.finished.emit(JobResult(ok=False, error=str(exc)))
 
 
+class _AsyncDispatcher(QObject):
+    """parent 스레드(보통 메인 UI 스레드)에서 on_done 을 실행하기 위한 헬퍼.
+
+    QThread 안에서 callable closure 로 직접 connect 하면 DirectConnection
+    이 적용돼 on_done 이 워커 스레드에서 실행되고, 그 안에서 thread.wait()
+    가 호출되면 자기 자신을 기다리며 데드락/크래시가 발생함. parent 가 가진
+    QObject 를 슬롯 홀더로 두면 AutoConnection 이 QueuedConnection 으로
+    승격돼 on_done 이 메인 스레드에서 안전하게 실행된다.
+    """
+
+    def __init__(
+        self,
+        parent: QObject,
+        on_done: Callable[["JobResult"], None],
+    ) -> None:
+        super().__init__(parent)
+        self._on_done = on_done
+
+    @Slot(object)
+    def handle(self, result: "JobResult") -> None:
+        try:
+            self._on_done(result)
+        except Exception as exc:  # noqa: BLE001
+            # UI 콜백 자체에서 실수가 나도 앱이 죽지 않게 한다.
+            print(f"[fassto async on_done error] {exc}")
+
+
 def _run_async(
     parent: QObject, func: Callable[[], Any], on_done: Callable[[JobResult], None]
 ) -> None:
     thread = QThread(parent)
     worker = FasstoJob(func)
     worker.moveToThread(thread)
+    dispatcher = _AsyncDispatcher(parent, on_done)
+
     thread.started.connect(worker.run)
-
-    def _cleanup(result: JobResult) -> None:
-        try:
-            on_done(result)
-        finally:
-            thread.quit()
-            thread.wait()
-            worker.deleteLater()
-            thread.deleteLater()
-
-    worker.finished.connect(_cleanup)
+    # AutoConnection: worker(작업 스레드) → dispatcher(메인 스레드) ⇒ QueuedConnection.
+    worker.finished.connect(dispatcher.handle)
+    # quit 은 thread 본체(메인에서 만든 객체)로 큐잉돼 안전.
+    worker.finished.connect(thread.quit)
+    # finished 후 객체 정리.
+    thread.finished.connect(worker.deleteLater)
+    thread.finished.connect(dispatcher.deleteLater)
+    thread.finished.connect(thread.deleteLater)
     thread.start()
 
 

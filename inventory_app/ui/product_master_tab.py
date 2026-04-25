@@ -710,14 +710,23 @@ class ProductMasterTab(QWidget):
             if unit_cost is None or stock is None:
                 continue
             total_stock_cost += int(unit_cost) * int(stock)
-        # 오늘 판매금액: 각 채널 링크의 (오늘판매수량 × 채널 판매가) 합산
-        total_today_revenue = 0
+        # 오늘 판매금액: 각 채널 링크의 (오늘판매수량 × 채널 판매가) 채널별 합산
+        naver_revenue = 0
+        coupang_revenue = 0
         for mr in self._current_aggregation.masters:
             for link in mr.linked:
                 if link.today_sales is None or link.price is None:
                     continue
-                total_today_revenue += int(link.today_sales) * int(link.price)
-        revenue_text = f"오늘 판매금액 {total_today_revenue:,}원"
+                amount = int(link.today_sales) * int(link.price)
+                if link.channel == "naver":
+                    naver_revenue += amount
+                elif link.channel == "coupang":
+                    coupang_revenue += amount
+        total_today_revenue = naver_revenue + coupang_revenue
+        revenue_text = (
+            f"오늘 판매금액 네이버 {naver_revenue:,}원 + 쿠팡 {coupang_revenue:,}원 "
+            f"= {total_today_revenue:,}원"
+        )
         cost_text = f"재고원가 합계 {total_stock_cost:,}원"
         warn = self._remote_refresh_warning or ""
         base = (

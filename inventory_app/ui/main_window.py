@@ -3332,6 +3332,12 @@ class SalesDailyTab(QWidget):
         self.monitor_url = monitor_url
         self.timeout = timeout
         self.cache = cache or ChannelProductCache()
+        # 상품등록 탭과 동일한 write-through 서비스 사용 — 매 조회 시 Pi 에서
+        # 마스터/링크 최신 스냅샷을 fetch 해 multiplier·새 마스터를 즉시 반영.
+        self.master_service = build_master_service(
+            cache=self.cache, monitor_url=monitor_url
+        )
+        self._master_remote_warning: str = ""
         self._loaded_once = False
         self.image_cache: dict[str, QPixmap] = {}
         self._image_pending: set[str] = set()
@@ -3555,7 +3561,16 @@ class SalesDailyTab(QWidget):
 
         sales = data.get("sales", [])
 
-        # 마스터/링크 로드 (각 이벤트를 마스터로 귀속)
+        # 마스터/링크 로드 — 상품등록 탭과 동일하게 Pi 에서 최신 스냅샷 fetch.
+        # 실패 시 로컬 캐시 사용 + 요약 영역에 경고.
+        self._master_remote_warning = ""
+        if self.master_service.has_remote():
+            try:
+                self.master_service.refresh_from_remote()
+            except MasterRemoteError as exc:
+                self._master_remote_warning = (
+                    f"Pi 마스터 동기화 실패 (로컬 캐시 사용): {exc}"
+                )
         try:
             links = self.cache.load_all_links()
             masters_by_id = {m.id: m for m in self.cache.list_masters()}
@@ -3632,6 +3647,10 @@ class SalesDailyTab(QWidget):
         if unlinked:
             lines.append(
                 f"미연결 {len(unlinked)}건 · {unlinked_qty:,}수량 / ₩{unlinked_revenue:,.0f}"
+            )
+        if self._master_remote_warning:
+            lines.append(
+                f"<span style='color:#b45309'>⚠ {self._master_remote_warning}</span>"
             )
         self.summary_label.setText("<br>".join(lines))
 

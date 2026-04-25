@@ -99,18 +99,16 @@ def _fetch_from_monitor(url: str, channel: str, timeout: int) -> List[ChannelPro
             item_id = (str(r.get("item_id")) if r.get("item_id") else None)
             raw_today = r.get("today_sales")
             if raw_today is None:
-                # 쿠팡은 monitor 서버의 재고변동 기반 today 추정치가 왜곡될 수 있어
-                # 서버가 today_sales를 직접 제공하지 않으면 0으로 처리한다.
-                if channel.lower() == "coupang":
+                # Pi /sales 엔드포인트는 재고 감소만 카운트하므로 쿠팡도 정확.
+                # exact 매칭(product_id+item_id)으로 옵션별 정확도 확보.
+                exact_key = _monitor_sales_key(product_id, item_id)
+                raw_today = today_sales_exact.get(exact_key)
+                # 네이버는 item_id 없을 때 product 단위 fallback 허용.
+                # 쿠팡은 옵션 변별이 중요하므로 fallback 없음.
+                if raw_today is None and not item_id and channel.lower() != "coupang":
+                    raw_today = today_sales_by_product.get(product_id, 0)
+                if raw_today is None:
                     raw_today = 0
-                else:
-                    exact_key = _monitor_sales_key(product_id, item_id)
-                    raw_today = today_sales_exact.get(exact_key)
-                    # item_id가 있는 행은 정확 매칭만 사용하고, 없을 때만 product 단위 fallback 허용
-                    if raw_today is None and not item_id:
-                        raw_today = today_sales_by_product.get(product_id, 0)
-                    if raw_today is None:
-                        raw_today = 0
             today_sales = _to_int(raw_today)
             if today_sales is None:
                 today_sales = 0
