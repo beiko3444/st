@@ -65,6 +65,7 @@ _MASTER_COLS = [
     "네이버(오늘)",
     "쿠팡(오늘)",
     "오늘판매",
+    "오늘매출",
     "네이버판매(30일)",
     "쿠팡판매(30일)",
     "총판매(30일)",
@@ -86,6 +87,13 @@ _LINK_COLS = [
 def _format_int(value: Optional[int]) -> str:
     if value is None:
         return "-"
+    return f"{int(value):,}"
+
+
+def _format_sales_int(value: Optional[int]) -> str:
+    """판매 수량 포매터 — 0 또는 None 이면 공란 (시각적 노이즈 제거)."""
+    if value is None or int(value) == 0:
+        return ""
     return f"{int(value):,}"
 
 
@@ -415,8 +423,8 @@ class MasterDetailDialog(QDialog):
 
         self.links_table.setItem(row_idx, 2, _number_item(f"×{link.multiplier}", link.multiplier))
         self.links_table.setItem(row_idx, 3, _number_item(_format_int(link.stock), link.stock))
-        self.links_table.setItem(row_idx, 4, _number_item(_format_int(link.sales), link.sales))
-        self.links_table.setItem(row_idx, 5, _number_item(_format_int(link.today_sales), link.today_sales))
+        self.links_table.setItem(row_idx, 4, _number_item(_format_sales_int(link.sales), link.sales))
+        self.links_table.setItem(row_idx, 5, _number_item(_format_sales_int(link.today_sales), link.today_sales))
         self.links_table.setItem(row_idx, 6, _number_item(_format_price(link.price), link.price))
 
         rep_item = QTableWidgetItem("★" if is_rep else "")
@@ -649,12 +657,13 @@ class ProductMasterTab(QWidget):
             header.setSectionResizeMode(idx, QHeaderView.Interactive)
         _col_widths = {
             0: 56, 1: 260, 2: 80, 3: 92, 4: 88, 5: 86, 6: 80, 7: 80,
-            8: 110, 9: 92, 10: 84, 11: 86, 12: 116, 13: 110, 14: 108, 15: 56,
+            8: 110, 9: 92, 10: 84, 11: 86, 12: 110,
+            13: 116, 14: 110, 15: 108, 16: 56,
         }
         for col, w in _col_widths.items():
             self.master_table.setColumnWidth(col, w)
         self.master_table.verticalHeader().setDefaultSectionSize(48)
-        for total_col in (7, 11, 14):
+        for total_col in (7, 11, 12, 15):
             header_item = self.master_table.horizontalHeaderItem(total_col)
             if header_item is not None:
                 f = header_item.font()
@@ -784,25 +793,40 @@ class ProductMasterTab(QWidget):
             row_idx, 8, _number_item(_format_price(stock_cost), stock_cost)
         )
         self.master_table.setItem(
-            row_idx, 9, _number_item(_format_int(master_row.naver_today_sales), master_row.naver_today_sales)
+            row_idx, 9, _number_item(_format_sales_int(master_row.naver_today_sales), master_row.naver_today_sales)
         )
         self.master_table.setItem(
-            row_idx, 10, _number_item(_format_int(master_row.coupang_today_sales), master_row.coupang_today_sales)
+            row_idx, 10, _number_item(_format_sales_int(master_row.coupang_today_sales), master_row.coupang_today_sales)
         )
         self.master_table.setItem(
-            row_idx, 11, _number_item(_format_int(master_row.total_today_sales), master_row.total_today_sales)
+            row_idx, 11, _number_item(_format_sales_int(master_row.total_today_sales), master_row.total_today_sales)
+        )
+        # 오늘 매출: 채널 링크별 (오늘판매수량 × 채널판매가) 합산.
+        # 채널마다 가격이 달라 master_row 의 channel_today_sales 에 단일 가격 곱하면 부정확.
+        today_revenue = 0
+        for link in master_row.linked:
+            if link.today_sales is None or link.price is None:
+                continue
+            today_revenue += int(link.today_sales) * int(link.price)
+        self.master_table.setItem(
+            row_idx,
+            12,
+            _number_item(
+                _format_price(today_revenue) if today_revenue else "",
+                today_revenue,
+            ),
         )
         self.master_table.setItem(
-            row_idx, 12, _number_item(_format_int(master_row.naver_sales), master_row.naver_sales)
+            row_idx, 13, _number_item(_format_sales_int(master_row.naver_sales), master_row.naver_sales)
         )
         self.master_table.setItem(
-            row_idx, 13, _number_item(_format_int(master_row.coupang_sales), master_row.coupang_sales)
+            row_idx, 14, _number_item(_format_sales_int(master_row.coupang_sales), master_row.coupang_sales)
         )
         self.master_table.setItem(
-            row_idx, 14, _number_item(_format_int(master_row.total_sales), master_row.total_sales)
+            row_idx, 15, _number_item(_format_sales_int(master_row.total_sales), master_row.total_sales)
         )
         link_count = len(master_row.linked)
-        self.master_table.setItem(row_idx, 15, _number_item(str(link_count), link_count))
+        self.master_table.setItem(row_idx, 16, _number_item(str(link_count), link_count))
 
     # ------------------------------------------------------------------
     # Table interaction

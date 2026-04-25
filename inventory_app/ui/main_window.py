@@ -3578,9 +3578,9 @@ class SalesDailyTab(QWidget):
             links = {}
             masters_by_id = {}
 
-        # 마스터별 집계 + 미연결 버킷
+        # 마스터별 집계 — 미연결 상품은 무시 (마스터 단위 판매일보)
         agg: dict[int, dict] = {}
-        unlinked: list[dict] = []
+        skipped_unlinked = 0
         for event in sales:
             if not isinstance(event, dict):
                 continue
@@ -3599,12 +3599,7 @@ class SalesDailyTab(QWidget):
 
             link = links.get((channel, product_key))
             if link is None or link.master_id not in masters_by_id:
-                unlinked.append({
-                    "channel": channel,
-                    "name": event.get("name") or product_key or "(미상)",
-                    "qty": qty,
-                    "revenue": revenue,
-                })
+                skipped_unlinked += 1
                 continue
             multiplier = max(1, int(link.multiplier))
             master_qty_delta = qty * multiplier
@@ -3637,16 +3632,14 @@ class SalesDailyTab(QWidget):
 
         total_qty = sum(t[2] for t in rows)
         total_revenue = sum(t[1]["revenue"] for t in rows)
-        unlinked_qty = sum(u["qty"] for u in unlinked)
-        unlinked_revenue = sum(u["revenue"] for u in unlinked)
 
         lines = [f"<b>{date_str} 판매일보 (마스터 단위)</b>"]
         lines.append(
             f"마스터 {len(rows)}개 · 총 <b>{total_qty:,}건</b> / ₩{total_revenue:,.0f}"
         )
-        if unlinked:
+        if skipped_unlinked:
             lines.append(
-                f"미연결 {len(unlinked)}건 · {unlinked_qty:,}수량 / ₩{unlinked_revenue:,.0f}"
+                f"<span style='color:#94a3b8'>미연결 {skipped_unlinked}건 제외</span>"
             )
         if self._master_remote_warning:
             lines.append(
@@ -3654,9 +3647,8 @@ class SalesDailyTab(QWidget):
             )
         self.summary_label.setText("<br>".join(lines))
 
-        # 테이블 렌더
-        total_rows = len(rows) + (len(unlinked) if unlinked else 0)
-        self.table.setRowCount(total_rows)
+        # 테이블 렌더 — 마스터 연결된 행만
+        self.table.setRowCount(len(rows))
         token = self.render_token
         row_idx = 0
         for master_id, data_row, total in rows:
@@ -3698,41 +3690,6 @@ class SalesDailyTab(QWidget):
                 _mk_num(f"₩{data_row['revenue']:,}" if data_row['revenue'] else "-", data_row['revenue']),
             )
             self.table.setItem(row_idx, 6, QTableWidgetItem(""))
-            row_idx += 1
-
-        # 미연결 섹션 (옅은 배경 + 비고 표시)
-        for u in unlinked:
-            self.table.setRowHeight(row_idx, 44)
-            self.table.setCellWidget(row_idx, 0, QWidget())
-            ch_label = "네이버" if u["channel"] == "naver" else ("쿠팡" if u["channel"] == "coupang" else u["channel"])
-            name_item = QTableWidgetItem(str(u["name"] or ""))
-            name_item.setForeground(QColor("#dc2626"))
-            self.table.setItem(row_idx, 1, name_item)
-
-            def _mk_num2(text: str, sort_val) -> QTableWidgetItem:
-                item = QTableWidgetItem(text)
-                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                item.setData(Qt.UserRole, sort_val)
-                item.setForeground(QColor("#dc2626"))
-                return item
-
-            qty_val = u["qty"]
-            self.table.setItem(row_idx, 2, _mk_num2(f"{qty_val:,}", qty_val))
-            self.table.setItem(
-                row_idx, 3,
-                _mk_num2(f"{qty_val:,}" if u["channel"] == "naver" else "-", qty_val if u["channel"] == "naver" else 0),
-            )
-            self.table.setItem(
-                row_idx, 4,
-                _mk_num2(f"{qty_val:,}" if u["channel"] == "coupang" else "-", qty_val if u["channel"] == "coupang" else 0),
-            )
-            self.table.setItem(
-                row_idx, 5,
-                _mk_num2(f"₩{u['revenue']:,}" if u['revenue'] else "-", u['revenue']),
-            )
-            note_item = QTableWidgetItem(f"미연결 ({ch_label})")
-            note_item.setForeground(QColor("#dc2626"))
-            self.table.setItem(row_idx, 6, note_item)
             row_idx += 1
 
     def _request_image(self, label: QLabel, url: str, token: int) -> None:
