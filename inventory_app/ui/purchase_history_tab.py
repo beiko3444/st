@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, List
 
 from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QBrush, QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -226,17 +226,48 @@ class PurchaseHistoryTab(QWidget):
         self.status.setText(f"{self.CHANNEL_LABELS[channel]} {len(records)}건 분석, {added}건 추가")
         self.reload()
 
+    # 취소/환불 키워드 (제목 안에서 탐지)
+    _CANCEL_KEYWORDS = ("결제취소", "취소완료", "주문취소", "구매취소", "환불완료", "환불")
+
+    @classmethod
+    def _is_cancelled(cls, record: PurchaseRecord) -> bool:
+        title = str(record.title or "")
+        for kw in cls._CANCEL_KEYWORDS:
+            if kw in title:
+                return True
+        return False
+
+    @classmethod
+    def _signed_amount(cls, record: PurchaseRecord) -> int:
+        """취소 거래는 음수, 정상 거래는 양수."""
+        amt = int(record.amount or 0)
+        return -amt if cls._is_cancelled(record) else amt
+
     def reload(self) -> None:
         channel = self._selected_channel()
         rows = self.store.load_records(channel=channel)
         self._render(rows)
-        total_amount = sum(int(row.amount or 0) for row in rows)
-        self.status.setText(f"{len(rows):,}건 / {total_amount:,}원")
+        # 정상 합계와 취소 차감을 분리해서 표시 (실수령/실지출 직관적으로)
+        gross = sum(int(row.amount or 0) for row in rows if not self._is_cancelled(row))
+        cancelled = sum(int(row.amount or 0) for row in rows if self._is_cancelled(row))
+        net = gross - cancelled
+        if cancelled > 0:
+            self.status.setText(
+                f"{len(rows):,}건 · 결제 {gross:,}원 - 취소 {cancelled:,}원 = "
+                f"<b>순 {net:,}원</b>"
+            )
+        else:
+            self.status.setText(f"{len(rows):,}건 / {net:,}원")
 
     def _render(self, rows: List[PurchaseRecord]) -> None:
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(rows))
+        red_brush = QBrush(QColor("#dc2626"))  # 빨강
+        gray_brush = QBrush(QColor("#9ca3af"))  # 취소된 행의 다른 컬럼 (옅은 회색)
         for row_idx, record in enumerate(rows):
+            cancelled = self._is_cancelled(record)
+            signed_amt = self._signed_amount(record)
+
             values: list[Any] = [
                 record.order_date or "-",
                 self.CHANNEL_LABELS.get(record.channel, record.channel),
@@ -248,11 +279,29 @@ class PurchaseHistoryTab(QWidget):
             ]
             for col_idx, value in enumerate(values):
                 if col_idx == 4:
-                    item = _NumberItem(f"{int(value or 0):,}원" if value else "-")
-                    item.setData(Qt.UserRole, int(value or 0))
+                    # 금액: 취소면 음수 + 빨강, 정상이면 그대로
+                    if cancelled:
+                        text = f"-{int(value or 0):,}원" if value else "-"
+                    else:
+                        text = f"{int(value or 0):,}원" if value else "-"
+                    item = _NumberItem(text)
+                    item.setData(Qt.UserRole, signed_amt)  # 정렬용 signed 값
+                    if cancelled:
+                        item.setForeground(red_brush)
+                        # 굵게 강조
+                        font = item.font()
+                        font.setBold(True)
+                        item.setFont(font)
                 else:
                     item = QTableWidgetItem(str(value))
                     item.setData(Qt.UserRole, str(value))
+                    if cancelled and col_idx != 3:
+                        # 상품명 외 다른 셀은 옅은 회색으로 (시각적 약화)
+                        item.setForeground(gray_brush)
+                    elif cancelled and col_idx == 3:
+                        # 상품명도 빨강으로
+                        item.setForeground(red_brush)
+
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 if col_idx == 3:
                     item.setToolTip(record.raw_text[:1000])
