@@ -63,6 +63,15 @@ def main() -> int:
         build_name,
         "--add-data",
         _add_data_arg(),
+        # Playwright 가 동적 import 하는 모듈을 명시적으로 포함
+        "--collect-all",
+        "playwright",
+        "--hidden-import",
+        "pyee",
+        "--hidden-import",
+        "pyee.asyncio",
+        "--hidden-import",
+        "greenlet",
     ]
     if icon_path is not None:
         command += ["--icon", str(icon_path)]
