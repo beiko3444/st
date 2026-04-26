@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from inventory_app.models import PurchaseRecord
+from inventory_app.models import PurchaseOrder, PurchaseRecord
 
 
 @dataclass
@@ -180,10 +180,17 @@ def _split_order_like_blocks(text: str) -> list[str]:
 class PurchaseHistoryStore:
     _guard = threading.Lock()
 
-    def __init__(self, db_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        db_path: Path | None = None,
+        *,
+        pi_client: "object | None" = None,
+    ) -> None:
         self.db_path = (db_path or _default_db_path()).resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
+        # Pi write-through: monitor_url 이 설정된 경우 Pi 에도 동기화 (best-effort)
+        self._pi = pi_client
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=5.0)
@@ -224,6 +231,30 @@ class PurchaseHistoryStore:
                 ON purchase_records(channel, order_date)
                 """
             )
+            # 주문 단위 요약 (카드 매칭용)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS purchase_orders (
+                    channel TEXT NOT NULL,
+                    order_no TEXT NOT NULL,
+                    order_date TEXT,
+                    payment_total INTEGER,
+                    item_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT,
+                    payment_method TEXT,
+                    source_url TEXT,
+                    raw_text TEXT,
+                    imported_at TEXT NOT NULL,
+                    PRIMARY KEY (channel, order_no)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_purchase_orders_channel_date
+                ON purchase_orders(channel, order_date)
+                """
+            )
             conn.commit()
 
     @staticmethod
@@ -241,8 +272,9 @@ class PurchaseHistoryStore:
         return hashlib.sha1(joined.encode("utf-8")).hexdigest()
 
     def save_records(self, records: Iterable[PurchaseRecord]) -> int:
+        records_list = list(records)
         rows = []
-        for record in records:
+        for record in records_list:
             rows.append(
                 (
                     record.channel,
@@ -272,7 +304,129 @@ class PurchaseHistoryStore:
                 rows,
             )
             conn.commit()
-            return conn.total_changes - before
+            inserted = conn.total_changes - before
+
+        # Pi write-through (best-effort, 실패는 로컬 저장에 영향 없음)
+        if self._pi is not None:
+            try:
+                if getattr(self._pi, "is_configured", False):
+                    self._pi.upload_purchase_records(records_list, self._fingerprint)
+            except Exception:  # noqa: BLE001
+                pass
+        return inserted
+
+    # ── 주문 단위 (카드 매칭용) ──
+
+    def save_orders(self, orders: Iterable[PurchaseOrder]) -> int:
+        rows = []
+        orders_list = list(orders)
+        for o in orders_list:
+            if not o.order_no:
+                continue
+            rows.append(
+                (
+                    o.channel,
+                    o.order_no,
+                    o.order_date,
+                    int(o.payment_total) if o.payment_total is not None else None,
+                    int(o.item_count or 0),
+                    o.status,
+                    o.payment_method,
+                    o.source_url,
+                    o.raw_text,
+                    o.imported_at.isoformat(),
+                )
+            )
+        if not rows:
+            return 0
+        with self._guard, self._connection() as conn:
+            before = conn.total_changes
+            conn.executemany(
+                """
+                INSERT INTO purchase_orders (
+                    channel, order_no, order_date, payment_total, item_count,
+                    status, payment_method, source_url, raw_text, imported_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(channel, order_no) DO UPDATE SET
+                    order_date     = excluded.order_date,
+                    payment_total  = COALESCE(excluded.payment_total, purchase_orders.payment_total),
+                    item_count     = excluded.item_count,
+                    status         = excluded.status,
+                    payment_method = COALESCE(excluded.payment_method, purchase_orders.payment_method),
+                    source_url     = excluded.source_url,
+                    raw_text       = excluded.raw_text,
+                    imported_at    = excluded.imported_at
+                """,
+                rows,
+            )
+            conn.commit()
+            inserted = conn.total_changes - before
+        # Pi write-through
+        if self._pi is not None and getattr(self._pi, "is_configured", False):
+            try:
+                self._pi.upload_purchase_orders(orders_list)
+            except Exception:  # noqa: BLE001
+                pass
+        return inserted
+
+    def load_orders(self, channel: str = "all", limit: int = 2000) -> List[PurchaseOrder]:
+        params: list = []
+        where = ""
+        if channel and channel != "all":
+            where = "WHERE channel = ?"
+            params.append(channel)
+        params.append(max(1, int(limit)))
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT channel, order_no, order_date, payment_total, item_count,
+                       status, payment_method, source_url, raw_text, imported_at
+                FROM purchase_orders
+                {where}
+                ORDER BY COALESCE(order_date, imported_at) DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        result: List[PurchaseOrder] = []
+        for row in rows:
+            try:
+                imported_at = datetime.fromisoformat(row[9])
+            except Exception:  # noqa: BLE001
+                imported_at = datetime.now()
+            result.append(
+                PurchaseOrder(
+                    channel=row[0],
+                    order_no=row[1],
+                    order_date=row[2],
+                    payment_total=row[3],
+                    item_count=int(row[4] or 0),
+                    status=row[5],
+                    payment_method=row[6],
+                    source_url=row[7],
+                    raw_text=row[8] or "",
+                    imported_at=imported_at,
+                )
+            )
+        return result
+
+    def load_remote_orders(self, channel: str = "all", limit: int = 2000) -> List[PurchaseOrder]:
+        if self._pi is not None and getattr(self._pi, "is_configured", False):
+            try:
+                return self._pi.list_purchase_orders(channel=channel, limit=limit)
+            except Exception:  # noqa: BLE001
+                pass
+        return self.load_orders(channel=channel, limit=limit)
+
+    def load_remote_records(self, channel: str = "all", limit: int = 2000) -> List[PurchaseRecord]:
+        """Pi 가 설정돼 있으면 Pi 에서, 아니면 로컬에서 읽기."""
+        if self._pi is not None and getattr(self._pi, "is_configured", False):
+            try:
+                return self._pi.list_purchase_records(channel=channel, limit=limit)
+            except Exception:  # noqa: BLE001
+                # Pi 실패 시 로컬 fallback
+                pass
+        return self.load_records(channel=channel, limit=limit)
 
     def load_records(self, channel: str = "all", limit: int = 1000) -> List[PurchaseRecord]:
         params: list[object] = []

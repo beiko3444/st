@@ -107,9 +107,17 @@ class PurchaseHistoryTab(QWidget):
         "\ubc18\ud488",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, monitor_url: str | None = None) -> None:
         super().__init__()
-        self.store = PurchaseHistoryStore()
+        # Pi write-through: monitor_url 이 있으면 라즈베리에 동기화
+        pi_client = None
+        if monitor_url:
+            try:
+                from inventory_app.services.pi_data_client import PiDataClient
+                pi_client = PiDataClient(monitor_url)
+            except Exception:  # noqa: BLE001
+                pi_client = None
+        self.store = PurchaseHistoryStore(pi_client=pi_client)
         self.parser = PurchaseHistoryParser()
         self._worker_thread: QThread | None = None
         self._worker: _CrawlerWorker | None = None
@@ -390,7 +398,19 @@ class PurchaseHistoryTab(QWidget):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "\uc800\uc7a5 \uc2e4\ud328", str(exc))
             added = 0
-        self.status.setText(f"{channel_label} \uc790\ub3d9 \uc218\uc9d1 \uc644\ub8cc: {len(result.records)}\uac74 \ucd94\ucd9c, {added}\uac74 \uc2e0\uaddc \uc800\uc7a5")
+        order_msg = ""
+        orders_attr = getattr(result, "orders", None) or []
+        if orders_attr:
+            try:
+                self.store.save_orders(orders_attr)
+                paid = sum(1 for o in orders_attr if o.payment_total is not None)
+                order_msg = f" \u00b7 \uc8fc\ubb38 {len(orders_attr)}\uac1c (\uacb0\uc81c\uae08 {paid}\uac1c)"
+            except Exception as exc:  # noqa: BLE001
+                order_msg = f" \u00b7 \uc8fc\ubb38 \uc800\uc7a5 \uc2e4\ud328: {exc}"
+        self.status.setText(
+            f"{channel_label} \uc790\ub3d9 \uc218\uc9d1 \uc644\ub8cc: {len(result.records)}\uac74 \ucd94\ucd9c, "
+            f"{added}\uac74 \uc2e0\uaddc \uc800\uc7a5{order_msg}"
+        )
         self.reload()
 
     def shutdown(self) -> None:

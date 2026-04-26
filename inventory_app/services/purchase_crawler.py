@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from inventory_app.models import PurchaseRecord
+from inventory_app.models import PurchaseOrder, PurchaseRecord
 from inventory_app.services.purchase_history_service import PurchaseHistoryParser
 
 try:
@@ -57,6 +57,7 @@ class CrawlResult:
     channel: str
     records: List[PurchaseRecord]
     error: Optional[str] = None
+    orders: List["PurchaseOrder"] = field(default_factory=list)
 
 
 class PlaywrightUnavailable(RuntimeError):
@@ -493,13 +494,15 @@ def _crawl_coupang_via_cdp(
             # 첫 페이지 추출
             seen_keys: set[str] = set()
             page1 = _extract_coupang_orders(target_page, progress)
+            detail_urls: List[str] = []
+            detail_urls.extend(_extract_coupang_order_detail_links(target_page))
             for rec in page1:
                 key = (rec.order_date or "", rec.title or "", rec.amount or 0)
                 if key in seen_keys:
                     continue
                 seen_keys.add(str(key))
                 records.append(rec)
-            progress.on_log(f"쿠팡 페이지 1: {len(page1)}건")
+            progress.on_log(f"쿠팡 페이지 1: {len(page1)}건 · 상세링크 {len(detail_urls)}개")
 
             # 2 ~ max_pages 페이지 (URL ?pageIndex=N-1)
             for page_no in range(2, max(2, max_pages) + 1):
@@ -515,6 +518,10 @@ def _crawl_coupang_via_cdp(
                     pass
                 time.sleep(0.5)
                 page_recs = _extract_coupang_orders(target_page, progress)
+                page_links = _extract_coupang_order_detail_links(target_page)
+                for h in page_links:
+                    if h not in detail_urls:
+                        detail_urls.append(h)
                 added = 0
                 for rec in page_recs:
                     key = (rec.order_date or "", rec.title or "", rec.amount or 0)
@@ -523,7 +530,10 @@ def _crawl_coupang_via_cdp(
                     seen_keys.add(str(key))
                     records.append(rec)
                     added += 1
-                progress.on_log(f"쿠팡 페이지 {page_no}: {len(page_recs)}건 추출, 신규 {added}")
+                progress.on_log(
+                    f"쿠팡 페이지 {page_no}: {len(page_recs)}건 추출, 신규 {added} · "
+                    f"상세링크 +{len(page_links)} (누계 {len(detail_urls)})"
+                )
 
                 # 마지막 페이지 자동 감지 — 쿠팡 안내 메시지로 판별
                 try:
@@ -542,6 +552,19 @@ def _crawl_coupang_via_cdp(
                     progress.on_log("새 데이터 없음 → 마지막 페이지 도달")
                     break
 
+            # ── 주문 상세 페이지 순회: order_no + payment_total 수집 ──
+            orders: List[PurchaseOrder] = []
+            if detail_urls and not progress.cancelled():
+                progress.on_log(
+                    f"주문 상세 페이지 {len(detail_urls)}개 순회 시작 (결제 합계금 추출)"
+                )
+                orders = _crawl_coupang_order_details(target_page, detail_urls, progress)
+                _associate_orders_to_records(orders, records)
+                progress.on_log(
+                    f"주문 상세 추출 완료: {len(orders)}개 주문 (결제금 미상 "
+                    f"{sum(1 for o in orders if o.payment_total is None)}개)"
+                )
+
     except Exception as exc:  # noqa: BLE001
         progress.on_log(f"오류: {exc}")
         return CrawlResult(channel="coupang", records=[], error=str(exc))
@@ -553,13 +576,159 @@ def _crawl_coupang_via_cdp(
         except Exception:  # noqa: BLE001
             pass
 
-    progress.on_log(f"쿠팡 수집 완료: {len(records)}건")
-    return CrawlResult(channel="coupang", records=records)
+    final_orders = locals().get("orders") or []
+    progress.on_log(f"쿠팡 수집 완료: 품목 {len(records)}건 / 주문 {len(final_orders)}개")
+    return CrawlResult(
+        channel="coupang",
+        records=records,
+        orders=final_orders,
+    )
 
 
 # 페이지 텍스트 → 주문 블록 → PurchaseRecord 추출
 _COUPANG_DATE_RE = re.compile(r"(20\d{2})\.\s*(\d{1,2})\.\s*(\d{1,2})\s*주문")
 _AMOUNT_RE = re.compile(r"([0-9][0-9,]{2,})\s*원")
+_COUPANG_ORDER_NO_RE = re.compile(r"주문번호[:\s]*([0-9]{6,})")
+_COUPANG_PAYMENT_TOTAL_RE = re.compile(
+    r"(?:총\s*결제\s*금액|결제\s*금액|총\s*결제|결제예정금액)\s*[:\s]*([0-9][0-9,]+)\s*원"
+)
+_COUPANG_PAYMENT_METHOD_RE = re.compile(
+    r"(신용카드|체크카드|쿠페이머니|쿠페이|간편결제|계좌이체|토스페이|카카오페이|페이코)"
+    r"(?:\s*\(?([0-9*\-]{4,})\)?)?"
+)
+
+
+def _extract_coupang_order_detail_links(page) -> List[str]:
+    """주문 리스트 페이지에서 '주문 상세보기' 링크들의 href 수집."""
+    try:
+        hrefs = page.evaluate(
+            """() => {
+                const out = new Set();
+                document.querySelectorAll('a').forEach(a => {
+                    const t = (a.innerText || '').trim();
+                    if (t.includes('주문 상세') || t.includes('상세보기')) {
+                        if (a.href) out.add(a.href);
+                    }
+                });
+                return Array.from(out);
+            }"""
+        ) or []
+    except Exception:  # noqa: BLE001
+        hrefs = []
+    return [str(h) for h in hrefs if h]
+
+
+def _parse_coupang_order_detail(text: str) -> dict:
+    """주문 상세 페이지 본문 텍스트에서 order_no / payment_total / status 추출."""
+    info: dict = {}
+    m = _COUPANG_ORDER_NO_RE.search(text or "")
+    if m:
+        info["order_no"] = m.group(1)
+    m = _COUPANG_PAYMENT_TOTAL_RE.search(text or "")
+    if m:
+        try:
+            info["payment_total"] = int(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    m = _COUPANG_PAYMENT_METHOD_RE.search(text or "")
+    if m:
+        method = m.group(1)
+        last4 = m.group(2)
+        info["payment_method"] = f"{method} {last4}".strip() if last4 else method
+    # 주문일 (yyyy. M. d 주문)
+    md = _COUPANG_DATE_RE.search(text or "")
+    if md:
+        info["order_date"] = f"{int(md.group(1)):04d}-{int(md.group(2)):02d}-{int(md.group(3)):02d}"
+    # 상태
+    for st in ("배송완료", "배송중", "배송준비중", "주문취소", "취소완료", "반품완료", "반품", "결제완료", "구매확정"):
+        if st in (text or ""):
+            info["status"] = st
+            break
+    return info
+
+
+def _crawl_coupang_order_details(
+    page,
+    detail_urls: List[str],
+    progress: CrawlerProgress,
+    *,
+    max_details: int = 60,
+) -> List[PurchaseOrder]:
+    """각 주문 상세 페이지를 방문해 order_no + payment_total 수집.
+
+    리스트 페이지에서 모은 href 들을 순회하며 같은 탭에서 navigate.
+    완료 후 다시 list 로 돌아갈 수 있게 history.back() 시도.
+    """
+    out: List[PurchaseOrder] = []
+    now = datetime.now()
+    seen: set[str] = set()
+    for idx, url in enumerate(detail_urls[:max_details]):
+        if progress.cancelled():
+            break
+        if url in seen:
+            continue
+        seen.add(url)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+            time.sleep(0.4)
+            try:
+                page.wait_for_load_state("networkidle", timeout=4_000)
+            except Exception:
+                pass
+            try:
+                body = page.evaluate("() => document.body.innerText") or ""
+            except Exception:
+                body = ""
+            info = _parse_coupang_order_detail(body)
+            order_no = info.get("order_no")
+            if not order_no:
+                progress.on_log(f"  detail {idx + 1}: 주문번호 추출 실패 ({url[:60]})")
+                continue
+            order = PurchaseOrder(
+                channel="coupang",
+                order_no=str(order_no),
+                order_date=info.get("order_date"),
+                payment_total=info.get("payment_total"),
+                item_count=0,  # 호출부에서 records 와 매핑 후 채움
+                status=info.get("status"),
+                payment_method=info.get("payment_method"),
+                source_url=url,
+                raw_text=(body or "")[:4000],
+                imported_at=now,
+            )
+            out.append(order)
+            pt = order.payment_total
+            progress.on_log(
+                f"  detail {idx + 1}/{min(len(detail_urls), max_details)}: "
+                f"주문 {order_no} · {pt:,}원" if pt is not None
+                else f"  detail {idx + 1}/{min(len(detail_urls), max_details)}: 주문 {order_no} · 결제금 미상"
+            )
+        except Exception as exc:  # noqa: BLE001
+            progress.on_log(f"  detail {idx + 1} 실패: {exc}")
+    return out
+
+
+def _associate_orders_to_records(
+    orders: List[PurchaseOrder],
+    records: List[PurchaseRecord],
+) -> None:
+    """orders[].order_date 와 records[].order_date 가 일치하면 item_count 채움 +
+    record.order_no 채워서 다음 매칭에서 활용 가능하게."""
+    by_date: dict[str, List[PurchaseOrder]] = {}
+    for o in orders:
+        if o.order_date:
+            by_date.setdefault(o.order_date, []).append(o)
+    # 같은 날짜에 여러 주문이 있으면 1:N 매칭이 모호 — 단순화: 날짜당 1개일 때만 link
+    for d, lst in by_date.items():
+        if len(lst) != 1:
+            continue
+        o = lst[0]
+        cnt = 0
+        for r in records:
+            if r.order_date == d and r.channel == o.channel:
+                r.order_no = o.order_no
+                cnt += 1
+        o.item_count = cnt
 
 
 def _scroll_to_bottom(page, progress: CrawlerProgress, max_iter: int = 3) -> None:

@@ -3814,7 +3814,7 @@ class MainWindow(QMainWindow):
             fetch_fn=self.keyword_service.fetch,
             default_days=sales_days,
         )
-        self.purchase_history_tab = PurchaseHistoryTab()
+        self.purchase_history_tab = PurchaseHistoryTab(monitor_url=config.monitor_url)
         self.card_usage_tab = CardUsageTab(config)
         self.fassto_tab = FasstoTab(config)
 

@@ -143,6 +143,79 @@ class InventoryHistoryDB:
                 ON channel_master_links(master_id)
                 """
             )
+            # 구매내역(쿠팡/네이버 주문) 캐시
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS purchase_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel TEXT NOT NULL,
+                    order_date TEXT,
+                    order_no TEXT,
+                    title TEXT NOT NULL,
+                    amount INTEGER,
+                    payment_method TEXT,
+                    source_url TEXT,
+                    raw_text TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL UNIQUE,
+                    imported_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_purchase_records_channel_date
+                ON purchase_records(channel, order_date)
+                """
+            )
+            # 주문 단위 요약 (카드 매칭용)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS purchase_orders (
+                    channel TEXT NOT NULL,
+                    order_no TEXT NOT NULL,
+                    order_date TEXT,
+                    payment_total INTEGER,
+                    item_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT,
+                    payment_method TEXT,
+                    source_url TEXT,
+                    raw_text TEXT,
+                    imported_at TEXT NOT NULL,
+                    PRIMARY KEY (channel, order_no)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_purchase_orders_channel_date
+                ON purchase_orders(channel, order_date)
+                """
+            )
+            # 카드사용내역
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS card_usages (
+                    use_key TEXT PRIMARY KEY,
+                    corp_num TEXT,
+                    card_num TEXT,
+                    used_at TEXT,
+                    store_name TEXT,
+                    amount INTEGER,
+                    category TEXT,
+                    memo TEXT,
+                    reviewed INTEGER NOT NULL DEFAULT 0,
+                    coupang_purchase_id TEXT,
+                    raw_json TEXT,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_card_usages_used_at
+                ON card_usages(used_at)
+                """
+            )
             conn.commit()
 
     def _load_last_data(self, conn: sqlite3.Connection, channel: str) -> dict[tuple, dict]:
@@ -1005,3 +1078,312 @@ class InventoryHistoryDB:
             )
             conn.commit()
         return self.get_link(channel_key, item_key)
+
+    # ── 구매내역 (쿠팡/네이버 주문) ──
+
+    def upsert_purchase_records(self, records: List[dict]) -> int:
+        """fingerprint 기준 INSERT OR IGNORE. 신규 row 수 반환."""
+        rows: list[tuple] = []
+        for r in records:
+            fp = str(r.get("fingerprint") or "").strip()
+            if not fp:
+                continue
+            rows.append(
+                (
+                    str(r.get("channel") or ""),
+                    r.get("order_date"),
+                    r.get("order_no"),
+                    str(r.get("title") or ""),
+                    self._opt_int(r.get("amount")),
+                    r.get("payment_method"),
+                    r.get("source_url"),
+                    str(r.get("raw_text") or ""),
+                    fp,
+                    str(r.get("imported_at") or datetime.now().isoformat()),
+                )
+            )
+        if not rows:
+            return 0
+        with self._guard, self._connection() as conn:
+            before = conn.total_changes
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO purchase_records
+                    (channel, order_date, order_no, title, amount, payment_method,
+                     source_url, raw_text, fingerprint, imported_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            conn.commit()
+            return conn.total_changes - before
+
+    def upsert_purchase_orders(self, orders: List[dict]) -> int:
+        rows: list[tuple] = []
+        for o in orders:
+            order_no = str(o.get("order_no") or "").strip()
+            channel = str(o.get("channel") or "").strip()
+            if not order_no or not channel:
+                continue
+            rows.append(
+                (
+                    channel,
+                    order_no,
+                    o.get("order_date"),
+                    self._opt_int(o.get("payment_total")),
+                    int(o.get("item_count") or 0),
+                    o.get("status"),
+                    o.get("payment_method"),
+                    o.get("source_url"),
+                    o.get("raw_text") or "",
+                    str(o.get("imported_at") or datetime.now().isoformat()),
+                )
+            )
+        if not rows:
+            return 0
+        with self._guard, self._connection() as conn:
+            before = conn.total_changes
+            conn.executemany(
+                """
+                INSERT INTO purchase_orders (
+                    channel, order_no, order_date, payment_total, item_count,
+                    status, payment_method, source_url, raw_text, imported_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(channel, order_no) DO UPDATE SET
+                    order_date     = excluded.order_date,
+                    payment_total  = COALESCE(excluded.payment_total, purchase_orders.payment_total),
+                    item_count     = excluded.item_count,
+                    status         = excluded.status,
+                    payment_method = COALESCE(excluded.payment_method, purchase_orders.payment_method),
+                    source_url     = excluded.source_url,
+                    raw_text       = excluded.raw_text,
+                    imported_at    = excluded.imported_at
+                """,
+                rows,
+            )
+            conn.commit()
+            return conn.total_changes - before
+
+    def list_purchase_orders(self, channel: str | None = None, limit: int = 2000) -> List[dict]:
+        params: list = []
+        where = ""
+        if channel and channel != "all":
+            where = "WHERE channel = ?"
+            params.append(channel)
+        params.append(max(1, int(limit)))
+        with self._guard, self._connection() as conn:
+            cursor = conn.execute(
+                f"""
+                SELECT channel, order_no, order_date, payment_total, item_count,
+                       status, payment_method, source_url, raw_text, imported_at
+                FROM purchase_orders
+                {where}
+                ORDER BY COALESCE(order_date, imported_at) DESC
+                LIMIT ?
+                """,
+                params,
+            )
+            cols = [
+                "channel", "order_no", "order_date", "payment_total", "item_count",
+                "status", "payment_method", "source_url", "raw_text", "imported_at",
+            ]
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    def list_purchase_records(self, channel: str | None = None, limit: int = 1000) -> List[dict]:
+        params: list = []
+        where = ""
+        if channel and channel != "all":
+            where = "WHERE channel = ?"
+            params.append(channel)
+        params.append(max(1, int(limit)))
+        with self._guard, self._connection() as conn:
+            cursor = conn.execute(
+                f"""
+                SELECT id, channel, order_date, order_no, title, amount, payment_method,
+                       source_url, raw_text, fingerprint, imported_at
+                FROM purchase_records
+                {where}
+                ORDER BY COALESCE(order_date, imported_at) DESC, id DESC
+                LIMIT ?
+                """,
+                params,
+            )
+            cols = [
+                "id", "channel", "order_date", "order_no", "title", "amount",
+                "payment_method", "source_url", "raw_text", "fingerprint", "imported_at",
+            ]
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    # ── 카드사용내역 ──
+
+    def upsert_card_usages(self, items: List[dict]) -> int:
+        """use_key PRIMARY KEY 로 UPSERT. 신규/갱신 수 반환."""
+        rows: list[tuple] = []
+        now = datetime.now().isoformat()
+        for it in items:
+            use_key = str(it.get("use_key") or it.get("id") or "").strip()
+            if not use_key:
+                continue
+            raw = it.get("raw")
+            if isinstance(raw, dict):
+                import json as _json
+                raw_json = _json.dumps(raw, ensure_ascii=False)
+            elif isinstance(raw, str):
+                raw_json = raw
+            else:
+                raw_json = None
+            rows.append(
+                (
+                    use_key,
+                    it.get("corp_num"),
+                    it.get("card_num"),
+                    it.get("used_at"),
+                    it.get("store_name"),
+                    self._opt_int(it.get("amount")),
+                    it.get("category"),
+                    it.get("memo"),
+                    int(bool(it.get("reviewed"))),
+                    it.get("coupang_purchase_id"),
+                    raw_json,
+                    now,
+                )
+            )
+        if not rows:
+            return 0
+        with self._guard, self._connection() as conn:
+            before = conn.total_changes
+            conn.executemany(
+                """
+                INSERT INTO card_usages
+                    (use_key, corp_num, card_num, used_at, store_name, amount,
+                     category, memo, reviewed, coupang_purchase_id, raw_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(use_key) DO UPDATE SET
+                    corp_num            = excluded.corp_num,
+                    card_num            = excluded.card_num,
+                    used_at             = excluded.used_at,
+                    store_name          = excluded.store_name,
+                    amount              = excluded.amount,
+                    category            = COALESCE(excluded.category, card_usages.category),
+                    memo                = COALESCE(excluded.memo, card_usages.memo),
+                    reviewed            = excluded.reviewed,
+                    coupang_purchase_id = COALESCE(
+                                              excluded.coupang_purchase_id,
+                                              card_usages.coupang_purchase_id
+                                          ),
+                    raw_json            = excluded.raw_json,
+                    updated_at          = excluded.updated_at
+                """,
+                rows,
+            )
+            conn.commit()
+            return conn.total_changes - before
+
+    def list_card_usages(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        card_num: str | None = None,
+        limit: int = 5000,
+    ) -> List[dict]:
+        clauses: list[str] = []
+        params: list = []
+        if start_date:
+            clauses.append("used_at >= ?")
+            params.append(f"{start_date}T00:00:00")
+        if end_date:
+            clauses.append("used_at <= ?")
+            params.append(f"{end_date}T23:59:59")
+        if card_num:
+            clauses.append("card_num = ?")
+            params.append(card_num)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(max(1, int(limit)))
+        with self._guard, self._connection() as conn:
+            cursor = conn.execute(
+                f"""
+                SELECT use_key, corp_num, card_num, used_at, store_name, amount,
+                       category, memo, reviewed, coupang_purchase_id, raw_json, updated_at
+                FROM card_usages
+                {where}
+                ORDER BY used_at DESC
+                LIMIT ?
+                """,
+                params,
+            )
+            cols = [
+                "use_key", "corp_num", "card_num", "used_at", "store_name", "amount",
+                "category", "memo", "reviewed", "coupang_purchase_id", "raw_json",
+                "updated_at",
+            ]
+            out: list[dict] = []
+            import json as _json
+            for row in cursor.fetchall():
+                d = dict(zip(cols, row))
+                d["reviewed"] = bool(d.get("reviewed"))
+                if d.get("raw_json"):
+                    try:
+                        d["raw"] = _json.loads(d["raw_json"])
+                    except Exception:  # noqa: BLE001
+                        d["raw"] = None
+                else:
+                    d["raw"] = None
+                d.pop("raw_json", None)
+                out.append(d)
+            return out
+
+    def update_card_usage_fields(
+        self,
+        use_key: str,
+        *,
+        memo: str | None = None,
+        category: str | None = None,
+        reviewed: bool | None = None,
+        coupang_purchase_id: str | None = None,
+        clear_memo: bool = False,
+        clear_coupang_match: bool = False,
+    ) -> dict | None:
+        updates: list[str] = []
+        params: list = []
+        if clear_memo:
+            updates.append("memo = NULL")
+        elif memo is not None:
+            updates.append("memo = ?")
+            params.append(str(memo))
+        if category is not None:
+            updates.append("category = ?")
+            params.append(str(category))
+        if reviewed is not None:
+            updates.append("reviewed = ?")
+            params.append(int(bool(reviewed)))
+        if clear_coupang_match:
+            updates.append("coupang_purchase_id = NULL")
+        elif coupang_purchase_id is not None:
+            updates.append("coupang_purchase_id = ?")
+            params.append(str(coupang_purchase_id))
+        if not updates:
+            return None
+        updates.append("updated_at = ?")
+        params.append(datetime.now().isoformat())
+        params.append(str(use_key))
+        with self._guard, self._connection() as conn:
+            conn.execute(
+                f"UPDATE card_usages SET {', '.join(updates)} WHERE use_key = ?",
+                params,
+            )
+            conn.commit()
+        rows = self.list_card_usages(limit=1)
+        # 단순 반환: 변경된 row 1건 다시 조회
+        for r in rows:
+            if r.get("use_key") == use_key:
+                return r
+        return None
+
+    @staticmethod
+    def _opt_int(value) -> int | None:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None

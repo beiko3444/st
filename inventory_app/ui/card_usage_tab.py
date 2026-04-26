@@ -54,6 +54,8 @@ from inventory_app.services.purchase_history_service import (
     PurchaseHistoryStore,
     group_records_by_order,
 )
+from inventory_app.services.pi_data_client import PiDataClient, PiDataError
+from inventory_app.models import PurchaseOrder
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +454,8 @@ class CardUsageTab(QWidget):
         self._review_mode: bool = False
         self._reviewed_keys: set[str] = set()  # 메모리상 검토 완료 마킹
         self._coupang_match_index: Dict[str, PurchaseGroup] = {}  # use_key/id → matched group
+        # Pi 데이터 API: 카드내역과 구매내역 모두 라즈베리에 저장
+        self.pi = PiDataClient(getattr(config, "monitor_url", None))
 
         # ===== 헤더 =====
         layout = QVBoxLayout(self)
@@ -736,24 +740,74 @@ class CardUsageTab(QWidget):
         self._fetch()
 
     def _on_match_coupang(self) -> None:
-        """쿠팡 주문을 결제(주문) 단위로 묶어 카드사용내역과 금액+날짜로 매칭."""
+        """쿠팡 주문을 결제(주문) 단위로 카드사용내역과 매칭.
+
+        우선순위:
+          1) purchase_orders 의 payment_total (주문 상세 페이지에서 추출한 실제 결제금)
+          2) fallback: purchase_records 를 raw_text 로 그룹핑 후 합산 (배송비 미포함, 부정확)
+        """
         if not self._all_items:
             QMessageBox.information(self, "쿠팡 매칭", "먼저 바로빌 동기화로 카드내역을 불러오세요.")
             return
-        try:
-            store = PurchaseHistoryStore()
-            recs = store.load_records(channel="coupang", limit=2000)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "쿠팡 매칭", f"쿠팡 구매내역 로드 실패: {exc}")
-            return
-        if not recs:
-            QMessageBox.information(
-                self, "쿠팡 매칭",
-                "DB 에 쿠팡 구매내역이 없습니다. 구매내역 탭에서 먼저 동기화하세요.",
-            )
-            return
 
-        groups = group_records_by_order(recs)
+        # ── 1순위: purchase_orders (Pi 우선, 로컬 fallback) ──
+        orders: List[PurchaseOrder] = []
+        if self.pi.is_configured:
+            try:
+                orders = self.pi.list_purchase_orders(channel="coupang", limit=5000)
+            except Exception:  # noqa: BLE001
+                orders = []
+        if not orders:
+            try:
+                store = PurchaseHistoryStore()
+                orders = store.load_orders(channel="coupang", limit=5000)
+            except Exception:  # noqa: BLE001
+                orders = []
+        # payment_total 이 없는 주문은 매칭 불가능 → 제외
+        orders = [o for o in orders if o.payment_total is not None and o.payment_total > 0]
+
+        groups: List[PurchaseGroup] = []
+        if orders:
+            # PurchaseOrder → PurchaseGroup 어댑터 (UI 코드 호환)
+            for o in orders:
+                title = (
+                    f"주문 {o.order_no}"
+                    + (f" · {o.item_count}건" if o.item_count else "")
+                    + (f" [{o.status}]" if o.status else "")
+                )
+                groups.append(PurchaseGroup(
+                    channel=o.channel,
+                    order_date=o.order_date,
+                    title=title,
+                    total_amount=int(o.payment_total or 0),
+                    item_count=o.item_count,
+                    items=[],
+                    group_key=f"coupang|order|{o.order_no}",
+                ))
+            source_msg = f"주문 {len(orders)}개 (결제금 기준)"
+        else:
+            # ── 2순위 fallback: 품목 합산 ──
+            recs: List = []
+            if self.pi.is_configured:
+                try:
+                    recs = self.pi.list_purchase_records(channel="coupang", limit=5000)
+                except Exception:  # noqa: BLE001
+                    recs = []
+            if not recs:
+                try:
+                    store = PurchaseHistoryStore()
+                    recs = store.load_records(channel="coupang", limit=2000)
+                except Exception as exc:  # noqa: BLE001
+                    QMessageBox.warning(self, "쿠팡 매칭", f"쿠팡 구매내역 로드 실패: {exc}")
+                    return
+            if not recs:
+                QMessageBox.information(
+                    self, "쿠팡 매칭",
+                    "DB 에 쿠팡 구매내역이 없습니다. 구매내역 탭에서 먼저 동기화하세요.",
+                )
+                return
+            groups = group_records_by_order(recs)
+            source_msg = f"품목 합산 그룹 {len(groups)}개 (구매내역 {len(recs)}건, ⚠ 배송비/할인 미반영)"
         # group_date(date) → list[PurchaseGroup]
         by_date: Dict[date, List[PurchaseGroup]] = {}
         for g in groups:
@@ -811,12 +865,21 @@ class CardUsageTab(QWidget):
 
         self._coupang_match_index.update(new_index)
 
+        # Pi 에도 매칭 결과 저장 (best-effort)
+        if self.pi.is_configured and matched > 0:
+            try:
+                changed_items = [it for it in self._all_items if it.coupang_purchase_id]
+                if changed_items:
+                    self.pi.upload_card_usages(changed_items)
+            except Exception:  # noqa: BLE001
+                pass
+
         # 결과 통보 + 화면 갱신
         QMessageBox.information(
             self, "쿠팡 매칭 결과",
             f"쿠팡 카드결제 {candidates}건 중 {matched}건 매칭"
             f"{f' (모호 {ambiguous}건은 가까운 날짜 우선)' if ambiguous else ''}.\n"
-            f"쿠팡 그룹 {len(groups)}개 (총 구매 {len(recs)}건).",
+            f"매칭 소스: {source_msg}",
         )
         try:
             self._render_list()
@@ -977,10 +1040,45 @@ class CardUsageTab(QWidget):
             for it in logs
         }
 
+        # Pi 업로드 (best-effort): 사용자 편집(메모/카테고리/검토)은 Pi 측 COALESCE 로 보존
+        pi_changed = -2  # -2: 미시도, -1: 실패, >=0: 변경 row 수
+        if self.pi.is_configured and logs:
+            try:
+                pi_changed = self.pi.upload_card_usages(logs)
+            except (PiDataError, Exception):  # noqa: BLE001
+                pi_changed = -1
+            if pi_changed >= 0:
+                # Pi 의 보존된 메모/검토/매칭값을 머지
+                try:
+                    remote = self.pi.list_card_usages(
+                        start_date=start, end_date=end, card_num=card, limit=20000,
+                    )
+                    if remote:
+                        by_key = {(r.use_key or r.id or ""): r for r in remote}
+                        merged: List[CardUsage] = []
+                        for it in logs:
+                            k = it.use_key or it.id or ""
+                            r = by_key.get(k)
+                            if r is not None:
+                                if it.raw is not None:
+                                    r.raw = it.raw
+                                merged.append(r)
+                            else:
+                                merged.append(it)
+                        logs = merged
+                except Exception:  # noqa: BLE001
+                    pass
+
         self._all_items = logs
         self._last_synced_at = datetime.now()
+        pi_suffix = ""
+        if self.pi.is_configured:
+            if pi_changed == -1:
+                pi_suffix = " · 라즈베리 통신 실패"
+            elif pi_changed >= 0:
+                pi_suffix = f" · 라즈베리 동기 {pi_changed}건"
         self.last_sync_label.setText(
-            f"최근 동기화: {self._last_synced_at.strftime('%Y. %m. %d. %p %I:%M')}"
+            f"최근 동기화: {self._last_synced_at.strftime('%Y. %m. %d. %p %I:%M')}{pi_suffix}"
         )
 
         # 성공 시 배너 숨김 (요약카드/last_sync_label 로 충분)
@@ -1315,6 +1413,10 @@ class CardUsageTab(QWidget):
     def shutdown(self) -> None:
         try:
             self.client.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.pi.close()
         except Exception:  # noqa: BLE001
             pass
 

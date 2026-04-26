@@ -172,6 +172,49 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
+        elif path == "/purchase-records":
+            channel = (qs.get("channel", [None])[0] or "").strip().lower() or None
+            try:
+                limit = max(1, min(20000, int(qs.get("limit", ["2000"])[0])))
+            except (TypeError, ValueError):
+                limit = 2000
+            try:
+                rows = db.list_purchase_records(channel=channel, limit=limit)
+                self._send_json({"records": rows})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/purchase-orders":
+            channel = (qs.get("channel", [None])[0] or "").strip().lower() or None
+            try:
+                limit = max(1, min(20000, int(qs.get("limit", ["2000"])[0])))
+            except (TypeError, ValueError):
+                limit = 2000
+            try:
+                rows = db.list_purchase_orders(channel=channel, limit=limit)
+                self._send_json({"orders": rows})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/card-usages":
+            start_date = qs.get("start_date", [None])[0]
+            end_date = qs.get("end_date", [None])[0]
+            card_num = qs.get("card_num", [None])[0]
+            try:
+                limit = max(1, min(50000, int(qs.get("limit", ["5000"])[0])))
+            except (TypeError, ValueError):
+                limit = 5000
+            try:
+                rows = db.list_card_usages(
+                    start_date=start_date,
+                    end_date=end_date,
+                    card_num=card_num,
+                    limit=limit,
+                )
+                self._send_json({"items": rows})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -232,6 +275,45 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(e)}, 500)
             return
 
+        if path == "/purchase-records":
+            try:
+                body = self._read_json_body()
+                records = body.get("records") or []
+                if not isinstance(records, list):
+                    self._send_json({"error": "records must be a list"}, 400)
+                    return
+                inserted = db.upsert_purchase_records(records)
+                self._send_json({"inserted": inserted, "received": len(records)})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/purchase-orders":
+            try:
+                body = self._read_json_body()
+                orders = body.get("orders") or []
+                if not isinstance(orders, list):
+                    self._send_json({"error": "orders must be a list"}, 400)
+                    return
+                changed = db.upsert_purchase_orders(orders)
+                self._send_json({"changed": changed, "received": len(orders)})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/card-usages":
+            try:
+                body = self._read_json_body()
+                items = body.get("items") or []
+                if not isinstance(items, list):
+                    self._send_json({"error": "items must be a list"}, 400)
+                    return
+                changed = db.upsert_card_usages(items)
+                self._send_json({"changed": changed, "received": len(items)})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
         self._send_json({"error": "not found"}, 404)
 
     def do_PATCH(self):
@@ -239,6 +321,31 @@ class Handler(BaseHTTPRequestHandler):
 
         parsed = urlparse(self.path)
         path = parsed.path
+
+        # /card-usages/<use_key>
+        cu_match = _CARD_USAGE_RE.match(path)
+        if cu_match is not None:
+            use_key = cu_match.group(1)
+            try:
+                body = self._read_json_body()
+                row = db.update_card_usage_fields(
+                    use_key,
+                    memo=body.get("memo") if "memo" in body and not body.get("clear_memo") else None,
+                    category=body.get("category") if "category" in body else None,
+                    reviewed=(bool(body["reviewed"]) if "reviewed" in body else None),
+                    coupang_purchase_id=(
+                        body.get("coupang_purchase_id")
+                        if "coupang_purchase_id" in body
+                        and not body.get("clear_coupang_match")
+                        else None
+                    ),
+                    clear_memo=bool(body.get("clear_memo")),
+                    clear_coupang_match=bool(body.get("clear_coupang_match")),
+                )
+                self._send_json({"item": row, "ok": True})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
 
         master_id = _match_master_id(path)
         if master_id is None:
@@ -351,6 +458,7 @@ class Handler(BaseHTTPRequestHandler):
 
 _MASTER_ID_RE = re.compile(r"^/masters/(\d+)$")
 _MASTER_REP_RE = re.compile(r"^/masters/(\d+)/representative$")
+_CARD_USAGE_RE = re.compile(r"^/card-usages/(.+)$")
 
 
 def _match_master_id(path: str) -> int | None:

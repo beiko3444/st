@@ -57,6 +57,25 @@ class PurchaseRecord:
 
 
 @dataclass
+class PurchaseOrder:
+    """주문(결제) 단위 요약. 카드사용내역과 매칭하기 위한 핵심 entity.
+
+    쿠팡: 한 주문 = 카드명세서 한 줄. payment_total 은 배송비/할인/쿠폰 적용 후
+    실제 카드에 청구된 금액이며 품목 합산과는 다를 수 있다.
+    """
+    channel: str
+    order_no: str                       # 주문번호 (e.g., "12345678")
+    order_date: Optional[str]           # ISO yyyy-mm-dd
+    payment_total: Optional[int]        # 실제 결제 합계 (원)
+    item_count: int                     # 주문에 포함된 품목 수
+    status: Optional[str]               # 배송완료 / 배송중 / 취소 / 반품 등
+    payment_method: Optional[str]       # 결제수단 (카드 4자리 등)
+    source_url: Optional[str]           # 주문 상세 URL
+    raw_text: str                       # 주문 상세 페이지 본문 (디버깅용)
+    imported_at: datetime
+
+
+@dataclass
 class CardUsage:
     """외부 카드 API 의 한 카드 사용 건.
 
