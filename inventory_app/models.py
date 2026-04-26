@@ -40,3 +40,17 @@ class ChannelMasterLink:
     multiplier: int
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass
+class PurchaseRecord:
+    id: Optional[int]
+    channel: str
+    order_date: Optional[str]
+    order_no: Optional[str]
+    title: str
+    amount: Optional[int]
+    payment_method: Optional[str]
+    source_url: Optional[str]
+    raw_text: str
+    imported_at: datetime

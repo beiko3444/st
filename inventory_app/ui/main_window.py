@@ -50,6 +50,7 @@ from inventory_app.config import AppConfig
 from inventory_app.models import ChannelProduct
 from inventory_app.ui.fassto_tab import FasstoTab
 from inventory_app.ui.product_master_tab import ProductMasterTab
+from inventory_app.ui.purchase_history_tab import PurchaseHistoryTab
 from inventory_app.services.channel_services import CoupangChannelService, NaverChannelService
 from inventory_app.services.keyword_services import (
     KeywordRevenueRow,
@@ -3812,6 +3813,7 @@ class MainWindow(QMainWindow):
             fetch_fn=self.keyword_service.fetch,
             default_days=sales_days,
         )
+        self.purchase_history_tab = PurchaseHistoryTab()
         self.fassto_tab = FasstoTab(config)
 
         self._build_ui()
@@ -3851,6 +3853,10 @@ class MainWindow(QMainWindow):
         self.tab_shortcut_8 = QShortcut(QKeySequence("8"), self)
         self.tab_shortcut_8.setContext(Qt.ApplicationShortcut)
         self.tab_shortcut_8.activated.connect(lambda: self._activate_tab_shortcut(7))
+
+        self.tab_shortcut_9 = QShortcut(QKeySequence("9"), self)
+        self.tab_shortcut_9.setContext(Qt.ApplicationShortcut)
+        self.tab_shortcut_9.activated.connect(lambda: self._activate_tab_shortcut(8))
 
         self.naver_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.coupang_tab.sync_finished.connect(self._on_sub_sync_finished)
@@ -3900,6 +3906,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.sales_daily_tab, "판매일보")
         self.tabs.addTab(self.revenue_tab, "매출비교")
         self.tabs.addTab(self.keyword_tab, "키워드매출")
+        self.tabs.addTab(self.purchase_history_tab, "구매내역")
         self.tabs.addTab(self.fassto_tab, "파스토")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         corner = QWidget()
@@ -4064,6 +4071,7 @@ class MainWindow(QMainWindow):
             "revenue_tab",
             "keyword_tab",
             "sales_daily_tab",
+            "purchase_history_tab",
         ):
             widget = getattr(self, attr_name, None)
             apply_styles = getattr(widget, "_apply_styles", None)
@@ -4260,4 +4268,5 @@ class MainWindow(QMainWindow):
         self.sales_daily_tab.shutdown()
         self.revenue_tab.shutdown()
         self.keyword_tab.shutdown()
+        self.purchase_history_tab.shutdown()
         super().closeEvent(event)
