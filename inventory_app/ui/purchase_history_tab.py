@@ -7,6 +7,7 @@ from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QBrush, QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -28,10 +29,7 @@ from inventory_app.services.purchase_crawler import (
     crawl_channel,
     ensure_browser_installed,
 )
-from inventory_app.services.purchase_history_service import (
-    PurchaseHistoryParser,
-    PurchaseHistoryStore,
-)
+from inventory_app.services.purchase_history_service import PurchaseHistoryParser, PurchaseHistoryStore
 
 
 class _NumberItem(QTableWidgetItem):
@@ -44,23 +42,11 @@ class _NumberItem(QTableWidgetItem):
 
 
 class _CrawlerWorker(QObject):
-    """QThread 안에서 실행되는 자동 크롤링 워커.
-
-    UI 스레드를 막지 않으면서 Playwright 브라우저를 띄움.
-    """
-
     log = Signal(str)
     login_required = Signal(str)
-    finished = Signal(object)  # CrawlResult
+    finished = Signal(object)
 
-    def __init__(
-        self,
-        channel: str,
-        *,
-        headless: bool,
-        max_pages: int,
-        reset_session: bool,
-    ) -> None:
+    def __init__(self, channel: str, *, headless: bool, max_pages: int, reset_session: bool) -> None:
         super().__init__()
         self.channel = channel
         self.headless = headless
@@ -79,38 +65,47 @@ class _CrawlerWorker(QObject):
         )
         try:
             ensure_browser_installed(progress)
+            result = crawl_channel(
+                self.channel,
+                headless=self.headless,
+                max_pages=self.max_pages,
+                reset_session=self.reset_session,
+                progress=progress,
+            )
         except PlaywrightUnavailable as exc:
-            self.finished.emit(
-                CrawlResult(channel=self.channel, records=[], error=str(exc))
-            )
-            return
+            result = CrawlResult(channel=self.channel, records=[], error=str(exc))
         except Exception as exc:  # noqa: BLE001
-            self.finished.emit(
-                CrawlResult(channel=self.channel, records=[], error=f"브라우저 준비 실패: {exc}")
-            )
-            return
-
-        result = crawl_channel(
-            self.channel,
-            headless=self.headless,
-            max_pages=self.max_pages,
-            reset_session=self.reset_session,
-            progress=progress,
-        )
+            result = CrawlResult(channel=self.channel, records=[], error=str(exc))
         self.finished.emit(result)
 
 
 class PurchaseHistoryTab(QWidget):
     CHANNEL_LABELS = {
-        "all": "전체",
-        "naver": "네이버",
-        "coupang": "쿠팡",
+        "all": "\uc804\uccb4",
+        "naver": "\ub124\uc774\ubc84",
+        "coupang": "\ucfe0\ud321",
     }
     ORDER_URLS = {
         "naver": "https://order.pay.naver.com/home",
         "coupang": "https://mc.coupang.com/ssr/desktop/order/list",
     }
-    HEADERS = ("일자", "채널", "주문번호", "상품/내역", "결제금액", "결제수단", "가져온 시각")
+    HEADERS = (
+        "\uc77c\uc790",
+        "\ucc44\ub110",
+        "\uc8fc\ubb38\ubc88\ud638",
+        "\uc0c1\ud488/\ub0b4\uc5ed",
+        "\uacb0\uc81c\uae08\uc561",
+        "\uacb0\uc81c\uc218\ub2e8",
+        "\uac00\uc838\uc628 \uc2dc\uac01",
+    )
+    CANCEL_KEYWORDS = (
+        "\uacb0\uc81c\ucde8\uc18c",
+        "\ucde8\uc18c\uc644\ub8cc",
+        "\uc8fc\ubb38\ucde8\uc18c",
+        "\uad6c\ub9e4\ucde8\uc18c",
+        "\ubc18\ud488\uc644\ub8cc",
+        "\ubc18\ud488",
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -123,52 +118,55 @@ class PurchaseHistoryTab(QWidget):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
-        # --- 1행: 필터/수동 가져오기 ---
         top = QHBoxLayout()
         self.channel_combo = QComboBox()
         for code, label in self.CHANNEL_LABELS.items():
             self.channel_combo.addItem(label, code)
         self.channel_combo.currentIndexChanged.connect(self.reload)
 
-        self.open_naver_btn = QPushButton("네이버 주문내역 열기")
+        self.open_naver_btn = QPushButton("\ub124\uc774\ubc84 \uc8fc\ubb38\ub0b4\uc5ed \uc5f4\uae30")
         self.open_naver_btn.clicked.connect(lambda: self._open_order_page("naver"))
-        self.open_coupang_btn = QPushButton("쿠팡 주문내역 열기")
+        self.open_coupang_btn = QPushButton("\ucfe0\ud321 \uc8fc\ubb38\ub0b4\uc5ed \uc5f4\uae30")
         self.open_coupang_btn.clicked.connect(lambda: self._open_order_page("coupang"))
-        self.import_btn = QPushButton("HTML 가져오기")
+        self.import_btn = QPushButton("HTML \uac00\uc838\uc624\uae30")
         self.import_btn.clicked.connect(self._import_html)
-        self.reload_btn = QPushButton("새로고침")
+        self.clipboard_btn = QPushButton("\ud074\ub9bd\ubcf4\ub4dc \uac00\uc838\uc624\uae30")
+        self.clipboard_btn.setToolTip(
+            "\uc77c\ubc18 \ube0c\ub77c\uc6b0\uc800\uc5d0\uc11c \uc8fc\ubb38\ub0b4\uc5ed \ud398\uc774\uc9c0\ub97c \uc5f4\uace0 "
+            "Ctrl+A, Ctrl+C \ud55c \ub2e4\uc74c \ub204\ub974\uc138\uc694."
+        )
+        self.clipboard_btn.clicked.connect(self._import_clipboard)
+        self.reload_btn = QPushButton("\uc0c8\ub85c\uace0\uce68")
         self.reload_btn.clicked.connect(self.reload)
 
-        top.addWidget(QLabel("채널"))
+        top.addWidget(QLabel("\ucc44\ub110"))
         top.addWidget(self.channel_combo)
         top.addWidget(self.open_naver_btn)
         top.addWidget(self.open_coupang_btn)
         top.addWidget(self.import_btn)
+        top.addWidget(self.clipboard_btn)
         top.addWidget(self.reload_btn)
         top.addStretch(1)
 
-        # --- 2행: 자동 수집 ---
         auto_row = QHBoxLayout()
-        self.auto_naver_btn = QPushButton("🤖 네이버 자동 수집")
+        self.auto_naver_btn = QPushButton("\ub124\uc774\ubc84 \uc790\ub3d9 \uc218\uc9d1")
         self.auto_naver_btn.setToolTip(
-            "Chromium 창이 뜨면 첫 1회만 직접 로그인하세요.\n"
-            "이후엔 저장된 세션으로 자동 로그인되어 주문내역을 긁어옵니다."
+            "\ube0c\ub77c\uc6b0\uc800 \ucc3d\uc774 \uc5f4\ub9ac\uba74 \uccab 1\ud68c\ub9cc \uc9c1\uc811 \ub85c\uadf8\uc778\ud558\uc138\uc694.\n"
+            "\ub2e4\uc74c\ubd80\ud130\ub294 \uc800\uc7a5\ub41c \uc815\uc0c1 \uc138\uc158\uc744 \uc7ac\uc0ac\uc6a9\ud569\ub2c8\ub2e4."
         )
         self.auto_naver_btn.clicked.connect(lambda: self._start_auto_crawl("naver"))
 
-        self.auto_coupang_btn = QPushButton("🤖 쿠팡 자동 수집")
+        self.auto_coupang_btn = QPushButton("\ucfe0\ud321 \uc790\ub3d9 \uc218\uc9d1")
         self.auto_coupang_btn.setToolTip(
-            "Chromium 창이 뜨면 첫 1회만 직접 로그인하세요.\n"
-            "이후엔 저장된 세션으로 자동 로그인되어 주문내역을 긁어옵니다."
+            "\ube0c\ub77c\uc6b0\uc800 \ucc3d\uc774 \uc5f4\ub9ac\uba74 \uccab 1\ud68c\ub9cc \uc9c1\uc811 \ub85c\uadf8\uc778\ud558\uc138\uc694.\n"
+            "\ucea1\ucc28, 2\ub2e8\uacc4 \uc778\uc99d\uc774 \ub098\uc624\uba74 \uc0ac\uc6a9\uc790\uac00 \uc9c1\uc811 \uc644\ub8cc\ud574\uc57c \ud569\ub2c8\ub2e4."
         )
         self.auto_coupang_btn.clicked.connect(lambda: self._start_auto_crawl("coupang"))
 
-        self.reset_session_chk = QCheckBox("세션 초기화(재로그인)")
-        self.reset_session_chk.setToolTip(
-            "체크하면 저장된 로그인 세션을 폐기하고 처음부터 로그인합니다."
-        )
+        self.reset_session_chk = QCheckBox("\uc138\uc158 \ucd08\uae30\ud654(\uc0c8\ub85c \ub85c\uadf8\uc778)")
+        self.reset_session_chk.setToolTip("\uc800\uc7a5\ub41c \ub85c\uadf8\uc778 \uc138\uc158\uc744 \uc9c0\uc6b0\uace0 \ucc98\uc74c\ubd80\ud130 \ub85c\uadf8\uc778\ud569\ub2c8\ub2e4.")
 
-        self.cancel_auto_btn = QPushButton("취소")
+        self.cancel_auto_btn = QPushButton("\ucde8\uc18c")
         self.cancel_auto_btn.clicked.connect(self._cancel_auto)
         self.cancel_auto_btn.setEnabled(False)
 
@@ -198,9 +196,7 @@ class PurchaseHistoryTab(QWidget):
 
     def _selected_import_channel(self) -> str:
         channel = self._selected_channel()
-        if channel in {"naver", "coupang"}:
-            return channel
-        return "naver"
+        return channel if channel in {"naver", "coupang"} else "naver"
 
     def _open_order_page(self, channel: str) -> None:
         url = self.ORDER_URLS.get(channel)
@@ -209,9 +205,9 @@ class PurchaseHistoryTab(QWidget):
 
     def _import_html(self) -> None:
         channel = self._selected_import_channel()
-        path, _selected_filter = QFileDialog.getOpenFileName(
+        path, _ = QFileDialog.getOpenFileName(
             self,
-            "구매내역 HTML 선택",
+            "\uad6c\ub9e4\ub0b4\uc5ed HTML \uc120\ud0dd",
             "",
             "HTML files (*.html *.htm);;All files (*.*)",
         )
@@ -221,53 +217,74 @@ class PurchaseHistoryTab(QWidget):
             records = self.parser.parse_html_file(channel, Path(path))
             added = self.store.save_records(records)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "가져오기 실패", str(exc))
+            QMessageBox.warning(self, "\uac00\uc838\uc624\uae30 \uc2e4\ud328", str(exc))
             return
-        self.status.setText(f"{self.CHANNEL_LABELS[channel]} {len(records)}건 분석, {added}건 추가")
+        self.status.setText(f"{self.CHANNEL_LABELS[channel]} {len(records)}\uac74 \ubd84\uc11d, {added}\uac74 \ucd94\uac00")
         self.reload()
 
-    # 취소/환불 키워드 (제목 안에서 탐지)
-    _CANCEL_KEYWORDS = ("결제취소", "취소완료", "주문취소", "구매취소", "환불완료", "환불")
+    def _import_clipboard(self) -> None:
+        channel = self._selected_import_channel()
+        text = QApplication.clipboard().text().strip()
+        if not text:
+            QMessageBox.information(
+                self,
+                "\ud074\ub9bd\ubcf4\ub4dc\uac00 \ube44\uc5b4\uc788\uc2b5\ub2c8\ub2e4",
+                "\uc77c\ubc18 \ube0c\ub77c\uc6b0\uc800\uc5d0\uc11c \uc8fc\ubb38\ub0b4\uc5ed \ud398\uc774\uc9c0\ub97c \uc5f4\uace0 Ctrl+A, Ctrl+C \ud6c4 \ub2e4\uc2dc \ub204\ub974\uc138\uc694.",
+            )
+            return
+        try:
+            records = self.parser.parse_text(channel, text, source_url="clipboard")
+            added = self.store.save_records(records)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "\ud074\ub9bd\ubcf4\ub4dc \uac00\uc838\uc624\uae30 \uc2e4\ud328", str(exc))
+            return
+        self.status.setText(
+            f"{self.CHANNEL_LABELS[channel]} \ud074\ub9bd\ubcf4\ub4dc {len(records)}\uac74 \ubd84\uc11d, {added}\uac74 \ucd94\uac00"
+        )
+        self.reload()
+
+    _STATUS_PREFIX_RE = __import__("re").compile(r"^\s*\[([^\]]+)\]")
 
     @classmethod
     def _is_cancelled(cls, record: PurchaseRecord) -> bool:
+        """취소/반품 거래 판별.
+
+        쿠팡 raw_text 에는 "반품, 교환 신청" 같은 버튼 텍스트가 항상 들어가서,
+        raw_text 검사하면 정상 [배송완료] 거래도 cancelled 로 잘못 잡힌다.
+        title 의 status prefix '[…]' 부분만 검사한다.
+        """
         title = str(record.title or "")
-        for kw in cls._CANCEL_KEYWORDS:
-            if kw in title:
-                return True
-        return False
+        m = cls._STATUS_PREFIX_RE.match(title)
+        if not m:
+            return False
+        status = m.group(1)
+        return any(keyword in status for keyword in cls.CANCEL_KEYWORDS)
 
     @classmethod
     def _signed_amount(cls, record: PurchaseRecord) -> int:
-        """취소 거래는 음수, 정상 거래는 양수."""
-        amt = int(record.amount or 0)
-        return -amt if cls._is_cancelled(record) else amt
+        amount = int(record.amount or 0)
+        return -amount if cls._is_cancelled(record) else amount
 
     def reload(self) -> None:
         channel = self._selected_channel()
         rows = self.store.load_records(channel=channel)
         self._render(rows)
-        # 정상 합계와 취소 차감을 분리해서 표시 (실수령/실지출 직관적으로)
         gross = sum(int(row.amount or 0) for row in rows if not self._is_cancelled(row))
         cancelled = sum(int(row.amount or 0) for row in rows if self._is_cancelled(row))
         net = gross - cancelled
         if cancelled > 0:
-            self.status.setText(
-                f"{len(rows):,}건 · 결제 {gross:,}원 - 취소 {cancelled:,}원 = "
-                f"<b>순 {net:,}원</b>"
-            )
+            self.status.setText(f"{len(rows):,}\uac74 | \uacb0\uc81c {gross:,}\uc6d0 - \ucde8\uc18c {cancelled:,}\uc6d0 = {net:,}\uc6d0")
         else:
-            self.status.setText(f"{len(rows):,}건 / {net:,}원")
+            self.status.setText(f"{len(rows):,}\uac74 | {net:,}\uc6d0")
 
     def _render(self, rows: List[PurchaseRecord]) -> None:
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(rows))
-        red_brush = QBrush(QColor("#dc2626"))  # 빨강
-        gray_brush = QBrush(QColor("#9ca3af"))  # 취소된 행의 다른 컬럼 (옅은 회색)
+        red_brush = QBrush(QColor("#dc2626"))
+        gray_brush = QBrush(QColor("#9ca3af"))
         for row_idx, record in enumerate(rows):
             cancelled = self._is_cancelled(record)
-            signed_amt = self._signed_amount(record)
-
+            signed_amount = self._signed_amount(record)
             values: list[Any] = [
                 record.order_date or "-",
                 self.CHANNEL_LABELS.get(record.channel, record.channel),
@@ -279,29 +296,19 @@ class PurchaseHistoryTab(QWidget):
             ]
             for col_idx, value in enumerate(values):
                 if col_idx == 4:
-                    # 금액: 취소면 음수 + 빨강, 정상이면 그대로
-                    if cancelled:
-                        text = f"-{int(value or 0):,}원" if value else "-"
-                    else:
-                        text = f"{int(value or 0):,}원" if value else "-"
+                    text = f"{signed_amount:,}\uc6d0" if value else "-"
                     item = _NumberItem(text)
-                    item.setData(Qt.UserRole, signed_amt)  # 정렬용 signed 값
+                    item.setData(Qt.UserRole, signed_amount)
                     if cancelled:
                         item.setForeground(red_brush)
-                        # 굵게 강조
                         font = item.font()
                         font.setBold(True)
                         item.setFont(font)
                 else:
                     item = QTableWidgetItem(str(value))
                     item.setData(Qt.UserRole, str(value))
-                    if cancelled and col_idx != 3:
-                        # 상품명 외 다른 셀은 옅은 회색으로 (시각적 약화)
-                        item.setForeground(gray_brush)
-                    elif cancelled and col_idx == 3:
-                        # 상품명도 빨강으로
-                        item.setForeground(red_brush)
-
+                    if cancelled:
+                        item.setForeground(red_brush if col_idx == 3 else gray_brush)
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 if col_idx == 3:
                     item.setToolTip(record.raw_text[:1000])
@@ -309,15 +316,12 @@ class PurchaseHistoryTab(QWidget):
         self.table.resizeColumnsToContents()
         self.table.setSortingEnabled(True)
 
-    # ------------------------------------------------------------------
-    # 자동 수집 (Playwright)
-    # ------------------------------------------------------------------
-
     def _set_auto_busy(self, busy: bool) -> None:
         for btn in (
             self.auto_naver_btn,
             self.auto_coupang_btn,
             self.import_btn,
+            self.clipboard_btn,
             self.open_naver_btn,
             self.open_coupang_btn,
             self.reload_btn,
@@ -328,14 +332,13 @@ class PurchaseHistoryTab(QWidget):
 
     def _start_auto_crawl(self, channel: str) -> None:
         if self._worker_thread is not None and self._worker_thread.isRunning():
-            QMessageBox.information(self, "안내", "이미 수집 작업이 진행 중입니다.")
+            QMessageBox.information(self, "\uc548\ub0b4", "\uc774\ubbf8 \uc218\uc9d1 \uc791\uc5c5\uc774 \uc9c4\ud589 \uc911\uc785\ub2c8\ub2e4.")
             return
-
         thread = QThread(self)
         worker = _CrawlerWorker(
             channel,
             headless=False,
-            max_pages=5,
+            max_pages=10,
             reset_session=self.reset_session_chk.isChecked(),
         )
         worker.moveToThread(thread)
@@ -345,62 +348,49 @@ class PurchaseHistoryTab(QWidget):
         worker.finished.connect(self._on_crawler_finished)
 
         def _cleanup(_result: object = None) -> None:
-            try:
-                thread.quit()
-                thread.wait(1000)
-            finally:
-                worker.deleteLater()
-                thread.deleteLater()
-                if self._worker_thread is thread:
-                    self._worker_thread = None
-                    self._worker = None
-                self._set_auto_busy(False)
+            thread.quit()
+            thread.wait(1000)
+            worker.deleteLater()
+            thread.deleteLater()
+            if self._worker_thread is thread:
+                self._worker_thread = None
+                self._worker = None
+            self._set_auto_busy(False)
 
         worker.finished.connect(_cleanup)
-
         self._worker_thread = thread
         self._worker = worker
         self.reset_session_chk.setChecked(False)
         self._set_auto_busy(True)
-        self.status.setText(
-            f"{self.CHANNEL_LABELS.get(channel, channel)} 자동 수집 시작... 브라우저 창에서 로그인하세요."
-        )
+        self.status.setText(f"{self.CHANNEL_LABELS.get(channel, channel)} \uc790\ub3d9 \uc218\uc9d1 \uc2dc\uc791... \ube0c\ub77c\uc6b0\uc800 \ucc3d\uc5d0\uc11c \ub85c\uadf8\uc778\ud558\uc138\uc694.")
         thread.start()
 
     def _cancel_auto(self) -> None:
         if self._worker is not None:
             self._worker.cancel()
-            self.status.setText("취소 요청됨 — 진행 중 작업이 끝나는 즉시 중단됩니다.")
+            self.status.setText("\ucde8\uc18c \uc694\uccad\ud588\uc2b5\ub2c8\ub2e4. \ud604\uc7ac \ub2e8\uacc4\uac00 \ub05d\ub098\uba74 \uc911\ub2e8\ub429\ub2c8\ub2e4.")
 
     def _on_crawler_log(self, msg: str) -> None:
         self.status.setText(msg)
 
     def _on_login_required(self, msg: str) -> None:
-        # 로그 라벨에 표시. 사용자가 브라우저 창에서 직접 로그인.
-        self.status.setText(f"⚠ {msg}")
+        self.status.setText(msg)
 
     def _on_crawler_finished(self, result: object) -> None:
         if not isinstance(result, CrawlResult):
-            self.status.setText("수집 종료(알 수 없는 응답)")
+            self.status.setText("\uc218\uc9d1\uc774 \uc885\ub8cc\ub418\uc5c8\uc9c0\ub9cc \uacb0\uacfc\ub97c \uc77d\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4.")
             return
         channel_label = self.CHANNEL_LABELS.get(result.channel, result.channel)
         if result.error:
-            QMessageBox.warning(
-                self,
-                f"{channel_label} 자동 수집 실패",
-                str(result.error)[:1500],
-            )
-            self.status.setText(f"❌ {channel_label} 실패: {result.error[:120]}")
+            QMessageBox.warning(self, f"{channel_label} \uc790\ub3d9 \uc218\uc9d1 \uc2e4\ud328", str(result.error)[:1500])
+            self.status.setText(f"{channel_label} \uc2e4\ud328: {result.error[:120]}")
             return
-
-        added = 0
         try:
             added = self.store.save_records(result.records)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "저장 실패", str(exc))
-        self.status.setText(
-            f"✅ {channel_label} 자동 수집 완료: {len(result.records)}건 추출, {added}건 신규 저장"
-        )
+            QMessageBox.warning(self, "\uc800\uc7a5 \uc2e4\ud328", str(exc))
+            added = 0
+        self.status.setText(f"{channel_label} \uc790\ub3d9 \uc218\uc9d1 \uc644\ub8cc: {len(result.records)}\uac74 \ucd94\ucd9c, {added}\uac74 \uc2e0\uaddc \uc800\uc7a5")
         self.reload()
 
     def shutdown(self) -> None:
@@ -409,5 +399,3 @@ class PurchaseHistoryTab(QWidget):
         if self._worker_thread is not None and self._worker_thread.isRunning():
             self._worker_thread.quit()
             self._worker_thread.wait(2000)
-        return
-

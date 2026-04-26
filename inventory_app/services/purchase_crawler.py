@@ -1,115 +1,48 @@
-"""네이버/쿠팡 개인 구매내역 자동 크롤러.
-
-사용 방식:
-1) 최초 1회 — 사용자가 ``playwright install chromium`` 으로 브라우저 다운로드
-   (앱이 자동 호출도 가능. ensure_browser() 참고)
-2) ``crawl_naver()`` / ``crawl_coupang()`` 호출 → 별도 창에서 Chromium 이 뜸
-3) 로그인 상태가 없으면 사용자가 직접 로그인 → 세션 정보 디스크에 저장
-4) 로그인된 채로 주문 페이지 이동 → 데이터 추출 → ``PurchaseRecord`` 리스트 반환
-
-저장 위치: ``~/.smartinventory/playwright_state_{channel}.json``
-"""
-
 from __future__ import annotations
 
-import json
-import os
 import re
-import subprocess
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional
+from typing import Callable, List, Optional
 
 from inventory_app.models import PurchaseRecord
+from inventory_app.services.purchase_history_service import PurchaseHistoryParser
+
+try:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import sync_playwright
+except Exception:  # pragma: no cover - handled at runtime for users without playwright
+    PlaywrightTimeoutError = TimeoutError  # type: ignore[assignment]
+    sync_playwright = None  # type: ignore[assignment]
 
 
-# ---------------------------------------------------------------------------
-# 경로/유틸
-# ---------------------------------------------------------------------------
-
-
-def _state_dir() -> Path:
-    return (Path.home() / ".smartinventory").resolve()
-
-
-def _state_path(channel: str) -> Path:
-    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", channel.lower()) or "channel"
-    return _state_dir() / f"playwright_state_{safe}.json"
-
-
-def _user_data_dir(channel: str) -> Path:
-    """채널별 영구 user data directory.
-
-    persistent_context 가 사용. 로그인/쿠키/캐시 모두 유지됨 →
-    매번 깨끗한 프로파일이 아니라 진짜 일반 브라우저처럼 보여서 안티봇 우회 가능.
-    """
-    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", channel.lower()) or "channel"
-    return _state_dir() / f"browser_profile_{safe}"
-
-
-def _purge_state(channel: str) -> None:
-    try:
-        _state_path(channel).unlink(missing_ok=True)  # type: ignore[arg-type]
-    except Exception:  # noqa: BLE001
-        pass
-    # user_data_dir 도 같이 비움 (재로그인)
-    import shutil
-    udir = _user_data_dir(channel)
-    if udir.exists():
-        try:
-            shutil.rmtree(udir, ignore_errors=True)
-        except Exception:  # noqa: BLE001
-            pass
-
-
-# 봇 감지 우회용 init 스크립트 (Coupang Akamai 등 차단 회피)
-_STEALTH_INIT_SCRIPT = """
-// 1) navigator.webdriver 숨김 (Playwright 의 가장 확실한 마커)
-Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-// 2) 일반 Chrome 처럼 plugins, languages 속성 제공
-Object.defineProperty(navigator, 'languages', {
-    get: () => ['ko-KR', 'ko', 'en-US', 'en']
-});
-Object.defineProperty(navigator, 'plugins', {
-    get: () => [
-        { name: 'PDF Viewer' },
-        { name: 'Chrome PDF Viewer' },
-        { name: 'Chromium PDF Viewer' },
-        { name: 'Microsoft Edge PDF Viewer' },
-        { name: 'WebKit built-in PDF' }
-    ]
-});
-
-// 3) chrome 객체 위장
-window.chrome = window.chrome || { runtime: {} };
-
-// 4) permissions API 응답 정상화 (자동화에선 default 라 의심받음)
-const origQuery = window.navigator.permissions && window.navigator.permissions.query;
-if (origQuery) {
-    window.navigator.permissions.query = (parameters) => (
-        parameters.name === 'notifications'
-            ? Promise.resolve({ state: Notification.permission })
-            : origQuery(parameters)
-    );
+ORDER_URLS = {
+    "naver": "https://order.pay.naver.com/home",
+    "coupang": "https://mc.coupang.com/ssr/desktop/order/list",
 }
 
-// 5) WebGL vendor / renderer 정상화
-const getParameter = WebGLRenderingContext.prototype.getParameter;
-WebGLRenderingContext.prototype.getParameter = function(parameter) {
-    if (parameter === 37445) return 'Intel Inc.';
-    if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-    return getParameter.call(this, parameter);
-};
-"""
+CHANNEL_LABELS = {
+    "naver": "\ub124\uc774\ubc84",
+    "coupang": "\ucfe0\ud321",
+}
 
+ORDER_HINTS = {
+    "naver": ("\uc8fc\ubb38", "\ubc30\uc1a1", "\uacb0\uc81c", "\uad6c\ub9e4", "\uc6d0"),
+    "coupang": ("\uc8fc\ubb38", "\ubc30\uc1a1", "\uacb0\uc81c", "\uad6c\ub9e4", "\uc6d0"),
+}
 
-# ---------------------------------------------------------------------------
-# 진행 상황 콜백
-# ---------------------------------------------------------------------------
+LOGIN_HINTS = (
+    "\ub85c\uadf8\uc778",
+    "login",
+    "\uc544\uc774\ub514",
+    "\ube44\ubc00\ubc88\ud638",
+    "\ud68c\uc6d0",
+    "sign in",
+)
 
 
 @dataclass
@@ -119,581 +52,164 @@ class CrawlerProgress:
     cancelled: Callable[[], bool] = field(default=lambda: False)
 
 
-# ---------------------------------------------------------------------------
-# Playwright 사전 점검
-# ---------------------------------------------------------------------------
+@dataclass
+class CrawlResult:
+    channel: str
+    records: List[PurchaseRecord]
+    error: Optional[str] = None
 
 
 class PlaywrightUnavailable(RuntimeError):
     pass
 
 
-def _import_playwright():
-    try:
-        from playwright.sync_api import sync_playwright  # type: ignore
-        return sync_playwright
-    except Exception as exc:  # noqa: BLE001
+def _profile_root() -> Path:
+    return (Path.home() / ".smartinventory" / "browser_profiles").resolve()
+
+
+def _profile_dir(channel: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", channel.lower()) or "channel"
+    return _profile_root() / f"purchase_{safe}"
+
+
+def _ensure_playwright() -> None:
+    if sync_playwright is None:
         raise PlaywrightUnavailable(
-            "playwright 패키지가 없습니다. 'pip install playwright' 후 'playwright install chromium' 을 실행하세요."
-        ) from exc
-
-
-def _is_frozen() -> bool:
-    """PyInstaller 빌드된 exe 안에서 실행 중인지."""
-    return getattr(sys, "frozen", False)
-
-
-def _detect_browser_channel(progress: CrawlerProgress) -> Optional[str]:
-    """시스템에 설치된 Chrome/Edge 가용성 확인. 사용 가능한 channel 반환.
-
-    반환값:
-    - "chrome": 시스템 Google Chrome
-    - "msedge": 시스템 Microsoft Edge
-    - None: Playwright 기본 Chromium (별도 다운로드 필요)
-    """
-    sync_playwright = _import_playwright()
-    for channel in ("chrome", "msedge"):
-        try:
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(channel=channel, headless=True)
-                browser.close()
-            return channel
-        except Exception:  # noqa: BLE001
-            continue
-    return None
+            "playwright \ud328\ud0a4\uc9c0\uac00 \uc5c6\uc2b5\ub2c8\ub2e4. requirements.txt \uc124\uce58 \ud6c4 \ub2e4\uc2dc \ube4c\ub4dc\ud574\uc8fc\uc138\uc694."
+        )
 
 
 def ensure_browser_installed(progress: Optional[CrawlerProgress] = None) -> None:
-    """크롤링용 브라우저 가용성 확인.
-
-    우선순위:
-    1) 시스템 Google Chrome (대부분 사용자)
-    2) 시스템 Microsoft Edge (Windows 11 기본)
-    3) Playwright Chromium (개발 환경에서 'playwright install chromium' 한 경우)
-    4) 위 셋 다 없고 frozen exe 가 아니면 → playwright install 자동 호출
-    5) frozen exe 인데 다 없으면 → 안내
-    """
     progress = progress or CrawlerProgress()
-    sync_playwright = _import_playwright()
+    _ensure_playwright()
+    # The collector intentionally uses a normal visible browser profile. It does not
+    # install evasion scripts or modify browser fingerprints. Edge/Chrome are tried
+    # first because they are normally already present on Windows.
+    progress.on_log("\ube0c\ub77c\uc6b0\uc800 \uc900\ube44 \ud655\uc778 \uc644\ub8cc")
 
-    # 1, 2) 시스템 Chrome/Edge
-    channel = _detect_browser_channel(progress)
-    if channel == "chrome":
-        progress.on_log("브라우저 OK: 시스템 Google Chrome")
-        return
-    if channel == "msedge":
-        progress.on_log("브라우저 OK: 시스템 Microsoft Edge")
-        return
 
-    # 3) Playwright Chromium 시도
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            browser.close()
-        progress.on_log("브라우저 OK: Playwright Chromium")
-        return
-    except Exception:  # noqa: BLE001
-        pass
+def _is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
 
-    # 4) Dev 환경: 자동 설치 시도
-    if not _is_frozen():
-        progress.on_log("Chromium 브라우저 설치 중... (최초 1회, 수백 MB 다운로드)")
+
+def _launch_persistent_context(pw, channel: str, headless: bool, progress: CrawlerProgress):
+    user_data_dir = _profile_dir(channel)
+    user_data_dir.mkdir(parents=True, exist_ok=True)
+    kwargs = {
+        "user_data_dir": str(user_data_dir),
+        "headless": headless,
+        "locale": "ko-KR",
+        "timezone_id": "Asia/Seoul",
+        "viewport": {"width": 1360, "height": 900},
+    }
+    last_error: Exception | None = None
+    for browser_channel, label in (("msedge", "Microsoft Edge"), ("chrome", "Google Chrome")):
         try:
-            proc = subprocess.run(
-                [sys.executable, "-m", "playwright", "install", "chromium"],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
-            if proc.stdout:
-                progress.on_log(proc.stdout.strip()[-400:])
-            progress.on_log("Chromium 설치 완료")
-            return
+            context = pw.chromium.launch_persistent_context(channel=browser_channel, **kwargs)
+            progress.on_log(f"{label} \uc815\uc0c1 \uc138\uc158\uc73c\ub85c \uc5f4\uc5c8\uc2b5\ub2c8\ub2e4")
+            return context
         except Exception as exc:  # noqa: BLE001
-            raise PlaywrightUnavailable(
-                f"브라우저 설치 실패. 수동으로 'playwright install chromium' 실행 요망: {exc}"
-            ) from exc
-
-    # 5) Frozen + 브라우저 없음
-    raise PlaywrightUnavailable(
-        "브라우저를 찾을 수 없습니다.\n\n"
-        "Google Chrome 또는 Microsoft Edge 를 설치한 뒤 재시도하세요.\n"
-        "(Chrome 다운로드: https://www.google.com/chrome/)"
-    )
-
-
-# ---------------------------------------------------------------------------
-# 채널별 추출 로직
-# ---------------------------------------------------------------------------
-
-
-_AMOUNT_RE = re.compile(r"([0-9][0-9,]{2,})\s*원")
-
-
-def _to_int(value: str | None) -> int | None:
-    if value is None:
-        return None
-    cleaned = re.sub(r"[^0-9]", "", str(value))
+            last_error = exc
     try:
-        return int(cleaned) if cleaned else None
-    except ValueError:
-        return None
+        context = pw.chromium.launch_persistent_context(**kwargs)
+        progress.on_log("Playwright Chromium \uc815\uc0c1 \uc138\uc158\uc73c\ub85c \uc5f4\uc5c8\uc2b5\ub2c8\ub2e4")
+        return context
+    except Exception as exc:  # noqa: BLE001
+        hint = (
+            "\n\n\uac1c\ubc1c \ud658\uacbd\uc5d0\uc11c\ub294 python -m playwright install chromium \uc744 \ud55c \ubc88 \uc2e4\ud589\ud558\uba74 \ud574\uacb0\ub429\ub2c8\ub2e4."
+            if not _is_frozen()
+            else "\n\nexe\uc5d0\uc11c\ub294 Microsoft Edge \ub610\ub294 Chrome\uc774 \uc124\uce58\ub418\uc5b4 \uc788\uc5b4\uc57c \ud569\ub2c8\ub2e4."
+        )
+        raise RuntimeError(f"\uc0ac\uc6a9 \uac00\ub2a5\ud55c \ube0c\ub77c\uc6b0\uc800\ub97c \ucc3e\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4: {last_error or exc}{hint}") from exc
 
 
-def _max_amount(text: str) -> int | None:
-    values = []
-    for raw in _AMOUNT_RE.findall(text or ""):
+def _body_text(page) -> str:
+    try:
+        return page.locator("body").inner_text(timeout=10_000)
+    except Exception:  # noqa: BLE001
         try:
-            values.append(int(raw.replace(",", "")))
-        except ValueError:
-            continue
-    return max(values) if values else None
-
-
-def _norm_date(text: str | None) -> str | None:
-    if not text:
-        return None
-    m = re.search(r"(20\d{2})[.\-/년\s]+(\d{1,2})[.\-/월\s]+(\d{1,2})", text)
-    if not m:
-        return None
-    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    if not (1 <= mo <= 12 and 1 <= d <= 31):
-        return None
-    return f"{y:04d}-{mo:02d}-{d:02d}"
-
-
-def _wait_off_login(page, host_keyword: str, timeout_sec: int = 240) -> bool:
-    """CSP-safe polling: URL 에 host_keyword 가 있는 동안 대기.
-
-    네이버 로그인 페이지는 CSP 로 wait_for_function/evaluate 의 `unsafe-eval` 을 막아
-    Playwright wait_for_function 이 EvalError 로 즉시 실패한다.
-    그래서 page.url 만 폴링.
-    """
-    start = time.time()
-    while time.time() - start < timeout_sec:
-        try:
-            url = page.url
+            return page.evaluate("() => document.body ? document.body.innerText : ''") or ""
         except Exception:  # noqa: BLE001
-            url = ""
-        if host_keyword not in url:
-            return True
-        time.sleep(2)
+            return ""
+
+
+def _looks_like_logged_in_order_page(channel: str, text: str, url: str) -> bool:
+    lowered = (text or "").lower()
+    has_order_hint = sum(1 for hint in ORDER_HINTS[channel] if hint in text) >= 2
+    has_login_hint = any(hint in lowered or hint in text for hint in LOGIN_HINTS)
+    return has_order_hint and not (has_login_hint and not has_order_hint)
+
+
+def _wait_for_user_login(page, channel: str, progress: CrawlerProgress, timeout_seconds: int = 360) -> None:
+    label = CHANNEL_LABELS.get(channel, channel)
+    deadline = time.time() + timeout_seconds
+    notified = False
+    while time.time() < deadline:
+        if progress.cancelled():
+            raise RuntimeError("\uc0ac\uc6a9\uc790\uac00 \uc218\uc9d1\uc744 \ucde8\uc18c\ud588\uc2b5\ub2c8\ub2e4.")
+        text = _body_text(page)
+        if _looks_like_logged_in_order_page(channel, text, page.url):
+            progress.on_log(f"{label} \ub85c\uadf8\uc778/\uc8fc\ubb38\ub0b4\uc5ed \ud655\uc778 \uc644\ub8cc")
+            return
+        if not notified:
+            progress.on_login_required(
+                f"{label} \ube0c\ub77c\uc6b0\uc800 \ucc3d\uc5d0\uc11c \uc9c1\uc811 \ub85c\uadf8\uc778\ud558\uace0, \uc8fc\ubb38\ub0b4\uc5ed \ud654\uba74\uc774 \ubcf4\uc774\uba74 \uadf8\ub300\ub85c \ub450\uc138\uc694."
+            )
+            notified = True
+        time.sleep(2.0)
+    raise RuntimeError(f"{label} \ub85c\uadf8\uc778/\uc8fc\ubb38\ub0b4\uc5ed \ud655\uc778 \uc2dc\uac04\uc774 \ucd08\uacfc\ub418\uc5c8\uc2b5\ub2c8\ub2e4.")
+
+
+def _click_next_if_available(page) -> bool:
+    selectors = [
+        "button:has-text('\\ub2e4\\uc74c')",
+        "a:has-text('\\ub2e4\\uc74c')",
+        "button:has-text('\\ub354\\ubcf4\\uae30')",
+        "a:has-text('\\ub354\\ubcf4\\uae30')",
+        "[aria-label*='Next']",
+        "[aria-label*='\\ub2e4\\uc74c']",
+    ]
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if locator.count() == 0:
+                continue
+            if locator.is_visible(timeout=1000) and locator.is_enabled(timeout=1000):
+                locator.click(timeout=3000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10_000)
+                except Exception:
+                    time.sleep(1.0)
+                return True
+        except Exception:  # noqa: BLE001
+            continue
     return False
 
 
-def _crawl_naver(page, max_pages: int, progress: CrawlerProgress) -> List[PurchaseRecord]:
-    """네이버 페이 결제내역 페이지 (https://pay.naver.com/pc/history) 수집.
-
-    DOM 구조 (CSS Modules — 클래스에 hash suffix):
-    - 결제 1건 컨테이너: [class*="PaymentItem_article"]
-    - 상품명:           [class*="PaymentItem_product__"]
-    - 금액:             [class*="PaymentItem_price"]
-    - 시간:             [class*="PaymentItem_time"]
-    - 주문상세:         [class*="PaymentItem_order-detail"]
-    - 상태:             [class*="OrderStatus_article"]
-
-    페이지네이션: URL ?page=N 으로 직접 이동.
-    """
+def _collect_records(page, channel: str, max_pages: int, progress: CrawlerProgress) -> List[PurchaseRecord]:
+    parser = PurchaseHistoryParser()
     records: List[PurchaseRecord] = []
-    now = datetime.now()
-    base_url = "https://pay.naver.com/pc/history"
-
-    # 1) 진입
-    try:
-        page.goto(f"{base_url}?page=1", wait_until="domcontentloaded", timeout=30_000)
-    except Exception as exc:  # noqa: BLE001
-        progress.on_log(f"페이지 이동 오류(무시): {exc}")
-
-    # 2) 로그인 처리 (네이버 ID 페이지)
-    if "nid.naver.com" in page.url:
-        progress.on_login_required(
-            "네이버 로그인이 필요합니다. 브라우저 창에서 직접 로그인해주세요."
-        )
-        if not _wait_off_login(page, "nid.naver.com", timeout_sec=300):
-            progress.on_log("로그인 대기 시간 초과")
-            return records
-        progress.on_log(f"로그인 감지됨 ({page.url[:80]}). 결제내역 페이지로 이동")
-        try:
-            page.goto(f"{base_url}?page=1", wait_until="domcontentloaded", timeout=30_000)
-        except Exception as exc:  # noqa: BLE001
-            progress.on_log(f"재이동 실패: {exc}")
-            return records
-
-    if "pay.naver.com" not in page.url:
-        progress.on_log(f"결제내역 페이지 진입 실패. 현재: {page.url[:120]}")
-        return records
-
-    # 3) 페이지별 추출
-    seen_keys: set[str] = set()  # (order_no or title+amount+date) 로 중복 방지
-    for page_idx in range(1, max_pages + 1):
+    seen = set()
+    label = CHANNEL_LABELS.get(channel, channel)
+    for page_no in range(1, max(1, max_pages) + 1):
         if progress.cancelled():
-            progress.on_log("취소 요청됨")
             break
-
-        if page_idx > 1:
-            try:
-                page.goto(f"{base_url}?page={page_idx}", wait_until="domcontentloaded", timeout=30_000)
-            except Exception as exc:  # noqa: BLE001
-                progress.on_log(f"페이지 {page_idx} 이동 실패: {exc}")
-                break
-
-        # 데이터 렌더 대기
-        try:
-            page.wait_for_load_state("networkidle", timeout=15_000)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            page.wait_for_selector('[class*="PaymentItem_article"]', timeout=10_000)
-        except Exception:  # noqa: BLE001
-            progress.on_log(f"페이지 {page_idx}: 결제 항목 못 찾음 → 종료")
-            break
-        time.sleep(1.0)
-
-        articles = page.query_selector_all('[class*="PaymentItem_article"]')
-        if not articles:
-            progress.on_log(f"페이지 {page_idx}: 항목 0건 → 종료")
-            break
-
+        text = _body_text(page)
+        parsed = parser.parse_text(channel, text, source_url=page.url)
         added = 0
-        for art in articles:
-            try:
-                rec = _extract_naver_payment_item(art, base_url, now)
-            except Exception as exc:  # noqa: BLE001
-                progress.on_log(f"  항목 파싱 오류(skip): {exc}")
+        for record in parsed:
+            key = (record.order_date, record.order_no, record.title, record.amount)
+            if key in seen:
                 continue
-            if rec is None:
-                continue
-            key = rec.order_no or f"{rec.order_date}|{rec.title}|{rec.amount}"
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            records.append(rec)
+            seen.add(key)
+            records.append(record)
             added += 1
-        progress.on_log(f"네이버 페이지 {page_idx}: {added}건 추출 (총 {len(records)})")
-
-        if added == 0:
+        progress.on_log(f"{label} {page_no}\ud398\uc774\uc9c0: {added}\uac74 \ucd94\ucd9c")
+        if page_no >= max_pages:
             break
-
+        if not _click_next_if_available(page):
+            break
     return records
-
-
-def _extract_naver_payment_item(article_handle, base_url: str, now: datetime) -> Optional[PurchaseRecord]:
-    """PaymentItem_article 컨테이너 1개에서 PurchaseRecord 추출.
-
-    실제 DOM 구조 (CSS Modules):
-    - 상품명 정확 위치:  [class*="ProductName_name"]   (예: "허니콤보")
-    - 가격:              [class*="PaymentItem_price"]
-    - 결제시간:          [class*="PaymentItem_time"]
-    - 상태:              [class*="OrderStatus_value"]
-    - 주문상세 링크:     [class*="PaymentItem_view-detail"]  href 에 주문번호 포함
-    - 상품 이미지 alt:   PaymentItem_product-detail 안의 img.alt — fallback 용
-    """
-
-    def _q_text(sel: str) -> str:
-        try:
-            el = article_handle.query_selector(sel)
-            if el is None:
-                return ""
-            return (el.inner_text() or "").strip()
-        except Exception:  # noqa: BLE001
-            return ""
-
-    def _q_attr(sel: str, attr: str) -> str:
-        try:
-            el = article_handle.query_selector(sel)
-            if el is None:
-                return ""
-            return (el.get_attribute(attr) or "").strip()
-        except Exception:  # noqa: BLE001
-            return ""
-
-    full_text = ""
-    try:
-        full_text = (article_handle.inner_text() or "").strip()
-    except Exception:  # noqa: BLE001
-        pass
-    if not full_text:
-        return None
-
-    # 상품명: ProductName_name 안의 텍스트가 가장 정확
-    product = _q_text('[class*="ProductName_name"]')
-    if not product:
-        # fallback 1: img alt (PaymentItem_product-detail 안)
-        product = _q_attr('[class*="PaymentItem_product-detail"] img', "alt")
-    if not product:
-        product = _guess_title(full_text)
-
-    price_text = _q_text('[class*="PaymentItem_price"]')
-    time_text = _q_text('[class*="PaymentItem_time"]')
-    status = _q_text('[class*="OrderStatus_value"]') or _q_text(
-        '[class*="OrderStatus_article"]'
-    )
-
-    amount = _max_amount(price_text or full_text)
-    if amount is None or amount <= 0:
-        return None
-
-    title = product.split("\n", 1)[0].strip() if "\n" in product else product
-    title = title.strip() or "구매내역"
-    if status:
-        status_clean = status.split("\n", 1)[0].strip()[:20]
-        if status_clean and status_clean not in title:
-            title = f"[{status_clean}] {title}"
-
-    order_date = _norm_naver_date(time_text or full_text, now)
-
-    # 주문번호: view-detail 링크 href 에서 /detail/{slipNo} 추출
-    detail_href = _q_attr('[class*="PaymentItem_view-detail"]', "href")
-    order_no = _extract_naver_order_no_from_url(detail_href) or _extract_order_no(full_text)
-
-    # source_url 도 detail href 가 있으면 그걸로 (개별 주문 페이지 직링크)
-    src_url = detail_href or base_url
-
-    return PurchaseRecord(
-        id=None,
-        channel="naver",
-        order_date=order_date,
-        order_no=order_no,
-        title=title[:120],
-        amount=amount,
-        payment_method=_extract_payment_method(full_text),
-        source_url=src_url,
-        raw_text=full_text[:2000],
-        imported_at=now,
-    )
-
-
-def _extract_naver_order_no_from_url(url: str) -> Optional[str]:
-    """orders.pay.naver.com/.../detail/{slipNo} 형식에서 slipNo 추출."""
-    if not url:
-        return None
-    m = re.search(r"/detail/([A-Za-z0-9]+)", url)
-    if m:
-        return m.group(1)
-    return None
-
-
-def _norm_naver_date(text: str, now: datetime) -> Optional[str]:
-    """네이버 페이의 '4. 19. 17:49' 같은 표기에서 날짜 추출.
-
-    연도 미표기 → now.year 로 가정 (12월 → 1월 같은 경계는 그대로 두되
-    미래 날짜면 작년으로 보정).
-    """
-    if not text:
-        return None
-    # 표준 ISO/일반 패턴 먼저
-    iso = _norm_date(text)
-    if iso:
-        return iso
-    # "M. D." 또는 "M.D" 또는 "M월 D일"
-    m = re.search(r"\b(\d{1,2})\.\s*(\d{1,2})\.", text)
-    if not m:
-        m = re.search(r"\b(\d{1,2})\s*월\s*(\d{1,2})", text)
-    if not m:
-        return None
-    month, day = int(m.group(1)), int(m.group(2))
-    if not (1 <= month <= 12 and 1 <= day <= 31):
-        return None
-    year = now.year
-    candidate = f"{year:04d}-{month:02d}-{day:02d}"
-    # 미래 날짜면 작년
-    try:
-        cand_dt = datetime.strptime(candidate, "%Y-%m-%d")
-        if cand_dt > now:
-            year -= 1
-            candidate = f"{year:04d}-{month:02d}-{day:02d}"
-    except Exception:  # noqa: BLE001
-        pass
-    return candidate
-
-
-def _crawl_coupang(page, max_pages: int, progress: CrawlerProgress) -> List[PurchaseRecord]:
-    """쿠팡 주문 목록 페이지 수집."""
-    records: List[PurchaseRecord] = []
-    now = datetime.now()
-    target = "https://mc.coupang.com/ssr/desktop/order/list"
-
-    progress.on_log(f"쿠팡 주문내역 페이지 이동: {target}")
-    try:
-        page.goto(target, wait_until="domcontentloaded", timeout=30_000)
-    except Exception as exc:  # noqa: BLE001
-        progress.on_log(f"페이지 이동 오류(무시): {exc}")
-
-    # 로그인 페이지로 갔는지 확인
-    if "login.coupang.com" in page.url:
-        progress.on_login_required(
-            "쿠팡 로그인이 필요합니다. 브라우저 창에서 직접 로그인해주세요."
-        )
-        if not _wait_off_login(page, "login.coupang.com", timeout_sec=300):
-            progress.on_log("로그인 대기 시간 초과")
-            return records
-        progress.on_log(f"로그인 감지됨 (현재 URL: {page.url[:80]}). 주문내역 페이지로 이동")
-        try:
-            page.goto(target, wait_until="domcontentloaded", timeout=30_000)
-        except Exception as exc:  # noqa: BLE001
-            progress.on_log(f"주문내역 진입 실패: {exc}")
-            return records
-
-    if "login.coupang.com" in page.url:
-        progress.on_log("아직 로그인 페이지. 사용자가 로그인 마치고 재시도하세요.")
-        return records
-
-    try:
-        page.wait_for_load_state("networkidle", timeout=20_000)
-    except Exception:  # noqa: BLE001
-        pass
-    time.sleep(2.0)
-
-    card_selectors = [
-        'div[class*="orderListItem"]',
-        'div[class*="order-item"]',
-        'div[class*="OrderItem"]',
-        'tr[class*="order"]',
-    ]
-
-    for page_idx in range(1, max_pages + 1):
-        if progress.cancelled():
-            progress.on_log("취소 요청됨")
-            break
-        cards = []
-        for sel in card_selectors:
-            try:
-                handles = page.query_selector_all(sel)
-            except Exception:  # noqa: BLE001
-                handles = []
-            if handles:
-                cards = handles
-                break
-        if not cards:
-            full_text = page.evaluate("() => document.body && document.body.innerText || ''")
-            blocks = _split_text_blocks(full_text)
-            for block in blocks:
-                rec = _block_to_record("coupang", block, target, now)
-                if rec is not None:
-                    records.append(rec)
-            progress.on_log(f"쿠팡 페이지 {page_idx}: 카드 selector 실패 → 텍스트 추출 {len(blocks)}건")
-            break
-
-        added_in_page = 0
-        for card in cards:
-            try:
-                text = (card.inner_text() or "").strip()
-            except Exception:  # noqa: BLE001
-                continue
-            rec = _block_to_record("coupang", text, target, now)
-            if rec is None:
-                continue
-            records.append(rec)
-            added_in_page += 1
-        progress.on_log(f"쿠팡 페이지 {page_idx}: {added_in_page}건 추출")
-
-        next_btn = None
-        for sel in ['button:has-text("다음")', 'a:has-text("다음")', 'button[aria-label*="다음"]']:
-            try:
-                btn = page.query_selector(sel)
-            except Exception:  # noqa: BLE001
-                btn = None
-            if btn and btn.is_enabled():
-                next_btn = btn
-                break
-        if not next_btn:
-            break
-        try:
-            next_btn.click()
-            time.sleep(1.5)
-            page.wait_for_load_state("networkidle", timeout=10_000)
-        except Exception:  # noqa: BLE001
-            break
-
-    return records
-
-
-def _split_text_blocks(text: str) -> List[str]:
-    if not text:
-        return []
-    # 날짜 패턴을 기준으로 블록 분리
-    parts = re.split(r"(?=20\d{2}[.\-/년\s]+\d{1,2}[.\-/월\s]+\d{1,2})", text)
-    return [p.strip() for p in parts if p.strip() and "원" in p]
-
-
-def _block_to_record(
-    channel: str,
-    text: str,
-    source_url: str,
-    now: datetime,
-) -> Optional[PurchaseRecord]:
-    text = (text or "").strip()
-    if not text or "원" not in text:
-        return None
-    amount = _max_amount(text)
-    if amount is None:
-        return None
-    order_date = _norm_date(text)
-    order_no = _extract_order_no(text)
-    title = _guess_title(text)
-    return PurchaseRecord(
-        id=None,
-        channel=channel,
-        order_date=order_date,
-        order_no=order_no,
-        title=title,
-        amount=amount,
-        payment_method=_extract_payment_method(text),
-        source_url=source_url,
-        raw_text=text[:2000],
-        imported_at=now,
-    )
-
-
-def _extract_order_no(text: str) -> Optional[str]:
-    for pat in (
-        r"(?:주문번호|주문\s*번호|order\s*no\.?)\s*[:：]?\s*([A-Za-z0-9\-]{6,})",
-        r"\b([0-9]{10,})\b",
-    ):
-        m = re.search(pat, text, flags=re.I)
-        if m:
-            return m.group(1)
-    return None
-
-
-def _extract_payment_method(text: str) -> Optional[str]:
-    # 흔한 결제수단 키워드
-    for keyword in (
-        "카드", "신용카드", "체크카드", "계좌이체", "무통장", "휴대폰결제",
-        "네이버페이", "카카오페이", "토스페이", "쿠페이", "페이코",
-        "삼성페이", "현금영수증", "포인트",
-    ):
-        if keyword in text:
-            return keyword
-    return None
-
-
-def _guess_title(text: str) -> str:
-    # 날짜/금액/공통 라벨 제거
-    trimmed = re.sub(r"\b20\d{2}[.\-/년\s]+\d{1,2}[.\-/월\s]+\d{1,2}\b", " ", text)
-    trimmed = re.sub(r"[0-9][0-9,]{2,}\s*원", " ", trimmed)
-    trimmed = re.sub(
-        r"(주문번호|주문\s*번호|배송완료|결제완료|구매확정|주문상세|배송중|취소|반품|교환)",
-        " ",
-        trimmed,
-    )
-    trimmed = re.sub(r"\s+", " ", trimmed).strip()
-    if len(trimmed) > 120:
-        trimmed = trimmed[:117].rstrip() + "..."
-    return trimmed or "구매내역"
-
-
-# ---------------------------------------------------------------------------
-# 공개 API
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class CrawlResult:
-    channel: str
-    records: List[PurchaseRecord]
-    error: Optional[str] = None
 
 
 def crawl_channel(
@@ -704,105 +220,502 @@ def crawl_channel(
     reset_session: bool = False,
     progress: Optional[CrawlerProgress] = None,
 ) -> CrawlResult:
-    """네이버/쿠팡 자동 수집.
-
-    headless=False 권장 — 최초 로그인 시 사용자가 입력해야 함.
-    reset_session=True 면 저장된 세션 폐기 후 재로그인.
-    """
     progress = progress or CrawlerProgress()
-    channel = channel.lower()
-    if channel not in {"naver", "coupang"}:
-        return CrawlResult(channel=channel, records=[], error=f"지원 안 함: {channel}")
+    channel = channel.lower().strip()
+    if channel not in ORDER_URLS:
+        return CrawlResult(channel=channel, records=[], error=f"\uc9c0\uc6d0\ud558\uc9c0 \uc54a\ub294 \ucc44\ub110: {channel}")
+
+    # \ucfe0\ud321\uc740 Akamai Bot Manager \uac00 \uc77c\ubc18 Playwright launch \ub97c \ucc28\ub2e8\ud558\ubbc0\ub85c,
+    # NTFS junction + CDP attach \ub85c \uc0ac\uc6a9\uc790 \ud3c9\uc0c1\uc2dc Chrome \ud504\ub85c\ud30c\uc77c\uc744 \ud65c\uc6a9\ud55c\ub2e4.
+    if channel == "coupang":
+        return _crawl_coupang_via_cdp(
+            max_pages=max_pages,
+            reset_session=reset_session,
+            progress=progress,
+        )
 
     if reset_session:
-        _purge_state(channel)
-
-    sync_playwright = _import_playwright()
-
-    state_dir = _state_dir()
-    state_dir.mkdir(parents=True, exist_ok=True)
-    user_data_dir = _user_data_dir(channel)
-    user_data_dir.mkdir(parents=True, exist_ok=True)
-
-    records: List[PurchaseRecord] = []
-    error: Optional[str] = None
+        shutil.rmtree(_profile_dir(channel), ignore_errors=True)
 
     try:
-        with sync_playwright() as pw:
-            # persistent_context 사용:
-            # - 영구 user_data_dir → 진짜 일반 브라우저처럼 동작 (Akamai 등 안티봇 우회)
-            # - 로그인 상태도 자연스레 유지 (별도 storage_state 불필요)
-            # - 첫 로그인은 사용자가 직접, 이후엔 쿠키/세션이 dir 안에 보관됨
-            launch_kwargs = {
-                "user_data_dir": str(user_data_dir),
-                "headless": headless,
-                "args": [
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-features=IsolateOrigins,site-per-process",
-                ],
-                "ignore_default_args": ["--enable-automation"],
-                "user_agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/130.0.0.0 Safari/537.36"
-                ),
-                "locale": "ko-KR",
-                "timezone_id": "Asia/Seoul",
-                "viewport": {"width": 1280, "height": 900},
-                "extra_http_headers": {
-                    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-                },
-            }
-            # 시스템 Chrome → Edge → Playwright Chromium 순으로 시도.
-            context = None
-            last_err: Exception | None = None
-            for channel_name, label in (("chrome", "Google Chrome"), ("msedge", "Microsoft Edge")):
-                try:
-                    context = pw.chromium.launch_persistent_context(
-                        channel=channel_name,
-                        **launch_kwargs,
-                    )
-                    progress.on_log(f"브라우저: 시스템 {label} (persistent profile)")
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    last_err = exc
-                    continue
-            if context is None:
-                try:
-                    context = pw.chromium.launch_persistent_context(**launch_kwargs)
-                    progress.on_log("브라우저: Playwright Chromium (persistent profile)")
-                except Exception as exc:  # noqa: BLE001
-                    raise RuntimeError(
-                        f"사용 가능한 브라우저가 없습니다. Chrome 또는 Edge 설치 후 재시도하세요.\n"
-                        f"마지막 오류: {last_err or exc}"
-                    ) from exc
-
-            # 봇 감지 우회 init 스크립트 (모든 페이지에 적용)
+        _ensure_playwright()
+        with sync_playwright() as pw:  # type: ignore[misc]
+            context = _launch_persistent_context(pw, channel, headless, progress)
             try:
-                context.add_init_script(_STEALTH_INIT_SCRIPT)
-            except Exception:  # noqa: BLE001
-                pass
-
-            # persistent context 는 기본 페이지가 있을 수 있음
-            page = context.pages[0] if context.pages else context.new_page()
-
-            try:
-                if channel == "naver":
-                    records = _crawl_naver(page, max_pages=max_pages, progress=progress)
-                else:
-                    records = _crawl_coupang(page, max_pages=max_pages, progress=progress)
-                progress.on_log("크롤링 완료. 세션은 user_data_dir 에 자동 저장됨")
-            finally:
+                page = context.pages[0] if context.pages else context.new_page()
+                progress.on_log(f"{CHANNEL_LABELS[channel]} \uc8fc\ubb38\ub0b4\uc5ed \ud398\uc774\uc9c0\ub85c \uc774\ub3d9 \uc911")
+                page.goto(ORDER_URLS[channel], wait_until="domcontentloaded", timeout=60_000)
                 try:
-                    context.close()
-                except Exception:  # noqa: BLE001
+                    page.wait_for_load_state("networkidle", timeout=15_000)
+                except Exception:
                     pass
+                _wait_for_user_login(page, channel, progress)
+                records = _collect_records(page, channel, max_pages, progress)
+                progress.on_log(f"{CHANNEL_LABELS[channel]} \uc218\uc9d1 \uc644\ub8cc: {len(records)}\uac74")
+                return CrawlResult(channel=channel, records=records)
+            finally:
+                context.close()
+    except PlaywrightUnavailable as exc:
+        return CrawlResult(channel=channel, records=[], error=str(exc))
     except Exception as exc:  # noqa: BLE001
-        error = str(exc)
-        progress.on_log(f"오류: {error}")
+        progress.on_log(f"\uc624\ub958: {exc}")
+        return CrawlResult(channel=channel, records=[], error=str(exc))
 
-    return CrawlResult(channel=channel, records=records, error=error)
+
+# ---------------------------------------------------------------------------
+# 쿠팡 전용: CDP attach + NTFS junction 우회
+# ---------------------------------------------------------------------------
+
+
+_COUPANG_DEBUG_PORT = 9223
+_COUPANG_ORDER_URL = "https://mc.coupang.com/ssr/desktop/order/list"
+
+
+def _find_chrome_path() -> Optional[str]:
+    candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        str(Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "Application" / "chrome.exe"),
+    ]
+    for c in candidates:
+        if Path(c).exists():
+            return c
+    return None
+
+
+def _real_chrome_user_data() -> Path:
+    return Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "User Data"
+
+
+def _coupang_junction_path() -> Path:
+    return Path.home() / ".smartinventory" / "chrome_junction"
+
+
+def _setup_chrome_junction(progress: CrawlerProgress) -> bool:
+    """NTFS junction 으로 사용자 평상시 Chrome User Data 를 다른 경로로 보이게 함.
+
+    이렇게 하면 Chrome 보안 정책 (default user-data-dir 에 디버깅 거부) 우회 가능.
+    """
+    junction = _coupang_junction_path()
+    real = _real_chrome_user_data()
+    if not real.exists():
+        progress.on_log(f"사용자 Chrome User Data 폴더 없음: {real}")
+        return False
+    if junction.exists():
+        return True
+    junction.parent.mkdir(parents=True, exist_ok=True)
+    import subprocess as _sp
+    cmd = ["cmd", "/c", "mklink", "/J", str(junction), str(real)]
+    progress.on_log(f"Junction 생성: {junction.name} → {real.name}")
+    try:
+        result = _sp.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            progress.on_log(f"Junction 실패: {result.stderr.strip()}")
+            return False
+    except Exception as exc:  # noqa: BLE001
+        progress.on_log(f"Junction 예외: {exc}")
+        return False
+    return True
+
+
+def _kill_chrome(progress: CrawlerProgress) -> None:
+    """Chrome 모든 인스턴스 종료. 쿠팡 자동수집 전 필수."""
+    import subprocess as _sp
+    progress.on_log("Chrome 모든 인스턴스 종료 중...")
+    try:
+        _sp.run(
+            ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    time.sleep(2)
+
+
+def _start_chrome_with_debug(
+    chrome_path: str, junction: Path, port: int, target_url: str, progress: CrawlerProgress
+) -> Optional[int]:
+    import subprocess as _sp
+    # SingletonLock 정리
+    for f in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        try:
+            (junction / f).unlink(missing_ok=True)  # type: ignore[arg-type]
+        except Exception:
+            pass
+
+    args = [
+        chrome_path,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={junction}",
+        "--profile-directory=Default",
+        target_url,
+    ]
+    try:
+        proc = _sp.Popen(args)
+        progress.on_log(f"Chrome 디버깅 모드 시작 (port {port}, PID {proc.pid})")
+        return proc.pid
+    except Exception as exc:  # noqa: BLE001
+        progress.on_log(f"Chrome 시작 실패: {exc}")
+        return None
+
+
+def _crawl_coupang_via_cdp(
+    *,
+    max_pages: int,
+    reset_session: bool,
+    progress: CrawlerProgress,
+) -> CrawlResult:
+    """쿠팡 전용 CDP attach 방식.
+
+    1) Chrome 모두 종료
+    2) NTFS junction 으로 사용자 평상시 user-data-dir 를 다른 경로처럼 보이게 함
+    3) Chrome 을 디버깅 포트로 시작 → 사용자 평상시 cookies/세션 그대로 활용
+    4) Playwright connect_over_cdp 로 attach
+    5) 사용자 로그인 대기
+    6) 주문 데이터 추출
+    """
+    if reset_session:
+        # 세션 초기화 = junction 만 삭제 (사용자 실제 Chrome 데이터는 절대 안 건드림)
+        try:
+            jp = _coupang_junction_path()
+            if jp.exists():
+                import subprocess as _sp
+                _sp.run(["cmd", "/c", "rmdir", str(jp)], capture_output=True, timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+
+    chrome = _find_chrome_path()
+    if not chrome:
+        return CrawlResult(
+            channel="coupang", records=[],
+            error="Google Chrome 을 찾을 수 없습니다.\nhttps://www.google.com/chrome/ 에서 설치 후 재시도하세요.",
+        )
+
+    _ensure_playwright()
+
+    _kill_chrome(progress)
+    if not _setup_chrome_junction(progress):
+        return CrawlResult(
+            channel="coupang", records=[],
+            error="Chrome 프로파일 junction 생성 실패. 평상시 Chrome 을 한 번 실행한 적이 있어야 합니다.",
+        )
+    junction = _coupang_junction_path()
+    if not _start_chrome_with_debug(chrome, junction, _COUPANG_DEBUG_PORT, _COUPANG_ORDER_URL, progress):
+        return CrawlResult(channel="coupang", records=[], error="Chrome 시작 실패")
+    time.sleep(3)
+
+    records: List[PurchaseRecord] = []
+    try:
+        with sync_playwright() as pw:  # type: ignore[misc]
+            try:
+                browser = pw.chromium.connect_over_cdp(f"http://localhost:{_COUPANG_DEBUG_PORT}")
+            except Exception as exc:  # noqa: BLE001
+                return CrawlResult(
+                    channel="coupang", records=[],
+                    error=(
+                        f"CDP 연결 실패: {exc}\n\n"
+                        "다른 Chrome 인스턴스가 디버깅 포트를 가로챘을 수 있습니다.\n"
+                        "Chrome 을 모두 종료하고 다시 시도하세요."
+                    ),
+                )
+            progress.on_log(f"CDP 연결 OK (contexts={len(browser.contexts)})")
+            ctx = browser.contexts[0]
+
+            # 쿠팡 탭 찾기 (poll)
+            target_page = None
+            deadline = time.time() + 480  # 8분
+            notified_login = False
+            last_state = ""
+            while time.time() < deadline:
+                if progress.cancelled():
+                    return CrawlResult(channel="coupang", records=[], error="사용자 취소")
+
+                cp = None
+                for p in ctx.pages:
+                    try:
+                        if "coupang.com" in p.url:
+                            cp = p
+                            break
+                    except Exception:
+                        continue
+
+                if cp is None:
+                    time.sleep(2)
+                    continue
+
+                try:
+                    cur = cp.url
+                    content = cp.content()
+                except Exception:
+                    time.sleep(2)
+                    continue
+
+                state = cur[:80]
+                if state != last_state:
+                    progress.on_log(f"탭: {state}")
+                    last_state = state
+
+                # Akamai 차단 감지
+                if "Access Denied" in content and "edgesuite" in content.lower():
+                    progress.on_log("⚠ Akamai 차단 페이지. 사용자가 페이지 새로고침 / 재로그인 필요")
+                    time.sleep(3)
+                    continue
+
+                # 로그인 페이지인지
+                if "이메일 로그인" in content and "회원가입" in content:
+                    if not notified_login:
+                        progress.on_login_required("쿠팡 로그인이 필요합니다. 브라우저 창에서 직접 로그인해주세요.")
+                        notified_login = True
+                    time.sleep(3)
+                    continue
+
+                # 주문 페이지인지 (로그인된 상태)
+                if "주문목록" in content or "최근 6개월" in content or "주문 상세보기" in content:
+                    target_page = cp
+                    progress.on_log("주문 페이지 도달!")
+                    break
+
+                time.sleep(3)
+
+            if target_page is None:
+                return CrawlResult(
+                    channel="coupang", records=[],
+                    error="주문 페이지에 도달하지 못했습니다 (시간 초과 또는 차단).",
+                )
+
+            # 데이터 추출 — 1 ~ max_pages 페이지 순회
+            try:
+                target_page.wait_for_load_state("networkidle", timeout=10_000)
+            except Exception:
+                pass
+            time.sleep(1.5)
+
+            # 첫 페이지 추출
+            seen_keys: set[str] = set()
+            page1 = _extract_coupang_orders(target_page, progress)
+            for rec in page1:
+                key = (rec.order_date or "", rec.title or "", rec.amount or 0)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(str(key))
+                records.append(rec)
+            progress.on_log(f"쿠팡 페이지 1: {len(page1)}건")
+
+            # 2 ~ max_pages 페이지 (URL ?pageIndex=N-1)
+            for page_no in range(2, max(2, max_pages) + 1):
+                if progress.cancelled():
+                    break
+                ok = _navigate_coupang_to_page(target_page, page_no, progress)
+                if not ok:
+                    progress.on_log(f"쿠팡 페이지 {page_no} 이동 실패. 종료.")
+                    break
+                try:
+                    target_page.wait_for_load_state("networkidle", timeout=4_000)
+                except Exception:
+                    pass
+                time.sleep(0.5)
+                page_recs = _extract_coupang_orders(target_page, progress)
+                added = 0
+                for rec in page_recs:
+                    key = (rec.order_date or "", rec.title or "", rec.amount or 0)
+                    if str(key) in seen_keys:
+                        continue
+                    seen_keys.add(str(key))
+                    records.append(rec)
+                    added += 1
+                progress.on_log(f"쿠팡 페이지 {page_no}: {len(page_recs)}건 추출, 신규 {added}")
+
+                # 마지막 페이지 자동 감지 — 쿠팡 안내 메시지로 판별
+                try:
+                    page_content = target_page.content()
+                except Exception:
+                    page_content = ""
+                is_last = (
+                    "마지막 내역입니다" in page_content
+                    or "주문하신 내역이 없습니다" in page_content
+                    or "조회된 주문 내역이 없습니다" in page_content
+                )
+                if is_last:
+                    progress.on_log("✓ '마지막 내역' 안내 감지 → 자동 종료")
+                    break
+                if added == 0 and len(page_recs) == 0:
+                    progress.on_log("새 데이터 없음 → 마지막 페이지 도달")
+                    break
+
+    except Exception as exc:  # noqa: BLE001
+        progress.on_log(f"오류: {exc}")
+        return CrawlResult(channel="coupang", records=[], error=str(exc))
+    finally:
+        # 수집 종료 시 Chrome 창 자동 닫음
+        try:
+            _kill_chrome(progress)
+            progress.on_log("Chrome 창 자동 종료")
+        except Exception:  # noqa: BLE001
+            pass
+
+    progress.on_log(f"쿠팡 수집 완료: {len(records)}건")
+    return CrawlResult(channel="coupang", records=records)
+
+
+# 페이지 텍스트 → 주문 블록 → PurchaseRecord 추출
+_COUPANG_DATE_RE = re.compile(r"(20\d{2})\.\s*(\d{1,2})\.\s*(\d{1,2})\s*주문")
+_AMOUNT_RE = re.compile(r"([0-9][0-9,]{2,})\s*원")
+
+
+def _scroll_to_bottom(page, progress: CrawlerProgress, max_iter: int = 3) -> None:
+    """페이지 끝까지 반복 스크롤. 쿠팡 주문페이지는 페이지당 5건 고정이라 단순화.
+
+    더 이상 스크롤되지 않으면 즉시 종료.
+    """
+    last_height = 0
+    for _ in range(max_iter):
+        try:
+            cur_height = page.evaluate("() => document.body.scrollHeight")
+        except Exception:  # noqa: BLE001
+            break
+        if cur_height == last_height:
+            break
+        last_height = cur_height
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            break
+        time.sleep(0.3)
+
+
+def _navigate_coupang_to_page(page, page_no: int, progress: CrawlerProgress) -> bool:
+    """쿠팡 주문페이지 N번째로 이동.
+
+    쿠팡 URL 패턴: `mc.coupang.com/ssr/desktop/order/list?pageIndex=N`
+
+    매핑 (쿠팡은 0-base):
+    - page_no=1: default URL (첫 페이지에서 이미 처리)
+    - page_no=2: ?pageIndex=1
+    - page_no=3: ?pageIndex=2
+    - page_no=N: ?pageIndex=N-1
+    """
+    base = "https://mc.coupang.com/ssr/desktop/order/list"
+    page_index = max(0, page_no - 1)
+    new_url = f"{base}?pageIndex={page_index}"
+    try:
+        page.goto(new_url, wait_until="domcontentloaded", timeout=20_000)
+        progress.on_log(f"  pageIndex={page_index} (앱 페이지 {page_no}) 이동")
+        time.sleep(0.5)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        progress.on_log(f"  pageIndex={page_index} 이동 실패: {exc}")
+        return False
+
+
+def _extract_coupang_orders(page, progress: CrawlerProgress) -> List[PurchaseRecord]:
+    """쿠팡 주문페이지 본문에서 PurchaseRecord 추출.
+
+    DOM 구조 (sc-XXX 클래스 hash 동적이라 텍스트 기반 파싱):
+    - 주문 wrapper: 텍스트 "YYYY. M. D 주문" 으로 시작하는 div
+    - 그 안 tbody tr 가 상품 1개씩
+    - tr inner_text: 배송상태\\n도착일\\n상품명\\n금액원\\n수량개\\n버튼들
+    """
+    records: List[PurchaseRecord] = []
+    now = datetime.now()
+
+    # 무한 스크롤 lazy load 트리거 — 모든 데이터가 DOM 에 올라오게
+    _scroll_to_bottom(page, progress)
+
+    # 페이지 전체 body 텍스트
+    try:
+        body = page.evaluate("() => document.body.innerText") or ""
+    except Exception:
+        return records
+
+    # "20YY. M. D 주문" 으로 split
+    parts = re.split(r"(?=20\d{2}\.\s*\d{1,2}\.\s*\d{1,2}\s*주문)", body)
+    progress.on_log(f"본문 split → {len(parts)} 블록")
+
+    for block in parts:
+        block = block.strip()
+        m = _COUPANG_DATE_RE.search(block)
+        if not m:
+            continue
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        order_date = f"{y:04d}-{mo:02d}-{d:02d}"
+
+        # 블록 내에서 라인별 파싱. 한 주문에 여러 상품일 수 있음.
+        lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+        # 첫 줄은 "20YY. M. D 주문". 두번째는 보통 "주문 상세보기"
+        # 상품 블록 패턴: [배송완료/취소/...] [도착일?] [상품명] [금액 원] [수량개]
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            # 상품 블록 시작점: "배송완료" / "주문취소" 같은 상태 키워드
+            if re.match(r"^(배송완료|배송중|주문취소|취소완료|반품|반품완료|결제완료|결제취소|구매확정)$", line):
+                status = line
+                # 다음 줄들에서 상품명 + 금액 + 수량 찾기
+                product = None
+                amount = None
+                qty = None
+                j = i + 1
+                while j < len(lines) and j < i + 10:
+                    nl = lines[j]
+                    if amount is None:
+                        am = _AMOUNT_RE.search(nl)
+                        if am:
+                            try:
+                                amount = int(am.group(1).replace(",", ""))
+                            except ValueError:
+                                pass
+                    if qty is None:
+                        qm = re.match(r"^(\d+)\s*개$", nl)
+                        if qm:
+                            qty = int(qm.group(1))
+                    if product is None:
+                        # 상품명 후보: 길고, 가격/수량/UI 버튼 텍스트가 아닌 줄.
+                        # 상품명이 숫자로 시작해도 OK ("7세대 23L 진공청소기" 등)
+                        is_price = bool(re.match(r"^[\d,]+\s*원$", nl))
+                        is_qty = bool(re.match(r"^\d+\s*개$", nl))
+                        is_button_or_ui = any(
+                            kw in nl for kw in (
+                                "도착", "장바구니", "배송", "주문", "상세보기",
+                                "상품 등급", "리뷰", "교환", "반품 신청",
+                                "재구매", "구매 확정", "취소 요청",
+                            )
+                        )
+                        if (
+                            len(nl) > 8
+                            and not is_price
+                            and not is_qty
+                            and not is_button_or_ui
+                        ):
+                            product = nl
+                    # 다음 상태 라인이면 상품 끝
+                    if j > i and re.match(
+                        r"^(배송완료|배송중|주문취소|취소완료|반품|반품완료|결제완료|결제취소|구매확정)$", nl
+                    ):
+                        break
+                    j += 1
+
+                if amount is not None and amount > 0:
+                    title = product or "쿠팡 주문"
+                    if status:
+                        title = f"[{status}] {title}"
+                    records.append(
+                        PurchaseRecord(
+                            id=None,
+                            channel="coupang",
+                            order_date=order_date,
+                            order_no=None,
+                            title=title[:120],
+                            amount=amount,
+                            payment_method=None,
+                            source_url=_COUPANG_ORDER_URL,
+                            raw_text=block[:2000],
+                            imported_at=now,
+                        )
+                    )
+                i = j
+                continue
+            i += 1
+
+    return records
 
 
 __all__ = [
