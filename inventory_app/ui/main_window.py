@@ -3375,9 +3375,9 @@ class SalesDailyTab(QWidget):
             [
                 "이미지",
                 "마스터 상품",
-                "총판매",
                 "네이버",
                 "쿠팡",
+                "총판매",
                 "추정매출",
                 "비고",
             ]
@@ -3676,15 +3676,15 @@ class SalesDailyTab(QWidget):
             name_item = QTableWidgetItem(master.name)
             name_item.setData(Qt.UserRole, master.id)
             self.table.setItem(row_idx, 1, name_item)
-            self.table.setItem(row_idx, 2, _mk_num(f"{total:,}", total))
             self.table.setItem(
-                row_idx, 3,
+                row_idx, 2,
                 _mk_num(f"{data_row['naver_qty']:,}" if data_row['naver_qty'] else "-", data_row['naver_qty']),
             )
             self.table.setItem(
-                row_idx, 4,
+                row_idx, 3,
                 _mk_num(f"{data_row['coupang_qty']:,}" if data_row['coupang_qty'] else "-", data_row['coupang_qty']),
             )
+            self.table.setItem(row_idx, 4, _mk_num(f"{total:,}", total))
             self.table.setItem(
                 row_idx, 5,
                 _mk_num(f"₩{data_row['revenue']:,}" if data_row['revenue'] else "-", data_row['revenue']),
@@ -4082,7 +4082,8 @@ class MainWindow(QMainWindow):
             return
         self.sync_progress.setVisible(True)
         self.sync_progress.setValue(0)
-        self.sync_progress.setFormat("동기화 진행 중... 0%")
+        in_progress = ", ".join(sorted(self._sync_expected_sources))
+        self.sync_progress.setFormat(f"동기화 중: {in_progress} ... 0%")
 
     def _update_sync_progress(self) -> None:
         if not self._sync_session_active:
@@ -4100,13 +4101,19 @@ class MainWindow(QMainWindow):
         if done >= total:
             self.sync_progress.setValue(100)
             if self._sync_failed_sources:
-                self.sync_progress.setFormat("동기화 완료 (일부 실패) 100%")
+                failed = ", ".join(sorted(self._sync_failed_sources))
+                self.sync_progress.setFormat(f"동기화 완료 (실패: {failed}) 100%")
             else:
                 self.sync_progress.setFormat("동기화 완료 100%")
             self._sync_session_active = False
             self.sync_progress.setVisible(False)
         else:
-            self.sync_progress.setFormat(f"동기화 진행 중... {percent}%")
+            pending = sorted(self._sync_expected_sources - self._sync_finished_sources)
+            in_progress = ", ".join(pending) if pending else ""
+            self.sync_progress.setFormat(
+                f"동기화 중: {in_progress} ... {percent}%" if in_progress
+                else f"동기화 진행 중... {percent}%"
+            )
 
     def _collect_favorite_inventory_rows(self) -> List[FavoriteInventoryRow]:
         rows: List[FavoriteInventoryRow] = []

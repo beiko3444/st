@@ -20,13 +20,14 @@ import httpx
 from datetime import date, timedelta
 
 from PySide6.QtCharts import (
+    QBarCategoryAxis,
+    QBarSet,
     QChart,
     QChartView,
-    QDateTimeAxis,
-    QLineSeries,
+    QStackedBarSeries,
     QValueAxis,
 )
-from PySide6.QtCore import QDateTime, QObject, Qt, Signal, Slot
+from PySide6.QtCore import QDate, QDateTime, QObject, Qt, QTime, Signal, Slot
 from PySide6.QtGui import QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -43,7 +44,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -275,7 +275,7 @@ class MasterDetailDialog(QDialog):
         self.setWindowTitle(
             "새 마스터 상품" if master_id is None else "마스터 상품 상세"
         )
-        self.resize(880, 720)
+        self.resize(900, 680)
         self._build_ui()
         if master_id is None:
             self._setup_create_mode()
@@ -336,13 +336,8 @@ class MasterDetailDialog(QDialog):
         separator.setStyleSheet("color: #e2e8f0;")
         layout.addWidget(separator)
 
-        # 탭: 연결된 채널 상품 / 30일 판매 추이
-        self.detail_tabs = QTabWidget()
-
-        # --- 연결 탭 ---
-        links_page = QWidget()
-        lp_layout = QVBoxLayout(links_page)
-        lp_layout.setContentsMargins(0, 6, 0, 0)
+        # 연결된 채널 상품
+        layout.addWidget(QLabel("연결된 채널 상품"))
         self.links_table = QTableWidget(0, len(_LINK_COLS))
         self.links_table.setHorizontalHeaderLabels(_LINK_COLS)
         self.links_table.verticalHeader().setVisible(False)
@@ -355,32 +350,42 @@ class MasterDetailDialog(QDialog):
         links_header.setSectionResizeMode(1, QHeaderView.Stretch)
         for idx in (0, 2, 3, 4, 5, 6, 7, 8):
             links_header.setSectionResizeMode(idx, QHeaderView.ResizeToContents)
-        lp_layout.addWidget(self.links_table, 1)
-        self.detail_tabs.addTab(links_page, "연결된 채널 상품")
+        self.links_table.setMaximumHeight(140)
+        layout.addWidget(self.links_table, 0)
 
-        # --- 차트 탭 ---
-        chart_page = QWidget()
-        cp_layout = QVBoxLayout(chart_page)
-        cp_layout.setContentsMargins(0, 6, 0, 0)
-        cp_layout.setSpacing(6)
-        self.chart_summary = QLabel("탭 클릭 시 그래프를 불러옵니다.")
+        # 30일 판매 추이 차트
+        layout.addWidget(QLabel("30일 판매 추이"))
+        self.chart_summary = QLabel("그래프 로딩 중...")
         self.chart_summary.setStyleSheet(
-            "color: #475569; padding: 6px; background: #f8fafc;"
-            " border: 1px solid #e2e8f0; border-radius: 6px;"
+            "color: #0f172a; padding: 6px 10px; background: #f1f5f9;"
+            " border: 1px solid #cbd5e1; border-radius: 6px;"
+            " font-size: 12px;"
         )
-        cp_layout.addWidget(self.chart_summary)
+        self.chart_summary.setFixedHeight(34)
+        self.chart_summary.setTextFormat(Qt.RichText)
+        layout.addWidget(self.chart_summary)
+
+        # hover 시 일별 상세를 보여주는 라벨 (단일 라인, 자동 사라지지 않음)
+        self.chart_hover_label = QLabel(
+            "<span style='color:#94a3b8'>막대 hover 시 일별 상세 표시</span>"
+        )
+        self.chart_hover_label.setStyleSheet(
+            "color: #0f172a; padding: 4px 10px; background: #fffbeb;"
+            " border: 1px solid #fcd34d; border-radius: 4px; font-size: 11px;"
+        )
+        self.chart_hover_label.setTextFormat(Qt.RichText)
+        self.chart_hover_label.setFixedHeight(26)
+        layout.addWidget(self.chart_hover_label)
+
         self.chart = QChart()
         self.chart.setAnimationOptions(QChart.SeriesAnimations)
         self.chart.legend().setAlignment(Qt.AlignBottom)
         self.chart_view = QChartView(self.chart)
         self.chart_view.setRenderHint(QPainter.Antialiasing)
-        cp_layout.addWidget(self.chart_view, 1)
-        self.detail_tabs.addTab(chart_page, "30일 판매 추이")
+        self.chart_view.setMinimumHeight(220)
+        layout.addWidget(self.chart_view, 1)
 
         self._chart_loaded = False
-        self.detail_tabs.currentChanged.connect(self._on_detail_tab_changed)
-
-        layout.addWidget(self.detail_tabs, 1)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Close)
         button_box.rejected.connect(self.accept)
@@ -631,40 +636,78 @@ class MasterDetailDialog(QDialog):
                 pm.scaled(116, 116, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             )
 
-    def _on_detail_tab_changed(self, idx: int) -> None:
-        # idx=1 → 차트 탭. 처음 진입 시에만 로드.
-        if idx == 1 and not self._chart_loaded and self.master_id is not None:
+    def _maybe_autoload_chart(self) -> None:
+        if not self._chart_loaded and self.master_id is not None:
             self._load_sales_chart()
 
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._maybe_autoload_chart()
+
     def _load_sales_chart(self) -> None:
-        """Pi /sales/series 30일치 응답을 마스터 단위로 환산해 라인 차트 그리기."""
+        """Pi /sales/series 30일치 응답으로 라인 차트 그리기 (단순 동기, 다이얼로그 그려진 뒤 실행)."""
         self._chart_loaded = True
         if not self._monitor_url:
             self.chart_summary.setText(
                 "<span style='color:#dc2626'>monitor.url 미설정 — 그래프를 불러올 수 없습니다.</span>"
             )
             return
-        master_row = self._find_master_row()
-        if master_row is None:
+        if self._find_master_row() is None:
             self.chart_summary.setText("마스터 정보 없음")
             return
 
         end_d = date.today()
         start_d = end_d - timedelta(days=29)
-        try:
-            resp = httpx.get(
-                f"{self._monitor_url.rstrip('/')}/sales/series",
-                params={"start": start_d.isoformat(), "end": end_d.isoformat()},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-        except Exception as exc:  # noqa: BLE001
-            self.chart_summary.setText(
-                f"<span style='color:#dc2626'>그래프 조회 실패: {exc}</span>"
-            )
-            return
+        url = f"{self._monitor_url.rstrip('/')}/sales/series"
+        self.chart_summary.setText(f"그래프 로딩 중... ({url})")
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, lambda: self._fetch_and_render_chart(url, start_d, end_d))
 
+    def _fetch_and_render_chart(self, url: str, start_d: date, end_d: date) -> None:
+        try:
+            try:
+                resp = httpx.get(
+                    url,
+                    params={"start": start_d.isoformat(), "end": end_d.isoformat()},
+                    timeout=httpx.Timeout(connect=3.0, read=8.0, write=3.0, pool=3.0),
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+            except Exception as exc:  # noqa: BLE001
+                self.chart_summary.setText(
+                    f"<span style='color:#dc2626'>그래프 조회 실패: {type(exc).__name__}: {exc}</span>"
+                )
+                return
+
+            if not isinstance(payload, dict):
+                self.chart_summary.setText(
+                    "<span style='color:#dc2626'>그래프 응답 형식 오류</span>"
+                )
+                return
+            master_row = self._find_master_row()
+            if master_row is None:
+                self.chart_summary.setText("마스터 정보 없음")
+                return
+            self._render_chart(payload, master_row, start_d, end_d)
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+            tb = traceback.format_exc()
+            self.chart_summary.setText(
+                f"<span style='color:#dc2626'>차트 렌더 오류: {type(exc).__name__}: {exc}</span>"
+            )
+            try:
+                from pathlib import Path
+                Path.home().joinpath(".smartinventory_chart_error.log").write_text(tb)
+            except Exception:
+                pass
+
+    def _render_chart(
+        self,
+        payload: dict,
+        master_row: MasterProductRow,
+        start_d: date,
+        end_d: date,
+    ) -> None:
         rows = payload.get("rows") or []
         link_mult: Dict[Tuple[str, str], int] = {
             (lk.channel, lk.product_key): max(1, int(lk.multiplier))
@@ -673,6 +716,8 @@ class MasterDetailDialog(QDialog):
 
         day_naver: Dict[str, int] = {}
         day_coupang: Dict[str, int] = {}
+        day_naver_rev: Dict[str, int] = {}
+        day_coupang_rev: Dict[str, int] = {}
         total_qty = 0
         total_revenue = 0
         for r in rows:
@@ -689,8 +734,10 @@ class MasterDetailDialog(QDialog):
             revenue = int(r.get("revenue") or 0)
             if channel == "naver":
                 day_naver[day] = day_naver.get(day, 0) + qty_master
+                day_naver_rev[day] = day_naver_rev.get(day, 0) + revenue
             elif channel == "coupang":
                 day_coupang[day] = day_coupang.get(day, 0) + qty_master
+                day_coupang_rev[day] = day_coupang_rev.get(day, 0) + revenue
             total_qty += qty_master
             total_revenue += revenue
 
@@ -701,17 +748,18 @@ class MasterDetailDialog(QDialog):
             all_days.append(cur)
             cur += timedelta(days=1)
 
-        naver_series = QLineSeries()
-        naver_series.setName("네이버")
-        coupang_series = QLineSeries()
-        coupang_series.setName("쿠팡")
-        total_series = QLineSeries()
-        total_series.setName("합계")
-        pen_total = QPen(Qt.black)
-        pen_total.setWidth(2)
-        total_series.setPen(pen_total)
+        from PySide6.QtGui import QColor
+        naver_set = QBarSet("네이버")
+        naver_set.setColor(QColor("#03C75A"))  # 네이버 브랜드 녹색
+        naver_set.setBorderColor(QColor("#03C75A"))
+        coupang_set = QBarSet("쿠팡")
+        coupang_set.setColor(QColor("#F50028"))  # 쿠팡 브랜드 레드
+        coupang_set.setBorderColor(QColor("#F50028"))
 
         max_qty = 0
+        categories: list[str] = []
+        n_days = len(all_days)
+        # 30개 라벨 모두 고유 + 간략 표시 (M/D). 가독성은 폰트/회전으로 처리.
         for d in all_days:
             key = d.isoformat()
             n = int(day_naver.get(key, 0))
@@ -719,10 +767,13 @@ class MasterDetailDialog(QDialog):
             t = n + c
             if t > max_qty:
                 max_qty = t
-            ts = QDateTime(d.year, d.month, d.day, 0, 0).toMSecsSinceEpoch()
-            naver_series.append(ts, n)
-            coupang_series.append(ts, c)
-            total_series.append(ts, t)
+            naver_set.append(n)
+            coupang_set.append(c)
+            categories.append(f"{d.month}/{d.day}")
+
+        bar_series = QStackedBarSeries()
+        bar_series.append(naver_set)
+        bar_series.append(coupang_set)
 
         # reset chart
         for s in self.chart.series()[:]:
@@ -730,34 +781,84 @@ class MasterDetailDialog(QDialog):
         for ax in self.chart.axes():
             self.chart.removeAxis(ax)
 
-        self.chart.addSeries(naver_series)
-        self.chart.addSeries(coupang_series)
-        self.chart.addSeries(total_series)
+        self.chart.addSeries(bar_series)
 
-        x_axis = QDateTimeAxis()
-        x_axis.setFormat("MM-dd")
-        x_axis.setTickCount(min(8, len(all_days)))
-        x_axis.setTitleText("일자")
+        from PySide6.QtCore import QMargins
+        from PySide6.QtGui import QFont
+
+        x_axis = QBarCategoryAxis()
+        x_axis.append(categories)
+        x_axis.setLabelsAngle(-45)
+        small_font = QFont()
+        small_font.setPointSize(8)
+        x_axis.setLabelsFont(small_font)
+        x_axis.setGridLineVisible(False)
         self.chart.addAxis(x_axis, Qt.AlignBottom)
-        for s in (naver_series, coupang_series, total_series):
-            s.attachAxis(x_axis)
+        bar_series.attachAxis(x_axis)
 
         y_axis = QValueAxis()
         y_axis.setLabelFormat("%d")
-        y_axis.setTitleText("판매수량 (마스터 단위)")
         y_axis.setRange(0, max(1, int(max_qty * 1.15)))
+        y_axis.setLabelsFont(small_font)
+        y_axis.setTickCount(5)
         self.chart.addAxis(y_axis, Qt.AlignLeft)
-        for s in (naver_series, coupang_series, total_series):
-            s.attachAxis(y_axis)
+        bar_series.attachAxis(y_axis)
 
-        x_axis.setRange(
-            QDateTime(start_d.year, start_d.month, start_d.day, 0, 0),
-            QDateTime(end_d.year, end_d.month, end_d.day, 23, 59),
-        )
+        # 차트 디자인 정리
+        self.chart.setTitle("")
+        self.chart.setMargins(QMargins(4, 4, 4, 28))  # 하단 여유 → 회전된 X축 라벨
+        self.chart.setBackgroundRoundness(8)
+        self.chart.legend().setAlignment(Qt.AlignTop)
+        self.chart.legend().setFont(small_font)
+        bar_series.setLabelsVisible(False)
+        bar_series.setBarWidth(0.85)
 
+        # 일별 데이터 보관 → hover 툴팁
+        self._chart_day_data = []
+        for d in all_days:
+            key = d.isoformat()
+            self._chart_day_data.append({
+                "date": d,
+                "naver_qty": int(day_naver.get(key, 0)),
+                "coupang_qty": int(day_coupang.get(key, 0)),
+                "naver_rev": int(day_naver_rev.get(key, 0)),
+                "coupang_rev": int(day_coupang_rev.get(key, 0)),
+            })
+
+        def _on_hover(status: bool, index: int, barset) -> None:
+            if not status or index < 0 or index >= len(self._chart_day_data):
+                return  # 사라지지 않게 유지 — 다음 막대 hover 시 갱신
+            row = self._chart_day_data[index]
+            d = row["date"]
+            n_qty = row["naver_qty"]
+            c_qty = row["coupang_qty"]
+            n_rev = row["naver_rev"]
+            c_rev = row["coupang_rev"]
+            total = n_rev + c_rev
+            self.chart_hover_label.setText(
+                f"<b>{d.strftime('%Y-%m-%d (%a)')}</b> &nbsp; "
+                f"<span style='color:#03C75A'>● 네이버</span> {n_qty}건 · ₩{n_rev:,} &nbsp; "
+                f"<span style='color:#F50028'>● 쿠팡</span> {c_qty}건 · ₩{c_rev:,} &nbsp; "
+                f"<b>합계 {n_qty + c_qty}건 · ₩{total:,}</b>"
+            )
+
+        bar_series.hovered.connect(_on_hover)
+
+        # 만원 단위 변환
+        if total_revenue >= 10000:
+            man = total_revenue // 10000
+            rest = total_revenue % 10000
+            man_str = f"{man:,}만 {rest:,}원" if rest else f"{man:,}만원"
+        else:
+            man_str = f"{total_revenue:,}원"
         self.chart_summary.setText(
-            f"기간 {start_d.isoformat()} ~ {end_d.isoformat()}  ·  "
-            f"총 판매 <b>{total_qty:,}건</b>  ·  매출 ₩{total_revenue:,}"
+            f"<span style='font-size:14px; color:#0f172a'>총 매출 "
+            f"<b style='color:#dc2626'>₩{total_revenue:,}</b> "
+            f"<span style='color:#64748b'>({man_str})</span></span>"
+            f" &nbsp;·&nbsp; <span style='color:#475569'>총 판매 "
+            f"<b style='color:#0f172a'>{total_qty:,}건</b></span>"
+            f" &nbsp;·&nbsp; <span style='color:#94a3b8; font-size:11px'>"
+            f"{start_d.isoformat()} ~ {end_d.isoformat()}</span>"
         )
 
 
