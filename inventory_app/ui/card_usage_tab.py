@@ -11,15 +11,18 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
-from PySide6.QtCore import QDate, QObject, Qt, QThread, Signal
-from PySide6.QtGui import QBrush, QColor, QFont
+from PySide6.QtCore import QDate, QObject, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDateEdit,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -28,6 +31,9 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -42,6 +48,11 @@ from inventory_app.services.card_category import (
     DEFAULT_CATEGORIES,
     category_meta,
     classify_category,
+)
+from inventory_app.services.purchase_history_service import (
+    PurchaseGroup,
+    PurchaseHistoryStore,
+    group_records_by_order,
 )
 
 
@@ -325,6 +336,104 @@ class _UsageRow(QFrame):
         layout.addLayout(right, 0)
 
 
+class _GaugeBar(QWidget):
+    """카테고리 분할 가로 게이지 바.
+
+    segments: [(color_hex, weight), ...]
+    percent_of_max: 0.0 ~ 1.0  → 가로 길이 비율
+    """
+
+    def __init__(self, segments: List[tuple[str, int]], percent_of_max: float) -> None:
+        super().__init__()
+        self._segments = segments
+        self._pct = max(0.0, min(1.0, percent_of_max))
+        self.setFixedHeight(6)
+        self.setMinimumWidth(40)
+
+    def paintEvent(self, _e) -> None:  # type: ignore[override]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w = self.width()
+        h = self.height()
+        # 배경
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#e2e8f0"))
+        p.drawRoundedRect(0, 0, w, h, h / 2, h / 2)
+        if self._pct <= 0 or not self._segments:
+            return
+        bar_w = int(w * self._pct)
+        if bar_w <= 0:
+            return
+        total = sum(max(0, s[1]) for s in self._segments) or 1
+        x = 0
+        for color, weight in self._segments:
+            seg_w = int(bar_w * (max(0, weight) / total))
+            if seg_w <= 0:
+                continue
+            p.setBrush(QColor(color))
+            p.drawRect(x, 0, seg_w, h)
+            x += seg_w
+        # 라운딩 오버레이 — 단순화: 전체 바를 마스크 처리
+        # (간단히 좌우 끝만 둥글게)
+
+
+class _CalendarDayCell(QFrame):
+    """캘린더 한 칸 (일자, 총액, 게이지, 퍼센트)."""
+
+    def __init__(
+        self,
+        day: int,
+        amount: int,
+        segments: List[tuple[str, int]],
+        percent: float,
+        is_placeholder: bool = False,
+    ) -> None:
+        super().__init__()
+        self.setObjectName("calCell")
+        if is_placeholder:
+            self.setStyleSheet(
+                "#calCell { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; }"
+            )
+        else:
+            self.setStyleSheet(
+                "#calCell { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; }"
+            )
+        self.setMinimumHeight(110)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(10, 8, 10, 8)
+        v.setSpacing(4)
+
+        day_label = QLabel(f"{day}일")
+        df = QFont(); df.setBold(True); df.setPointSize(10)
+        day_label.setFont(df)
+        day_label.setStyleSheet("color: #0f172a;" if not is_placeholder else "color: #cbd5e1;")
+        v.addWidget(day_label)
+
+        if is_placeholder or amount <= 0:
+            empty = QLabel("-")
+            empty.setStyleSheet("color: #cbd5e1; font-size: 11px;")
+            v.addWidget(empty)
+            v.addStretch(1)
+            gauge = _GaugeBar([], 0.0)
+            v.addWidget(gauge)
+            pct = QLabel("0%")
+            pct.setAlignment(Qt.AlignRight)
+            pct.setStyleSheet("color: #cbd5e1; font-size: 10px;")
+            v.addWidget(pct)
+            return
+
+        amt_label = QLabel(f"{amount:,}원")
+        amt_label.setStyleSheet("color: #0f172a; font-size: 11px;")
+        v.addWidget(amt_label)
+        v.addStretch(1)
+        gauge = _GaugeBar(segments, percent)
+        v.addWidget(gauge)
+        pct = QLabel(f"{int(round(percent * 100))}%")
+        pct.setAlignment(Qt.AlignRight)
+        pct.setStyleSheet("color: #94a3b8; font-size: 10px;")
+        v.addWidget(pct)
+
+
 # ---------------------------------------------------------------------------
 # 메인 탭
 # ---------------------------------------------------------------------------
@@ -339,6 +448,10 @@ class CardUsageTab(QWidget):
         self._categories_index: Dict[str, str] = {}  # use_key → category code
         self._selected_category: Optional[str] = None
         self._last_synced_at: Optional[datetime] = None
+        self._view_mode: str = "card"   # "card" | "table" | "calendar"
+        self._review_mode: bool = False
+        self._reviewed_keys: set[str] = set()  # 메모리상 검토 완료 마킹
+        self._coupang_match_index: Dict[str, PurchaseGroup] = {}  # use_key/id → matched group
 
         # ===== 헤더 =====
         layout = QVBoxLayout(self)
@@ -476,6 +589,32 @@ class CardUsageTab(QWidget):
         cf = QFont(); cf.setBold(True); cf.setPointSize(12)
         self.list_count_label.setFont(cf)
 
+        # 뷰 모드 토글 (테이블 / 카드 / 캘린더)
+        self._view_btns: Dict[str, QPushButton] = {}
+        view_group = QFrame()
+        view_group.setStyleSheet(
+            "QFrame { background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 8px; }"
+        )
+        vg_layout = QHBoxLayout(view_group)
+        vg_layout.setContentsMargins(2, 2, 2, 2)
+        vg_layout.setSpacing(0)
+        for code, label in (("table", "테이블"), ("card", "카드"), ("calendar", "캘린더")):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda _ck=False, c=code: self._on_view_mode(c))
+            self._view_btns[code] = btn
+            vg_layout.addWidget(btn)
+        self._view_btns[self._view_mode].setChecked(True)
+        self._refresh_view_mode_styles()
+
+        # 리뷰 모드 토글
+        self.review_btn = QPushButton("리뷰 모드 OFF")
+        self.review_btn.setCheckable(True)
+        self.review_btn.setCursor(Qt.PointingHandCursor)
+        self.review_btn.clicked.connect(self._toggle_review_mode)
+        self._refresh_review_btn_style()
+
         self.sort_btn = QPushButton("날짜순 ↓")
         self.sort_btn.setCheckable(True)
         self.sort_btn.setStyleSheet(
@@ -488,10 +627,15 @@ class CardUsageTab(QWidget):
 
         list_header.addWidget(self.list_count_label)
         list_header.addStretch(1)
+        list_header.addWidget(view_group)
+        list_header.addWidget(self.review_btn)
         list_header.addWidget(self.sort_btn)
         layout.addLayout(list_header)
 
-        # ===== 거래내역 리스트 =====
+        # ===== 본문 (Stacked: 카드 / 테이블 / 캘린더) =====
+        self.body_stack = QStackedWidget()
+
+        # --- 카드 뷰 (기존 QListWidget) ---
         self.list = QListWidget()
         self.list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.list.setSpacing(6)
@@ -500,7 +644,48 @@ class CardUsageTab(QWidget):
             "QListWidget::item { background: transparent; padding: 0px; border: none; }"
             "QListWidget::item:selected { background: rgba(15, 23, 42, 0.04); }"
         )
-        layout.addWidget(self.list, 1)
+        self.body_stack.addWidget(self.list)  # idx 0 = card
+
+        # --- 테이블 뷰 ---
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["날짜", "가맹점", "카테고리", "금액", "카드", "메모"])
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setShowGrid(False)
+        self.table.setStyleSheet(
+            "QTableWidget { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; "
+            "gridline-color: #e2e8f0; }"
+            "QHeaderView::section { background: #f8fafc; border: none; "
+            "border-bottom: 1px solid #e2e8f0; padding: 8px; font-weight: 600; color: #475569; }"
+            "QTableWidget::item { padding: 6px 8px; }"
+            "QTableWidget::item:selected { background: rgba(15, 23, 42, 0.06); color: #0f172a; }"
+        )
+        h = self.table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(1, QHeaderView.Stretch)
+        h.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(5, QHeaderView.Stretch)
+        self.body_stack.addWidget(self.table)  # idx 1 = table
+
+        # --- 캘린더 뷰 ---
+        cal_scroll = QScrollArea()
+        cal_scroll.setWidgetResizable(True)
+        cal_scroll.setStyleSheet("QScrollArea { border: none; background: #f8fafc; }")
+        self._cal_inner = QWidget()
+        self._cal_inner_layout = QVBoxLayout(self._cal_inner)
+        self._cal_inner_layout.setContentsMargins(8, 8, 8, 8)
+        self._cal_inner_layout.setSpacing(8)
+        cal_scroll.setWidget(self._cal_inner)
+        self.body_stack.addWidget(cal_scroll)  # idx 2 = calendar
+
+        # 초기 페이지: 카드
+        self.body_stack.setCurrentIndex(0)
+        layout.addWidget(self.body_stack, 1)
 
         if not self.client.is_configured():
             miss = ", ".join(self.client.config.missing_fields())
@@ -550,11 +735,92 @@ class CardUsageTab(QWidget):
         self._fetch()
 
     def _on_match_coupang(self) -> None:
+        """쿠팡 주문을 결제(주문) 단위로 묶어 카드사용내역과 금액+날짜로 매칭."""
+        if not self._all_items:
+            QMessageBox.information(self, "쿠팡 매칭", "먼저 바로빌 동기화로 카드내역을 불러오세요.")
+            return
+        try:
+            store = PurchaseHistoryStore()
+            recs = store.load_records(channel="coupang", limit=2000)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "쿠팡 매칭", f"쿠팡 구매내역 로드 실패: {exc}")
+            return
+        if not recs:
+            QMessageBox.information(
+                self, "쿠팡 매칭",
+                "DB 에 쿠팡 구매내역이 없습니다. 구매내역 탭에서 먼저 동기화하세요.",
+            )
+            return
+
+        groups = group_records_by_order(recs)
+        # group_date(date) → list[PurchaseGroup]
+        by_date: Dict[date, List[PurchaseGroup]] = {}
+        for g in groups:
+            try:
+                gd = datetime.strptime(g.order_date or "", "%Y-%m-%d").date()
+            except Exception:  # noqa: BLE001
+                continue
+            by_date.setdefault(gd, []).append(g)
+
+        # 카드 매칭: 가맹점에 쿠팡/coupang 포함 + 양수 금액
+        used_groups: set[str] = set()
+        matched = 0
+        ambiguous = 0
+        candidates = 0
+        new_index: Dict[str, PurchaseGroup] = {}
+        for usage in self._all_items:
+            store_l = (usage.store_name or "").lower()
+            amt = int(usage.amount or 0)
+            if amt <= 0:
+                continue
+            if "쿠팡" not in (usage.store_name or "") and "coupang" not in store_l:
+                continue
+            candidates += 1
+            udt = _parse_used_at(usage.used_at)
+            if udt is None:
+                continue
+            ud = udt.date()
+            # ±3일 내 같은 금액 그룹 찾기
+            window: List[PurchaseGroup] = []
+            for delta in range(-3, 4):
+                d = ud + timedelta(days=delta)
+                for g in by_date.get(d, []):
+                    if g.group_key in used_groups:
+                        continue
+                    if g.total_amount == amt:
+                        window.append(g)
+            if not window:
+                continue
+            if len(window) > 1:
+                # 가장 가까운 날짜 1개 선택
+                window.sort(key=lambda g: abs(
+                    (datetime.strptime(g.order_date or "1900-01-01", "%Y-%m-%d").date() - ud).days
+                ))
+                ambiguous += 1
+            chosen = window[0]
+            used_groups.add(chosen.group_key)
+            key = usage.use_key or usage.id or ""
+            if key:
+                new_index[key] = chosen
+            usage.coupang_purchase_id = chosen.group_key
+            # 메모가 비어있으면 자동 채움
+            if not (usage.memo or "").strip():
+                usage.memo = f"🔗 쿠팡: {chosen.title}"
+            matched += 1
+
+        self._coupang_match_index.update(new_index)
+
+        # 결과 통보 + 화면 갱신
         QMessageBox.information(
-            self, "쿠팡 매칭",
-            "쿠팡 매칭은 외부 card-api-service 가 필요합니다.\n"
-            "기본 모드(바로빌 직접)에서는 칩 표시만 제공됩니다.",
+            self, "쿠팡 매칭 결과",
+            f"쿠팡 카드결제 {candidates}건 중 {matched}건 매칭"
+            f"{f' (모호 {ambiguous}건은 가까운 날짜 우선)' if ambiguous else ''}.\n"
+            f"쿠팡 그룹 {len(groups)}개 (총 구매 {len(recs)}건).",
         )
+        try:
+            self._render_list()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _on_chip_clicked(self, code: str) -> None:
         # 토글
@@ -588,9 +854,73 @@ class CardUsageTab(QWidget):
             self.sort_btn.setText("날짜순 ↓")
         self._render_list()
 
+    # ----- 뷰 모드 / 리뷰 모드 -----
+
+    def _on_view_mode(self, code: str) -> None:
+        if code not in ("table", "card", "calendar"):
+            return
+        self._view_mode = code
+        for c, btn in self._view_btns.items():
+            btn.setChecked(c == code)
+        self._refresh_view_mode_styles()
+        idx = {"card": 0, "table": 1, "calendar": 2}[code]
+        self.body_stack.setCurrentIndex(idx)
+        self._render_list()
+
+    def _refresh_view_mode_styles(self) -> None:
+        for code, btn in self._view_btns.items():
+            if btn.isChecked():
+                btn.setStyleSheet(
+                    "QPushButton { background: #ffffff; color: #0f172a; border: 1px solid #cbd5e1; "
+                    "border-radius: 6px; padding: 4px 12px; font-size: 11px; font-weight: 600; }"
+                )
+            else:
+                btn.setStyleSheet(
+                    "QPushButton { background: transparent; color: #64748b; border: none; "
+                    "border-radius: 6px; padding: 4px 12px; font-size: 11px; font-weight: 500; }"
+                    "QPushButton:hover { color: #0f172a; }"
+                )
+
+    def _toggle_review_mode(self) -> None:
+        self._review_mode = not self._review_mode
+        self.review_btn.setChecked(self._review_mode)
+        self._refresh_review_btn_style()
+        self._render_list()
+
+    def _refresh_review_btn_style(self) -> None:
+        if self._review_mode:
+            self.review_btn.setText("리뷰 모드 ON")
+            self.review_btn.setStyleSheet(
+                "QPushButton { background: #0f172a; color: #ffffff; border: none; "
+                "border-radius: 6px; padding: 4px 12px; font-size: 11px; font-weight: 600; }"
+            )
+        else:
+            self.review_btn.setText("리뷰 모드 OFF")
+            self.review_btn.setStyleSheet(
+                "QPushButton { background: #ffffff; color: #475569; border: 1px solid #e2e8f0; "
+                "border-radius: 6px; padding: 4px 12px; font-size: 11px; font-weight: 500; }"
+                "QPushButton:hover { border-color: #cbd5e1; }"
+            )
+
+    def _is_reviewed(self, usage: CardUsage) -> bool:
+        key = usage.use_key or usage.id or ""
+        if key and key in self._reviewed_keys:
+            return True
+        if usage.reviewed:
+            return True
+        # 메모가 비어있지 않으면 검토된 것으로 간주
+        if (usage.memo or "").strip():
+            return True
+        return False
+
     # ----- 데이터 가져오기 -----
 
     def _fetch(self) -> None:
+        """바로빌 동기화 — 동기 호출 (UI 잠깐 멈춤).
+
+        QThread 워커 + 시그널 dispatch 가 PyInstaller frozen 환경에서 가끔 죽어서
+        단순 동기 호출로 변경. 보통 91건 조회에 1-2초.
+        """
         start = self._q_to_iso(self.start_edit.date())
         end = self._q_to_iso(self.end_edit.date())
         refresh = self.refresh_chk.isChecked()
@@ -602,60 +932,72 @@ class CardUsageTab(QWidget):
             "padding: 10px 14px; color: #1e40af; font-size: 12px; }"
         )
         self._set_busy(True)
+        QApplication.processEvents()  # 상태 메시지 즉시 표시
 
-        def work() -> Dict[str, Any]:
-            return self.client.fetch_card_usages(
+        try:
+            data = self.client.fetch_card_usages(
                 start_date=start, end_date=end,
                 card_num=card, refresh_before_fetch=refresh,
             )
-
-        def done(result: _JobResult) -> None:
+        except BarobillError as exc:
             self._set_busy(False)
             self.refresh_chk.setChecked(False)
-            if not result.ok:
-                self.status_banner.setText(f"❌ {result.error}")
-                self.status_banner.setStyleSheet(
-                    "QLabel { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; "
-                    "padding: 10px 14px; color: #991b1b; font-size: 12px; }"
-                )
-                return
-            data = result.data or {}
-            logs: List[CardUsage] = data.get("logs") or []
-            target_cards: List[str] = data.get("targetCards") or []
-
-            # 카드번호 콤보 갱신
-            self._refresh_card_combo(target_cards)
-
-            # 카테고리 자동 분류
-            self._categories_index = {
-                (it.use_key or it.id or ""): classify_category(
-                    it.store_name, (it.raw or {}).get("UseStoreBizType")
-                )
-                for it in logs
-            }
-
-            self._all_items = logs
-            self._last_synced_at = datetime.now()
-            self.last_sync_label.setText(
-                f"최근 동기화: {self._last_synced_at.strftime('%Y. %m. %d. %p %I:%M')}"
-            )
-
-            confirmed = sum(1 for it in logs if (it.amount or 0) != 0)
-            empty = len(logs) - confirmed
-            self.status_banner.setText(
-                f"● 동기화 완료 · 조회 {len(logs)}건 / 저장 {len(logs)}건 · "
-                f"금액확인 {confirmed}건 / 금액없음 {empty}건"
-            )
+            self.status_banner.setText(f"❌ [{exc.code or ''}] {exc}")
             self.status_banner.setStyleSheet(
-                "QLabel { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; "
-                "padding: 10px 14px; color: #166534; font-size: 12px; }"
+                "QLabel { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; "
+                "padding: 10px 14px; color: #991b1b; font-size: 12px; }"
             )
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._set_busy(False)
+            self.refresh_chk.setChecked(False)
+            self.status_banner.setText(f"❌ {exc}")
+            self.status_banner.setStyleSheet(
+                "QLabel { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; "
+                "padding: 10px 14px; color: #991b1b; font-size: 12px; }"
+            )
+            return
 
+        self._set_busy(False)
+        self.refresh_chk.setChecked(False)
+
+        logs: List[CardUsage] = data.get("logs") or []
+        target_cards: List[str] = data.get("targetCards") or []
+
+        self._refresh_card_combo(target_cards)
+
+        self._categories_index = {
+            (it.use_key or it.id or ""): classify_category(
+                it.store_name, (it.raw or {}).get("UseStoreBizType")
+            )
+            for it in logs
+        }
+
+        self._all_items = logs
+        self._last_synced_at = datetime.now()
+        self.last_sync_label.setText(
+            f"최근 동기화: {self._last_synced_at.strftime('%Y. %m. %d. %p %I:%M')}"
+        )
+
+        confirmed = sum(1 for it in logs if (it.amount or 0) != 0)
+        empty = len(logs) - confirmed
+        self.status_banner.setText(
+            f"● 동기화 완료 · 조회 {len(logs)}건 / 저장 {len(logs)}건 · "
+            f"금액확인 {confirmed}건 / 금액없음 {empty}건"
+        )
+        self.status_banner.setStyleSheet(
+            "QLabel { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; "
+            "padding: 10px 14px; color: #166534; font-size: 12px; }"
+        )
+
+        try:
             self._refresh_summary_cards()
             self._refresh_chip_amounts()
             self._render_list()
-
-        _run_async(self, work, done)
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+            self.status_banner.setText(f"❌ 화면 갱신 오류: {exc}")
+            print("[CardUsageTab] render error:", traceback.format_exc())
 
     def _refresh_card_combo(self, cards: List[str]) -> None:
         cur = self.card_combo.currentData()
@@ -711,10 +1053,9 @@ class CardUsageTab(QWidget):
         for code, chip in self.category_chips.items():
             chip.set_amount(sums.get(code, 0))
 
-    # ----- 리스트 렌더 -----
+    # ----- 리스트 렌더 (디스패처) -----
 
-    def _render_list(self) -> None:
-        self.list.clear()
+    def _filtered_sorted_items(self) -> List[CardUsage]:
         items = list(self._all_items)
 
         # 카테고리 필터
@@ -724,26 +1065,232 @@ class CardUsageTab(QWidget):
                 if self._categories_index.get(it.use_key or it.id or "", "OTHER") == self._selected_category
             ]
 
-        # 검색 (가맹점/메모/금액범위)
+        # 검색
         q = self.store_filter.text().strip()
         if q:
             items = self._apply_search(items, q)
+
+        # 리뷰 모드 ON → 검토 안 된 항목만
+        if self._review_mode:
+            items = [it for it in items if not self._is_reviewed(it)]
 
         # 정렬
         if self._sort_mode == "amount":
             items.sort(key=lambda it: abs(int(it.amount or 0)), reverse=True)
         else:
             items.sort(key=lambda it: (it.used_at or ""), reverse=True)
+        return items
 
-        self.list_count_label.setText(f"거래내역 {len(items)}건")
+    def _render_list(self) -> None:
+        items = self._filtered_sorted_items()
+        suffix = " · 미검토" if self._review_mode else ""
+        self.list_count_label.setText(f"거래내역 {len(items)}건{suffix}")
 
+        if self._view_mode == "calendar":
+            self._render_calendar(items)
+        elif self._view_mode == "table":
+            self._render_table(items)
+        else:
+            self._render_card(items)
+
+    def _render_card(self, items: List[CardUsage]) -> None:
+        self.list.clear()
+        # sizeHint 명시 고정 → frozen 환경에서 잘못된 sizeHint 반환 방지
+        ROW_HEIGHT = 96
         for usage in items:
             cat = self._categories_index.get(usage.use_key or usage.id or "", "OTHER")
             row = _UsageRow(usage, cat)
             li = QListWidgetItem()
-            li.setSizeHint(row.sizeHint())
+            li.setSizeHint(QSize(0, ROW_HEIGHT))
             self.list.addItem(li)
             self.list.setItemWidget(li, row)
+
+    def _render_table(self, items: List[CardUsage]) -> None:
+        self.table.setRowCount(0)
+        self.table.setRowCount(len(items))
+        for r, usage in enumerate(items):
+            cat_code = self._categories_index.get(usage.use_key or usage.id or "", "OTHER")
+            cm = category_meta(cat_code)
+            amount_int = int(usage.amount or 0)
+            cancelled = amount_int < 0
+
+            # 날짜
+            date_item = QTableWidgetItem(_format_used_at_short(usage.used_at))
+            date_item.setForeground(QBrush(QColor("#475569")))
+            # 가맹점
+            store_item = QTableWidgetItem((usage.store_name or "(가맹점명 미상)").strip())
+            store_item.setForeground(QBrush(QColor("#ef4444" if cancelled else "#0f172a")))
+            f = QFont(); f.setBold(True); store_item.setFont(f)
+            # 카테고리
+            cat_item = QTableWidgetItem(f"{cm.emoji} {cm.label}")
+            cat_item.setForeground(QBrush(QColor("#334155")))
+            # 금액
+            amt_item = QTableWidgetItem(_fmt_money(amount_int))
+            amt_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            af = QFont(); af.setBold(True); amt_item.setFont(af)
+            amt_item.setForeground(QBrush(QColor("#ef4444" if cancelled else "#0f172a")))
+            # 카드
+            card_item = QTableWidgetItem(_mask_card_number(usage.card_num))
+            card_item.setForeground(QBrush(QColor("#64748b")))
+            # 메모
+            memo_item = QTableWidgetItem(usage.memo or "")
+            memo_item.setForeground(QBrush(QColor("#475569")))
+
+            self.table.setItem(r, 0, date_item)
+            self.table.setItem(r, 1, store_item)
+            self.table.setItem(r, 2, cat_item)
+            self.table.setItem(r, 3, amt_item)
+            self.table.setItem(r, 4, card_item)
+            self.table.setItem(r, 5, memo_item)
+
+    def _render_calendar(self, items: List[CardUsage]) -> None:
+        # 기존 캘린더 클리어
+        while self._cal_inner_layout.count():
+            child = self._cal_inner_layout.takeAt(0)
+            w = child.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+            else:
+                lay = child.layout()
+                if lay is not None:
+                    self._clear_layout(lay)
+
+        # 표시할 월 결정 — start_edit 의 연/월 사용
+        qd = self.start_edit.date()
+        year, month = qd.year(), qd.month()
+        first_weekday, days_in_month = calendar.monthrange(year, month)
+        # Python: monday=0 → 우리 캘린더는 일요일 시작이므로 col_offset 계산
+        # 일=0, 월=1, ..., 토=6
+        py_to_sun_first = (first_weekday + 1) % 7  # mon(0)→1, tue(1)→2, ..., sun(6)→0
+
+        # 일자별 카테고리 합계 집계
+        day_totals: Dict[int, int] = {}
+        day_cat_sums: Dict[int, Dict[str, int]] = {}
+        for it in items:
+            d = _parse_used_at(it.used_at)
+            if d is None:
+                continue
+            if d.year != year or d.month != month:
+                continue
+            amt = int(it.amount or 0)
+            if amt <= 0:
+                continue  # 취소건은 게이지 제외
+            day = d.day
+            day_totals[day] = day_totals.get(day, 0) + amt
+            cat = self._categories_index.get(it.use_key or it.id or "", "OTHER")
+            day_cat_sums.setdefault(day, {})
+            day_cat_sums[day][cat] = day_cat_sums[day].get(cat, 0) + amt
+
+        max_total = max(day_totals.values()) if day_totals else 0
+
+        # 헤더(설명 + 월)
+        info = QLabel(
+            f"일별 사용액 게이지 (카테고리 분할, 최대 {max_total:,}원 = 100%)"
+            if max_total > 0 else "일별 사용액 게이지 — 데이터 없음"
+        )
+        info.setStyleSheet(
+            "QLabel { background: #fefce8; border: 1px solid #fde68a; border-radius: 8px; "
+            "padding: 8px 12px; color: #854d0e; font-size: 11px; }"
+        )
+        self._cal_inner_layout.addWidget(info)
+
+        title = QLabel(f"{year}년 {month}월")
+        tf = QFont(); tf.setBold(True); tf.setPointSize(13)
+        title.setFont(tf)
+        title.setStyleSheet("color: #0f172a; padding: 4px 2px;")
+        self._cal_inner_layout.addWidget(title)
+
+        # 그리드
+        grid_box = QFrame()
+        grid_box.setStyleSheet("QFrame { background: transparent; }")
+        grid = QGridLayout(grid_box)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+        # 컬럼 균등
+        for c in range(7):
+            grid.setColumnStretch(c, 1)
+
+        # 요일 헤더
+        weekdays = ["일", "월", "화", "수", "목", "금", "토"]
+        for c, wd in enumerate(weekdays):
+            lab = QLabel(wd)
+            lab.setAlignment(Qt.AlignCenter)
+            color = "#ef4444" if c == 0 else ("#3b82f6" if c == 6 else "#64748b")
+            lab.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: 600; padding: 4px;")
+            grid.addWidget(lab, 0, c)
+
+        # 일자 셀
+        row = 1
+        col = py_to_sun_first
+        # 첫 주 placeholder
+        for c in range(col):
+            ph = _CalendarDayCell(0, 0, [], 0.0, is_placeholder=True)
+            ph.day_placeholder = True  # marker
+            # placeholder 라도 day 라벨이 어색하므로 빈 프레임으로 대체
+            grid.addWidget(self._calendar_blank_cell(), row, c)
+
+        for day in range(1, days_in_month + 1):
+            amt = day_totals.get(day, 0)
+            cat_sums = day_cat_sums.get(day, {})
+            # 세그먼트 (큰 카테고리부터)
+            segs: List[tuple[str, int]] = []
+            for code, sub in sorted(cat_sums.items(), key=lambda kv: -kv[1]):
+                segs.append((self._cat_color(code), sub))
+            pct = (amt / max_total) if max_total > 0 else 0.0
+            cell = _CalendarDayCell(day, amt, segs, pct, is_placeholder=False)
+            grid.addWidget(cell, row, col)
+            col += 1
+            if col >= 7:
+                col = 0
+                row += 1
+
+        # 마지막 주 placeholder
+        if col != 0:
+            for c in range(col, 7):
+                grid.addWidget(self._calendar_blank_cell(), row, c)
+
+        self._cal_inner_layout.addWidget(grid_box)
+        self._cal_inner_layout.addStretch(1)
+
+    def _calendar_blank_cell(self) -> QWidget:
+        f = QFrame()
+        f.setMinimumHeight(110)
+        f.setStyleSheet(
+            "QFrame { background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 8px; }"
+        )
+        return f
+
+    @staticmethod
+    def _clear_layout(lay) -> None:
+        while lay.count():
+            child = lay.takeAt(0)
+            w = child.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+    @staticmethod
+    def _cat_color(code: str) -> str:
+        # 카테고리 메인 컬러 (게이지용 — 채도 높임)
+        m = {
+            "CAFE":          "#f59e0b",
+            "FOOD":          "#fb923c",
+            "BAKERY":        "#fbbf24",
+            "TRANSPORT":     "#3b82f6",
+            "SHOPPING":      "#22c55e",
+            "CONVENIENCE":   "#10b981",
+            "FUEL":          "#f97316",
+            "FINANCE":       "#a855f7",
+            "TELECOM":       "#6366f1",
+            "OFFICE":        "#64748b",
+            "MEDICAL":       "#14b8a6",
+            "EDUCATION":     "#0ea5e9",
+            "ENTERTAINMENT": "#ec4899",
+            "OTHER":         "#94a3b8",
+        }
+        return m.get(code, "#94a3b8")
 
     def _apply_search(self, items: List[CardUsage], query: str) -> List[CardUsage]:
         # 금액 범위 표현 우선

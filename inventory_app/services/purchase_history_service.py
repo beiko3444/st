@@ -7,11 +7,68 @@ import re
 import sqlite3
 import threading
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 from inventory_app.models import PurchaseRecord
+
+
+@dataclass
+class PurchaseGroup:
+    """주문/결제 단위 묶음.
+
+    쿠팡 주문 N개가 한 번에 결제되면 카드 명세서에는 합계 1건으로 찍히므로
+    금액 매칭을 위해 동일 주문 묶음을 만들어 합계를 계산한다.
+    """
+    channel: str
+    order_date: Optional[str]
+    title: str            # 대표 제목 ("외 N건")
+    total_amount: int     # 양수만 합계 (취소건 별도)
+    item_count: int
+    items: List[PurchaseRecord] = field(default_factory=list)
+    group_key: str = ""
+
+
+def group_records_by_order(records: List[PurchaseRecord]) -> List[PurchaseGroup]:
+    """raw_text 가 동일한 항목들을 한 주문(결제) 묶음으로 본다.
+
+    쿠팡 크롤러는 한 주문 블록 전체를 모든 line item 의 raw_text 에 동일하게 저장하므로
+    raw_text 의 앞부분 해시 + order_date 로 묶을 수 있다.
+    """
+    groups: dict[str, list[PurchaseRecord]] = {}
+    for r in records:
+        key_text = (r.raw_text or "")[:200].strip()
+        h = hashlib.sha1(key_text.encode("utf-8")).hexdigest()[:12]
+        key = f"{r.channel}|{r.order_date or ''}|{h}"
+        groups.setdefault(key, []).append(r)
+
+    out: List[PurchaseGroup] = []
+    for key, items in groups.items():
+        # 음수(취소)는 합계에서 제외 (카드 매칭은 양수 결제건만)
+        total = sum(int(i.amount or 0) for i in items if int(i.amount or 0) > 0)
+        if total <= 0:
+            continue
+        first_title = (items[0].title or "").strip()
+        clean = re.sub(r"^\[[^\]]+\]\s*", "", first_title).strip()
+        if len(items) > 1:
+            display = f"{clean[:40]} 외 {len(items) - 1}건"
+        else:
+            display = clean[:60] or "(제목 없음)"
+        out.append(
+            PurchaseGroup(
+                channel=items[0].channel,
+                order_date=items[0].order_date,
+                title=display,
+                total_amount=total,
+                item_count=len(items),
+                items=items,
+                group_key=key,
+            )
+        )
+    out.sort(key=lambda g: (g.order_date or ""), reverse=True)
+    return out
 
 WON = "\uc6d0"
 ORDER_NO = "\uc8fc\ubb38\ubc88\ud638"

@@ -3860,6 +3860,11 @@ class MainWindow(QMainWindow):
         self.tab_shortcut_9.setContext(Qt.ApplicationShortcut)
         self.tab_shortcut_9.activated.connect(lambda: self._activate_tab_shortcut(8))
 
+        # F5 → 전체 동기화
+        self.sync_shortcut = QShortcut(QKeySequence(Qt.Key_F5), self)
+        self.sync_shortcut.setContext(Qt.ApplicationShortcut)
+        self.sync_shortcut.activated.connect(self.sync_now)
+
         self.naver_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.coupang_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.naver_tab.favorites_changed.connect(self._refresh_inventory_tab)
@@ -3873,9 +3878,8 @@ class MainWindow(QMainWindow):
         self.keyword_tab.sync_finished.connect(self._on_sub_sync_finished)
         self._refresh_inventory_tab()
         QTimer.singleShot(0, self._load_initial_visible_channel_tab)
-        # 시작 시 자동 동기화: 창이 뜨고 캐시가 화면에 그려진 뒤 백그라운드 동기화 시작.
-        # 캐시 렌더링 → (500ms) → 자동 sync_now → 변경된 row만 diff 적용
-        QTimer.singleShot(500, self._auto_initial_sync)
+        # 자동 동기화는 사용자가 요청할 때만 (F5 또는 동기화 버튼).
+        # 시작 시에는 캐시만 표시하고 네트워크 호출 안 함.
 
     def _auto_initial_sync(self) -> None:
         """시작 시 자동 동기화 트리거. 이미 동기화 중이면 건너뜀."""
