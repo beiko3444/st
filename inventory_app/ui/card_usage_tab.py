@@ -156,33 +156,33 @@ class _SummaryCard(QFrame):
         self.setObjectName("summaryCard")
         self.setFrameShape(QFrame.NoFrame)
         self.setStyleSheet(
-            "#summaryCard { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }"
+            "#summaryCard { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; }"
         )
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 14, 18, 14)
-        layout.setSpacing(6)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(8)
 
         self.title_label = QLabel(title)
-        self.title_label.setStyleSheet("color: #64748b; font-size: 12px; font-weight: 500;")
+        self.title_label.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 500;")
 
         self.value_label = QLabel("-")
         f = QFont()
-        f.setPointSize(18)
+        f.setPointSize(13)
         f.setBold(True)
         self.value_label.setFont(f)
         self.value_label.setStyleSheet("color: #0f172a;")
 
         self.sub_label = QLabel("")
-        self.sub_label.setStyleSheet("color: #94a3b8; font-size: 11px;")
-        self.sub_label.setWordWrap(True)
+        self.sub_label.setStyleSheet("color: #94a3b8; font-size: 10px;")
 
         layout.addWidget(self.title_label)
+        layout.addStretch(1)
         layout.addWidget(self.value_label)
         layout.addWidget(self.sub_label)
 
     def set_value(self, text: str, sub: str = "") -> None:
         self.value_label.setText(text)
-        self.sub_label.setText(sub)
+        self.sub_label.setText(f"· {sub}" if sub else "")
 
 
 class _CategoryChip(QPushButton):
@@ -448,37 +448,34 @@ class CardUsageTab(QWidget):
         self._categories_index: Dict[str, str] = {}  # use_key → category code
         self._selected_category: Optional[str] = None
         self._last_synced_at: Optional[datetime] = None
-        self._view_mode: str = "card"   # "card" | "table" | "calendar"
+        self._view_mode: str = "table"   # "card" | "table" | "calendar"
         self._review_mode: bool = False
         self._reviewed_keys: set[str] = set()  # 메모리상 검토 완료 마킹
         self._coupang_match_index: Dict[str, PurchaseGroup] = {}  # use_key/id → matched group
 
         # ===== 헤더 =====
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
 
         header = QHBoxLayout()
+        header.setSpacing(8)
         title = QLabel("카드사용내역")
-        tf = QFont(); tf.setBold(True); tf.setPointSize(20)
+        tf = QFont(); tf.setBold(True); tf.setPointSize(15)
         title.setFont(tf)
-        self.last_sync_label = QLabel("최근 동기화: -")
-        self.last_sync_label.setStyleSheet("color: #94a3b8; font-size: 11px; padding-top: 6px;")
-
-        title_box = QVBoxLayout()
-        title_box.setSpacing(0)
-        title_box.addWidget(title)
-        title_box.addWidget(self.last_sync_label)
-        header.addLayout(title_box)
+        self.last_sync_label = QLabel("· 동기화: -")
+        self.last_sync_label.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        header.addWidget(title)
+        header.addWidget(self.last_sync_label)
         header.addStretch(1)
 
         self.refresh_chk = QCheckBox("즉시 갱신")
         self.refresh_chk.setToolTip("바로빌이 카드사로부터 새로 받아오도록 강제")
 
-        self.sync_btn = QPushButton("🔄 바로빌 동기화")
+        self.sync_btn = QPushButton("🔄 바로빌")
         self.sync_btn.setStyleSheet(
             "QPushButton { background: #0f172a; color: #ffffff; border: none; "
-            "border-radius: 8px; padding: 8px 16px; font-weight: 600; }"
+            "border-radius: 6px; padding: 5px 12px; font-weight: 600; font-size: 12px; }"
             "QPushButton:hover { background: #1e293b; }"
             "QPushButton:disabled { background: #cbd5e1; }"
         )
@@ -487,7 +484,7 @@ class CardUsageTab(QWidget):
         self.match_btn = QPushButton("🔗 쿠팡 매칭")
         self.match_btn.setStyleSheet(
             "QPushButton { background: #ef4444; color: #ffffff; border: none; "
-            "border-radius: 8px; padding: 8px 16px; font-weight: 600; }"
+            "border-radius: 6px; padding: 5px 12px; font-weight: 600; font-size: 12px; }"
             "QPushButton:hover { background: #dc2626; }"
         )
         self.match_btn.clicked.connect(self._on_match_coupang)
@@ -500,21 +497,23 @@ class CardUsageTab(QWidget):
 
         # ===== 통계 카드 =====
         cards_row = QHBoxLayout()
-        cards_row.setSpacing(12)
+        cards_row.setSpacing(8)
         self.card_total = _SummaryCard("이번 달 총 지출")
         self.card_count = _SummaryCard("거래 건수")
         self.card_avg = _SummaryCard("일평균 지출")
         for c in (self.card_total, self.card_count, self.card_avg):
             c.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            c.setFixedHeight(40)
             cards_row.addWidget(c, 1)
         layout.addLayout(cards_row)
 
-        # ===== 상태 배너 =====
+        # ===== 상태 배너 (메시지 있을 때만 표시) =====
         self.status_banner = QLabel("바로빌 동기화를 눌러 데이터를 가져오세요.")
         self.status_banner.setStyleSheet(
-            "QLabel { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; "
-            "padding: 10px 14px; color: #166534; font-size: 12px; }"
+            "QLabel { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; "
+            "padding: 6px 10px; color: #166534; font-size: 11px; }"
         )
+        self.status_banner.setMinimumHeight(28)
         layout.addWidget(self.status_banner)
 
         # ===== 카테고리 칩 =====
@@ -541,7 +540,7 @@ class CardUsageTab(QWidget):
         chip_scroll.setWidgetResizable(True)
         chip_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         chip_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        chip_scroll.setFixedHeight(48)
+        chip_scroll.setFixedHeight(42)
         chip_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         chip_inner = QWidget()
         chip_inner.setLayout(chip_row)
