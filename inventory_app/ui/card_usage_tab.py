@@ -659,13 +659,16 @@ class CardUsageTab(QWidget):
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
+        # 셀 포커스 점선/박스 제거
+        self.table.setFocusPolicy(Qt.NoFocus)
         self.table.setStyleSheet(
-            "QTableWidget { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; "
-            "gridline-color: #e2e8f0; }"
-            "QHeaderView::section { background: #f8fafc; border: none; "
-            "border-bottom: 1px solid #e2e8f0; padding: 8px; font-weight: 600; color: #475569; }"
-            "QTableWidget::item { padding: 6px 8px; }"
-            "QTableWidget::item:selected { background: rgba(15, 23, 42, 0.06); color: #0f172a; }"
+            "QTableWidget { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px;"
+            " gridline-color: #e2e8f0; outline: 0; }"
+            "QHeaderView::section { background: #f8fafc; border: none;"
+            " border-bottom: 1px solid #e2e8f0; padding: 8px; font-weight: 600; color: #475569; }"
+            "QTableWidget::item { padding: 6px 8px; border: none; }"
+            "QTableWidget::item:selected { background: #f1f5f9; color: #0f172a; }"
+            "QTableWidget::item:focus { background: #f1f5f9; color: #0f172a; }"
         )
         h = self.table.horizontalHeader()
         h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -687,8 +690,9 @@ class CardUsageTab(QWidget):
         cal_scroll.setWidget(self._cal_inner)
         self.body_stack.addWidget(cal_scroll)  # idx 2 = calendar
 
-        # 초기 페이지: 카드
-        self.body_stack.setCurrentIndex(0)
+        # 초기 페이지: 테이블 (self._view_mode 와 동기화)
+        _initial_idx = {"card": 0, "table": 1, "calendar": 2}.get(self._view_mode, 1)
+        self.body_stack.setCurrentIndex(_initial_idx)
         layout.addWidget(self.body_stack, 1)
 
         if not self.client.is_configured():
@@ -701,6 +705,9 @@ class CardUsageTab(QWidget):
                 "padding: 6px 10px; color: #92400e; font-size: 11px; }"
             )
             self.status_banner.setVisible(True)
+
+        # 시작 시 Pi 캐시에서 즉시 로드 — UI 가 그려진 직후 1회 (창 띄우기 안 늦게)
+        QTimer.singleShot(0, self._load_from_pi_cache)
 
     # ----- helpers -----
 
@@ -740,15 +747,27 @@ class CardUsageTab(QWidget):
         self._fetch()
 
     def _on_match_coupang(self) -> None:
-        """쿠팡 주문을 결제(주문) 단위로 카드사용내역과 매칭.
+        """쿠팡 매칭 (UI 버튼) — 결과 다이얼로그 표시."""
+        result = self._run_coupang_match(silent=False)
+        if result is None:
+            return
+        matched, candidates, ambiguous, source_msg = result
+        QMessageBox.information(
+            self, "쿠팡 매칭 결과",
+            f"쿠팡 카드결제 {candidates}건 중 {matched}건 매칭"
+            f"{f' (모호 {ambiguous}건은 가까운 날짜 우선)' if ambiguous else ''}.\n"
+            f"매칭 소스: {source_msg}",
+        )
 
-        우선순위:
-          1) purchase_orders 의 payment_total (주문 상세 페이지에서 추출한 실제 결제금)
-          2) fallback: purchase_records 를 raw_text 로 그룹핑 후 합산 (배송비 미포함, 부정확)
+    def _run_coupang_match(self, *, silent: bool) -> Optional[tuple[int, int, int, str]]:
+        """쿠팡 주문 단위 매칭 실행. 반환: (matched, candidates, ambiguous, source_msg) 또는 None.
+
+        silent=True 면 다이얼로그/경고 없이 조용히 동작 (자동 매칭 용).
         """
         if not self._all_items:
-            QMessageBox.information(self, "쿠팡 매칭", "먼저 바로빌 동기화로 카드내역을 불러오세요.")
-            return
+            if not silent:
+                QMessageBox.information(self, "쿠팡 매칭", "먼저 바로빌 동기화로 카드내역을 불러오세요.")
+            return None
 
         # ── 1순위: purchase_orders (Pi 우선, 로컬 fallback) ──
         orders: List[PurchaseOrder] = []
@@ -798,14 +817,16 @@ class CardUsageTab(QWidget):
                     store = PurchaseHistoryStore()
                     recs = store.load_records(channel="coupang", limit=2000)
                 except Exception as exc:  # noqa: BLE001
-                    QMessageBox.warning(self, "쿠팡 매칭", f"쿠팡 구매내역 로드 실패: {exc}")
-                    return
+                    if not silent:
+                        QMessageBox.warning(self, "쿠팡 매칭", f"쿠팡 구매내역 로드 실패: {exc}")
+                    return None
             if not recs:
-                QMessageBox.information(
-                    self, "쿠팡 매칭",
-                    "DB 에 쿠팡 구매내역이 없습니다. 구매내역 탭에서 먼저 동기화하세요.",
-                )
-                return
+                if not silent:
+                    QMessageBox.information(
+                        self, "쿠팡 매칭",
+                        "DB 에 쿠팡 구매내역이 없습니다. 구매내역 탭에서 먼저 동기화하세요.",
+                    )
+                return None
             groups = group_records_by_order(recs)
             source_msg = f"품목 합산 그룹 {len(groups)}개 (구매내역 {len(recs)}건, ⚠ 배송비/할인 미반영)"
         # group_date(date) → list[PurchaseGroup]
@@ -874,17 +895,13 @@ class CardUsageTab(QWidget):
             except Exception:  # noqa: BLE001
                 pass
 
-        # 결과 통보 + 화면 갱신
-        QMessageBox.information(
-            self, "쿠팡 매칭 결과",
-            f"쿠팡 카드결제 {candidates}건 중 {matched}건 매칭"
-            f"{f' (모호 {ambiguous}건은 가까운 날짜 우선)' if ambiguous else ''}.\n"
-            f"매칭 소스: {source_msg}",
-        )
+        # 화면 갱신
         try:
             self._render_list()
         except Exception:  # noqa: BLE001
             pass
+
+        return (matched, candidates, ambiguous, source_msg)
 
     def _on_chip_clicked(self, code: str) -> None:
         # 토글
@@ -978,6 +995,61 @@ class CardUsageTab(QWidget):
         return False
 
     # ----- 데이터 가져오기 -----
+
+    def _load_from_pi_cache(self) -> None:
+        """창 시작 시 Pi DB 에서 카드사용내역 즉시 로드 (네트워크 호출 없음).
+
+        - Pi 가 설정돼 있고 데이터가 있으면 그걸로 화면 초기 채움
+        - 사용자는 필요할 때 '바로빌 동기화' 로 최신화
+        - 실패해도 조용히 무시 (UI 는 빈 상태)
+        """
+        if not self.pi.is_configured:
+            return
+        start = self._q_to_iso(self.start_edit.date())
+        end = self._q_to_iso(self.end_edit.date())
+        try:
+            items = self.pi.list_card_usages(
+                start_date=start, end_date=end, card_num=None, limit=20000,
+            )
+        except Exception:  # noqa: BLE001
+            return
+        if not items:
+            return
+
+        # target_cards: 로드된 데이터에서 추출
+        target_cards = sorted({(it.card_num or "") for it in items if it.card_num})
+        self._refresh_card_combo([c for c in target_cards if c])
+
+        self._categories_index = {
+            (it.use_key or it.id or ""): (
+                it.category
+                or classify_category(
+                    it.store_name, (it.raw or {}).get("UseStoreBizType") if it.raw else None
+                )
+            )
+            for it in items
+        }
+
+        self._all_items = items
+        self._last_synced_at = datetime.now()
+        self.last_sync_label.setText(
+            f"Pi 캐시 로드: {len(items)}건 (마지막 동기화 시점은 '바로빌 동기화' 시 갱신)"
+        )
+        self.status_banner.setVisible(False)
+
+        try:
+            self._refresh_summary_cards()
+            self._refresh_chip_amounts()
+            self._render_list()
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Pi 캐시에는 이미 매칭 결과(coupang_purchase_id) 가 들어있을 수 있으므로
+        # 여기서는 자동 매칭을 한 번 더 돌려 신규 항목까지 커버 (조용히)
+        try:
+            self._run_coupang_match(silent=True)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _fetch(self) -> None:
         """바로빌 동기화 — 동기 호출 (UI 잠깐 멈춤).
@@ -1092,6 +1164,18 @@ class CardUsageTab(QWidget):
             import traceback
             self.status_banner.setText(f"❌ 화면 갱신 오류: {exc}")
             print("[CardUsageTab] render error:", traceback.format_exc())
+
+        # 동기화 후 쿠팡 자동 매칭 (조용히) — 다이얼로그 없이 last_sync_label 에 결과만 추가
+        try:
+            res = self._run_coupang_match(silent=True)
+            if res is not None:
+                matched, candidates, _amb, _src = res
+                cur = self.last_sync_label.text()
+                self.last_sync_label.setText(
+                    f"{cur} · 쿠팡매칭 {matched}/{candidates}건"
+                )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _refresh_card_combo(self, cards: List[str]) -> None:
         cur = self.card_combo.currentData()

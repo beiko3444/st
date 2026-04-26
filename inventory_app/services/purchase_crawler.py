@@ -485,85 +485,91 @@ def _crawl_coupang_via_cdp(
                 )
 
             # 데이터 추출 — 1 ~ max_pages 페이지 순회
-            try:
-                target_page.wait_for_load_state("networkidle", timeout=10_000)
-            except Exception:
-                pass
-            time.sleep(1.5)
+            # NEXT_DATA 는 SSR HTML 에 이미 들어있으므로 networkidle 대기 불필요
 
-            # 첫 페이지 추출
+            # 첫 페이지 추출 (__NEXT_DATA__ 기반 → 품목 + 주문 동시 획득)
             seen_keys: set[str] = set()
-            page1 = _extract_coupang_orders(target_page, progress)
-            detail_urls: List[str] = []
-            detail_urls.extend(_extract_coupang_order_detail_links(target_page))
+            seen_orders: set[str] = set()
+            orders: List[PurchaseOrder] = []
+            page1, page1_orders, page1_pg = _extract_coupang_orders_from_next_data(
+                target_page, progress
+            )
             for rec in page1:
                 key = (rec.order_date or "", rec.title or "", rec.amount or 0)
-                if key in seen_keys:
+                if str(key) in seen_keys:
                     continue
                 seen_keys.add(str(key))
                 records.append(rec)
-            progress.on_log(f"쿠팡 페이지 1: {len(page1)}건 · 상세링크 {len(detail_urls)}개")
+            for o in page1_orders:
+                if o.order_no in seen_orders:
+                    continue
+                seen_orders.add(o.order_no)
+                orders.append(o)
+            has_next = bool(page1_pg.get("hasNext"))
+            progress.on_log(
+                f"쿠팡 페이지 1: 품목 {len(page1)}건 · 주문 {len(page1_orders)}개 · "
+                f"hasNext={has_next}"
+            )
+            if not has_next:
+                progress.on_log("✓ orderPagination.hasNext=false → 1페이지가 마지막")
 
             # 2 ~ max_pages 페이지 (URL ?pageIndex=N-1)
-            for page_no in range(2, max(2, max_pages) + 1):
-                if progress.cancelled():
-                    break
-                ok = _navigate_coupang_to_page(target_page, page_no, progress)
-                if not ok:
-                    progress.on_log(f"쿠팡 페이지 {page_no} 이동 실패. 종료.")
-                    break
-                try:
-                    target_page.wait_for_load_state("networkidle", timeout=4_000)
-                except Exception:
-                    pass
-                time.sleep(0.5)
-                page_recs = _extract_coupang_orders(target_page, progress)
-                page_links = _extract_coupang_order_detail_links(target_page)
-                for h in page_links:
-                    if h not in detail_urls:
-                        detail_urls.append(h)
-                added = 0
-                for rec in page_recs:
-                    key = (rec.order_date or "", rec.title or "", rec.amount or 0)
-                    if str(key) in seen_keys:
-                        continue
-                    seen_keys.add(str(key))
-                    records.append(rec)
-                    added += 1
-                progress.on_log(
-                    f"쿠팡 페이지 {page_no}: {len(page_recs)}건 추출, 신규 {added} · "
-                    f"상세링크 +{len(page_links)} (누계 {len(detail_urls)})"
-                )
+            # 종료 조건: hasNext=false 또는 max_pages 도달 또는 사용자 취소
+            if has_next:
+                for page_no in range(2, max(2, max_pages) + 1):
+                    if progress.cancelled():
+                        break
+                    ok = _navigate_coupang_to_page(target_page, page_no, progress)
+                    if not ok:
+                        progress.on_log(f"쿠팡 페이지 {page_no} 이동 실패. 종료.")
+                        break
+                    # NEXT_DATA 는 SSR HTML 안에 있어 추가 대기 불필요. 추출 실패 시만 짧게 재시도.
+                    page_recs, page_orders, page_pg = _extract_coupang_orders_from_next_data(
+                        target_page, progress
+                    )
+                    if not page_recs and not page_orders:
+                        # 첫 추출 실패 → 페이지가 아직 안정화 안 됐을 수 있어 짧게 한 번만 재시도
+                        time.sleep(0.3)
+                        page_recs, page_orders, page_pg = _extract_coupang_orders_from_next_data(
+                            target_page, progress
+                        )
+                    added = 0
+                    added_orders = 0
+                    for rec in page_recs:
+                        key = (rec.order_date or "", rec.title or "", rec.amount or 0)
+                        if str(key) in seen_keys:
+                            continue
+                        seen_keys.add(str(key))
+                        records.append(rec)
+                        added += 1
+                    for o in page_orders:
+                        if o.order_no in seen_orders:
+                            continue
+                        seen_orders.add(o.order_no)
+                        orders.append(o)
+                        added_orders += 1
+                    has_next = bool(page_pg.get("hasNext"))
+                    progress.on_log(
+                        f"쿠팡 페이지 {page_no}: 품목 {len(page_recs)}건 (신규 {added}) · "
+                        f"주문 {len(page_orders)}개 (신규 {added_orders}) · "
+                        f"hasNext={has_next}"
+                    )
 
-                # 마지막 페이지 자동 감지 — 쿠팡 안내 메시지로 판별
-                try:
-                    page_content = target_page.content()
-                except Exception:
-                    page_content = ""
-                is_last = (
-                    "마지막 내역입니다" in page_content
-                    or "주문하신 내역이 없습니다" in page_content
-                    or "조회된 주문 내역이 없습니다" in page_content
-                )
-                if is_last:
-                    progress.on_log("✓ '마지막 내역' 안내 감지 → 자동 종료")
-                    break
-                if added == 0 and len(page_recs) == 0:
-                    progress.on_log("새 데이터 없음 → 마지막 페이지 도달")
-                    break
+                    # 종료 판단:
+                    # 1) NEXT_DATA 의 hasNext=false → 정확한 마지막 페이지 신호
+                    # 2) orderList 가 빈 페이지가 나왔다 → 비정상 (보호용)
+                    if not has_next:
+                        progress.on_log("✓ orderPagination.hasNext=false → 마지막 페이지")
+                        break
+                    if len(page_recs) == 0 and len(page_orders) == 0:
+                        progress.on_log("주문 0건 → 마지막 페이지로 간주")
+                        break
 
-            # ── 주문 상세 페이지 순회: order_no + payment_total 수집 ──
-            orders: List[PurchaseOrder] = []
-            if detail_urls and not progress.cancelled():
-                progress.on_log(
-                    f"주문 상세 페이지 {len(detail_urls)}개 순회 시작 (결제 합계금 추출)"
-                )
-                orders = _crawl_coupang_order_details(target_page, detail_urls, progress)
-                _associate_orders_to_records(orders, records)
-                progress.on_log(
-                    f"주문 상세 추출 완료: {len(orders)}개 주문 (결제금 미상 "
-                    f"{sum(1 for o in orders if o.payment_total is None)}개)"
-                )
+            # __NEXT_DATA__ 가 모든 정보를 담고 있어 주문 상세 페이지 추가 호출 불필요
+            paid_count = sum(1 for o in orders if o.payment_total is not None)
+            progress.on_log(
+                f"주문 추출 완료: 총 {len(orders)}개 (결제금 확정 {paid_count}개)"
+            )
 
     except Exception as exc:  # noqa: BLE001
         progress.on_log(f"오류: {exc}")
@@ -577,7 +583,11 @@ def _crawl_coupang_via_cdp(
             pass
 
     final_orders = locals().get("orders") or []
-    progress.on_log(f"쿠팡 수집 완료: 품목 {len(records)}건 / 주문 {len(final_orders)}개")
+    paid = sum(1 for o in final_orders if o.payment_total is not None)
+    progress.on_log(
+        f"쿠팡 수집 완료: 품목 {len(records)}건 / 주문 {len(final_orders)}개 "
+        f"(결제금 {paid}개)"
+    )
     return CrawlResult(
         channel="coupang",
         records=records,
@@ -598,24 +608,113 @@ _COUPANG_PAYMENT_METHOD_RE = re.compile(
 )
 
 
-def _extract_coupang_order_detail_links(page) -> List[str]:
-    """주문 리스트 페이지에서 '주문 상세보기' 링크들의 href 수집."""
+def _extract_coupang_next_data(page) -> dict | None:
+    """Coupang SSR 페이지의 __NEXT_DATA__ 파싱.
+
+    이 안에 orderList[] 가 들어있고 각 order 마다 productList, discountedUnitPrice,
+    quantity, shipping fee 등 결제 합계 계산에 필요한 모든 정보가 들어있다.
+    """
     try:
-        hrefs = page.evaluate(
-            """() => {
-                const out = new Set();
-                document.querySelectorAll('a').forEach(a => {
-                    const t = (a.innerText || '').trim();
-                    if (t.includes('주문 상세') || t.includes('상세보기')) {
-                        if (a.href) out.add(a.href);
-                    }
-                });
-                return Array.from(out);
-            }"""
-        ) or []
+        text = page.evaluate(
+            "() => { const el = document.getElementById('__NEXT_DATA__');"
+            " return el ? el.textContent : ''; }"
+        )
     except Exception:  # noqa: BLE001
-        hrefs = []
-    return [str(h) for h in hrefs if h]
+        return None
+    if not text:
+        return None
+    try:
+        import json as _json
+        return _json.loads(text)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _coupang_orderlist_from_next_data(data: dict) -> List[dict]:
+    try:
+        return list(
+            (data.get("props") or {})
+            .get("pageProps", {})
+            .get("domains", {})
+            .get("desktopOrder", {})
+            .get("orderList") or []
+        )
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _coupang_pagination_from_next_data(data: dict) -> dict:
+    """{'hasNext': bool, 'hasPrev': bool, 'nextPageIndex': int, ...} 반환."""
+    try:
+        return (
+            (data.get("props") or {})
+            .get("pageProps", {})
+            .get("domains", {})
+            .get("desktopOrder", {})
+            .get("orderPagination") or {}
+        )
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _compute_coupang_payment(order: dict) -> tuple[int, int]:
+    """주문에서 (payment_total, item_count) 계산.
+
+    payment_total = sum( (quantity - cancelQuantity) * discountedUnitPrice ) + shippingFee
+    item_count = 살아있는 상품 라인 수 (cancelQuantity == quantity 인 건 제외)
+    """
+    items_total = 0
+    item_count = 0
+    for dg in order.get("deliveryGroupList", []) or []:
+        for p in dg.get("productList", []) or []:
+            qty = int(p.get("quantity") or 0)
+            cancelled = int(p.get("cancelQuantity") or 0)
+            effective = max(0, qty - cancelled)
+            if effective <= 0:
+                continue
+            unit = int(
+                p.get("discountedUnitPrice")
+                or p.get("combinedUnitPrice")
+                or p.get("unitPrice")
+                or 0
+            )
+            items_total += unit * effective
+            item_count += 1
+    shipping = 0
+    for br in order.get("bundleReceiptList", []) or []:
+        shipping += int(br.get("shippingFee") or 0)
+        shipping += int(br.get("remoteAreaShippingFee") or 0)
+    return items_total + shipping, item_count
+
+
+def _coupang_order_status(order: dict) -> str:
+    if order.get("allCanceled"):
+        return "주문취소"
+    # productList 의 cancel/return 플래그로 부분 상태 판단
+    has_returned = False
+    has_cancelled = False
+    has_active = False
+    for dg in order.get("deliveryGroupList", []) or []:
+        for p in dg.get("productList", []) or []:
+            if p.get("returnReceipted"):
+                has_returned = True
+            if p.get("partialCanceled") or p.get("cancelQuantity"):
+                has_cancelled = True
+            qty = int(p.get("quantity") or 0)
+            cancelled = int(p.get("cancelQuantity") or 0)
+            if qty - cancelled > 0:
+                has_active = True
+    if has_returned:
+        return "반품"
+    if has_cancelled and not has_active:
+        return "취소완료"
+    if has_cancelled and has_active:
+        return "부분취소"
+    # delivered date 가 있으면 배송완료
+    for dg in order.get("deliveryGroupList", []) or []:
+        if dg.get("deliveredDate"):
+            return "배송완료"
+    return "결제완료"
 
 
 def _parse_coupang_order_detail(text: str) -> dict:
@@ -767,23 +866,133 @@ def _navigate_coupang_to_page(page, page_no: int, progress: CrawlerProgress) -> 
     page_index = max(0, page_no - 1)
     new_url = f"{base}?pageIndex={page_index}"
     try:
+        # SSR 이라 domcontentloaded 시점에 NEXT_DATA 는 이미 HTML 안에 있음 → 추가 대기 불필요
         page.goto(new_url, wait_until="domcontentloaded", timeout=20_000)
         progress.on_log(f"  pageIndex={page_index} (앱 페이지 {page_no}) 이동")
-        time.sleep(0.5)
         return True
     except Exception as exc:  # noqa: BLE001
         progress.on_log(f"  pageIndex={page_index} 이동 실패: {exc}")
         return False
 
 
-def _extract_coupang_orders(page, progress: CrawlerProgress) -> List[PurchaseRecord]:
-    """쿠팡 주문페이지 본문에서 PurchaseRecord 추출.
+def _extract_coupang_orders_from_next_data(
+    page,
+    progress: CrawlerProgress,
+) -> tuple[List[PurchaseRecord], List[PurchaseOrder], dict]:
+    """__NEXT_DATA__ 의 orderList 에서 PurchaseRecord(품목) + PurchaseOrder(주문) 추출.
 
-    DOM 구조 (sc-XXX 클래스 hash 동적이라 텍스트 기반 파싱):
-    - 주문 wrapper: 텍스트 "YYYY. M. D 주문" 으로 시작하는 div
-    - 그 안 tbody tr 가 상품 1개씩
-    - tr inner_text: 배송상태\\n도착일\\n상품명\\n금액원\\n수량개\\n버튼들
+    품목 합산이 아니라 주문 단위 결제 합계를 정확히 계산하므로 카드 매칭이 1:1 가능.
+    반환: (records, orders, pagination_info)
     """
+    records: List[PurchaseRecord] = []
+    orders_out: List[PurchaseOrder] = []
+    pagination: dict = {}
+    now = datetime.now()
+
+    data = _extract_coupang_next_data(page)
+    if not data:
+        progress.on_log("  __NEXT_DATA__ 추출 실패 (구조 변경 가능성)")
+        return records, orders_out, pagination
+
+    pagination = _coupang_pagination_from_next_data(data)
+    order_list = _coupang_orderlist_from_next_data(data)
+    if not order_list:
+        progress.on_log("  __NEXT_DATA__.orderList 비어있음")
+        return records, orders_out, pagination
+
+    progress.on_log(f"  __NEXT_DATA__ orderList: {len(order_list)} 주문")
+
+    for o in order_list:
+        order_id = str(o.get("orderId") or "").strip()
+        if not order_id:
+            continue
+        ts_ms = int(o.get("orderedAt") or 0)
+        order_date: Optional[str] = None
+        if ts_ms:
+            try:
+                order_date = datetime.fromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d")
+            except Exception:  # noqa: BLE001
+                pass
+
+        payment_total, item_count = _compute_coupang_payment(o)
+        status = _coupang_order_status(o)
+
+        # 주문(결제) 단위 record
+        title = str(o.get("title") or "")
+        orders_out.append(PurchaseOrder(
+            channel="coupang",
+            order_no=order_id,
+            order_date=order_date,
+            payment_total=payment_total if payment_total > 0 else None,
+            item_count=item_count,
+            status=status,
+            payment_method=None,  # NEXT_DATA 에는 안 들어있음
+            source_url=f"https://mc.coupang.com/ssr/desktop/order/detail?orderId={order_id}",
+            raw_text=title[:500],
+            imported_at=now,
+        ))
+
+        # 품목 단위 records (기존 호환성) — source_url 에 상품 페이지 URL 저장
+        for dg in o.get("deliveryGroupList", []) or []:
+            for p in dg.get("productList", []) or []:
+                qty = int(p.get("quantity") or 0)
+                cancelled = int(p.get("cancelQuantity") or 0)
+                effective = max(0, qty - cancelled)
+                if effective <= 0 and not p.get("allCanceled"):
+                    continue
+                unit = int(
+                    p.get("discountedUnitPrice")
+                    or p.get("combinedUnitPrice")
+                    or p.get("unitPrice")
+                    or 0
+                )
+                line_amount = unit * (effective if effective > 0 else qty)
+                pname = (p.get("vendorItemName") or p.get("productName") or "").strip()
+                line_status = status
+                if p.get("allCanceled") or (cancelled and effective == 0):
+                    line_status = "취소완료"
+                    line_amount = -abs(line_amount)
+                product_id = p.get("productId")
+                vendor_item_id = p.get("vendorItemId")
+                if product_id and vendor_item_id:
+                    product_url = (
+                        f"https://www.coupang.com/vp/products/{product_id}"
+                        f"?vendorItemId={vendor_item_id}"
+                    )
+                elif vendor_item_id:
+                    product_url = (
+                        f"https://www.coupang.com/vp/products/0"
+                        f"?vendorItemId={vendor_item_id}"
+                    )
+                else:
+                    product_url = _COUPANG_ORDER_URL
+                records.append(PurchaseRecord(
+                    id=None,
+                    channel="coupang",
+                    order_date=order_date,
+                    order_no=order_id,
+                    title=f"[{line_status}] {pname}"[:120] if pname else f"[{line_status}] 쿠팡 주문",
+                    amount=line_amount,
+                    payment_method=None,
+                    source_url=product_url,
+                    raw_text=f"orderId={order_id}|productId={product_id}|vendorItemId={vendor_item_id}|{pname}"[:500],
+                    imported_at=now,
+                ))
+
+    return records, orders_out, pagination
+
+
+def _extract_coupang_orders(page, progress: CrawlerProgress) -> List[PurchaseRecord]:
+    """레거시 — 기존 호출자 호환. 내부적으로 NEXT_DATA 우선, 실패시 텍스트 fallback."""
+    records, _orders, _pg = _extract_coupang_orders_from_next_data(page, progress)
+    if records:
+        return records
+    progress.on_log("  NEXT_DATA fallback → 본문 텍스트 파싱")
+    return _extract_coupang_orders_text_fallback(page, progress)
+
+
+def _extract_coupang_orders_text_fallback(page, progress: CrawlerProgress) -> List[PurchaseRecord]:
+    """본문 텍스트 기반 추출 (NEXT_DATA 가 없을 때만)."""
     records: List[PurchaseRecord] = []
     now = datetime.now()
 

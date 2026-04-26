@@ -147,6 +147,14 @@ class PurchaseHistoryTab(QWidget):
         self.reload_btn = QPushButton("\uc0c8\ub85c\uace0\uce68")
         self.reload_btn.clicked.connect(self.reload)
 
+        # \ucfe0\ud321 \uce90\uc2dc \ucd08\uae30\ud654 (\uad6c\ubc84\uc804 \ud06c\ub864\ub7ec\ub85c \uc800\uc7a5\ub41c \ub354\ub7ec\uc6b4 row \uc81c\uac70 \ud6c4 \uc7ac\uc218\uc9d1)
+        self.cleanup_coupang_btn = QPushButton("\ud83e\uddf9 \ucfe0\ud321 \uce90\uc2dc \ucd08\uae30\ud654")
+        self.cleanup_coupang_btn.setToolTip(
+            "\ucfe0\ud321 \uad6c\ub9e4\ub0b4\uc5ed/\uc8fc\ubb38\uc744 \ubaa8\ub450 \uc0ad\uc81c. \ub2e4\uc74c \uc790\ub3d9\uc218\uc9d1\uc5d0\uc11c \uae68\ub057\ud558\uac8c \uc7ac\uad6c\ucd95.\n"
+            "\uc8fc\ubb38\ubc88\ud638\uac00 NULL \uc778 \uc61b\ub0a0 \ub370\uc774\ud130/\uc911\ubcf5 row \uc815\ub9ac\uc6a9."
+        )
+        self.cleanup_coupang_btn.clicked.connect(self._cleanup_coupang)
+
         # \ud30c\uc774 \uc77c\uad04 \uc5c5\ub85c\ub4dc (\uae30\uc874 \ub85c\uceec \ub370\uc774\ud130\ub97c Pi \uc5d0 \ud478\uc2dc)
         self.pi_sync_btn = QPushButton("\u2601 \ud30c\uc774 \uc77c\uad04 \uc5c5\ub85c\ub4dc")
         self.pi_sync_btn.setToolTip(
@@ -165,6 +173,7 @@ class PurchaseHistoryTab(QWidget):
         top.addWidget(self.import_btn)
         top.addWidget(self.clipboard_btn)
         top.addWidget(self.reload_btn)
+        top.addWidget(self.cleanup_coupang_btn)
         top.addWidget(self.pi_sync_btn)
         top.addStretch(1)
 
@@ -205,6 +214,8 @@ class PurchaseHistoryTab(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSortingEnabled(True)
         self.table.horizontalHeader().setStretchLastSection(True)
+        # 상품명/내역 셀 더블클릭 → 상품 페이지로 이동
+        self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
 
         layout.addLayout(top)
         layout.addLayout(auto_row)
@@ -285,6 +296,32 @@ class PurchaseHistoryTab(QWidget):
         amount = int(record.amount or 0)
         return -amount if cls._is_cancelled(record) else amount
 
+    def _cleanup_coupang(self) -> None:
+        """쿠팡 구매내역 + 주문 전체 삭제 (재수집용)."""
+        ans = QMessageBox.question(
+            self, "쿠팡 캐시 초기화",
+            "쿠팡 구매내역과 주문 데이터를 모두 삭제할까요?\n"
+            "(다음 자동수집에서 깨끗하게 재구축됩니다.\n"
+            "라즈베리파이 DB 는 그대로 유지되며, 재수집 후 다시 동기화됩니다.)",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+        try:
+            n_recs = self.store.delete_records("coupang")
+            n_orders = self.store.delete_orders("coupang")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "쿠팡 캐시 초기화 실패", str(exc))
+            return
+        self.status.setText(f"✓ 쿠팡 캐시 삭제: 구매내역 {n_recs}건 / 주문 {n_orders}개")
+        self.reload()
+        QMessageBox.information(
+            self, "쿠팡 캐시 초기화 완료",
+            f"구매내역 {n_recs}건, 주문 {n_orders}개 삭제됨.\n"
+            "이제 '쿠팡 자동 수집' 을 다시 실행하세요.",
+        )
+
     def _pi_sync_all(self) -> None:
         """로컬 DB 의 모든 구매내역 + 주문을 Pi 로 일괄 업로드."""
         pi = self.store._pi
@@ -340,6 +377,18 @@ class PurchaseHistoryTab(QWidget):
         else:
             self.status.setText(f"{len(rows):,}\uac74 | {net:,}\uc6d0")
 
+    def _on_cell_double_clicked(self, row: int, col: int) -> None:
+        """상품/내역 컬럼 더블클릭 → 상품 페이지 열기."""
+        if col != 3:  # 상품/내역 컬럼만
+            return
+        item = self.table.item(row, col)
+        if item is None:
+            return
+        url = item.data(Qt.UserRole + 1)
+        if not url:
+            return
+        QDesktopServices.openUrl(QUrl(str(url)))
+
     def _render(self, rows: List[PurchaseRecord]) -> None:
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(rows))
@@ -374,7 +423,15 @@ class PurchaseHistoryTab(QWidget):
                         item.setForeground(red_brush if col_idx == 3 else gray_brush)
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 if col_idx == 3:
-                    item.setToolTip(record.raw_text[:1000])
+                    # 상품 페이지 URL 을 cell 에 임베드 → 더블클릭 시 사용 (색상은 기본 유지)
+                    if record.source_url and record.source_url != self.ORDER_URLS.get(record.channel, ""):
+                        item.setData(Qt.UserRole + 1, record.source_url)
+                        item.setToolTip(
+                            (record.raw_text[:800] if record.raw_text else "")
+                            + f"\n\n📎 더블클릭 → {record.source_url}"
+                        )
+                    else:
+                        item.setToolTip(record.raw_text[:1000] if record.raw_text else "")
                 self.table.setItem(row_idx, col_idx, item)
         self.table.resizeColumnsToContents()
         self.table.setSortingEnabled(True)

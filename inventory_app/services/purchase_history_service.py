@@ -259,14 +259,21 @@ class PurchaseHistoryStore:
 
     @staticmethod
     def _fingerprint(record: PurchaseRecord) -> str:
+        """안정된 fingerprint — raw_text 제외.
+
+        raw_text 는 크롤러 버전마다 포맷이 바뀌므로 fingerprint 에서 제외.
+        같은 주문/같은 상품이면 channel+order_date+order_no+title+amount 가 동일하므로
+        중복 INSERT 안 됨.
+        """
+        # title 의 status prefix '[배송완료]' 등은 시간이 지나면 바뀔 수 있어 제거
+        clean_title = re.sub(r"^\s*\[[^\]]+\]\s*", "", str(record.title or "")).strip()
         joined = "\x1f".join(
             [
                 record.channel,
                 record.order_date or "",
                 record.order_no or "",
-                record.title,
+                clean_title[:200],
                 str(record.amount or ""),
-                record.raw_text[:500],
             ]
         )
         return hashlib.sha1(joined.encode("utf-8")).hexdigest()
@@ -314,6 +321,27 @@ class PurchaseHistoryStore:
             except Exception:  # noqa: BLE001
                 pass
         return inserted
+
+    def delete_records(self, channel: str, *, only_missing_order_no: bool = False) -> int:
+        """채널의 구매내역 삭제. 신규/잘못된 데이터 정리용."""
+        clauses = ["channel = ?"]
+        params: list = [channel]
+        if only_missing_order_no:
+            clauses.append("(order_no IS NULL OR order_no = '')")
+        where = " AND ".join(clauses)
+        with self._guard, self._connection() as conn:
+            before = conn.total_changes
+            conn.execute(f"DELETE FROM purchase_records WHERE {where}", params)
+            conn.commit()
+            return conn.total_changes - before
+
+    def delete_orders(self, channel: str) -> int:
+        """채널의 주문 단위 데이터 삭제."""
+        with self._guard, self._connection() as conn:
+            before = conn.total_changes
+            conn.execute("DELETE FROM purchase_orders WHERE channel = ?", (channel,))
+            conn.commit()
+            return conn.total_changes - before
 
     # ── 주문 단위 (카드 매칭용) ──
 
