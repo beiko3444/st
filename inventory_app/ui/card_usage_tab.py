@@ -507,13 +507,14 @@ class CardUsageTab(QWidget):
             cards_row.addWidget(c, 1)
         layout.addLayout(cards_row)
 
-        # ===== 상태 배너 (메시지 있을 때만 표시) =====
-        self.status_banner = QLabel("바로빌 동기화를 눌러 데이터를 가져오세요.")
+        # ===== 상태 배너 (에러/경고/진행중일 때만 표시) =====
+        self.status_banner = QLabel("")
         self.status_banner.setStyleSheet(
             "QLabel { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; "
             "padding: 6px 10px; color: #166534; font-size: 11px; }"
         )
         self.status_banner.setMinimumHeight(28)
+        self.status_banner.setVisible(False)
         layout.addWidget(self.status_banner)
 
         # ===== 카테고리 칩 =====
@@ -692,9 +693,10 @@ class CardUsageTab(QWidget):
                 f"⚠ 바로빌 설정 누락: {miss}. credentials.json 의 barobill 섹션을 확인하세요."
             )
             self.status_banner.setStyleSheet(
-                "QLabel { background: #fef3c7; border: 1px solid #fde68a; border-radius: 8px; "
-                "padding: 10px 14px; color: #92400e; font-size: 12px; }"
+                "QLabel { background: #fef3c7; border: 1px solid #fde68a; border-radius: 6px; "
+                "padding: 6px 10px; color: #92400e; font-size: 11px; }"
             )
+            self.status_banner.setVisible(True)
 
     # ----- helpers -----
 
@@ -927,9 +929,10 @@ class CardUsageTab(QWidget):
 
         self.status_banner.setText(f"🔄 조회 중... ({start} ~ {end})")
         self.status_banner.setStyleSheet(
-            "QLabel { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; "
-            "padding: 10px 14px; color: #1e40af; font-size: 12px; }"
+            "QLabel { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; "
+            "padding: 6px 10px; color: #1e40af; font-size: 11px; }"
         )
+        self.status_banner.setVisible(True)
         self._set_busy(True)
         QApplication.processEvents()  # 상태 메시지 즉시 표시
 
@@ -943,18 +946,20 @@ class CardUsageTab(QWidget):
             self.refresh_chk.setChecked(False)
             self.status_banner.setText(f"❌ [{exc.code or ''}] {exc}")
             self.status_banner.setStyleSheet(
-                "QLabel { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; "
-                "padding: 10px 14px; color: #991b1b; font-size: 12px; }"
+                "QLabel { background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; "
+                "padding: 6px 10px; color: #991b1b; font-size: 11px; }"
             )
+            self.status_banner.setVisible(True)
             return
         except Exception as exc:  # noqa: BLE001
             self._set_busy(False)
             self.refresh_chk.setChecked(False)
             self.status_banner.setText(f"❌ {exc}")
             self.status_banner.setStyleSheet(
-                "QLabel { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; "
-                "padding: 10px 14px; color: #991b1b; font-size: 12px; }"
+                "QLabel { background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; "
+                "padding: 6px 10px; color: #991b1b; font-size: 11px; }"
             )
+            self.status_banner.setVisible(True)
             return
 
         self._set_busy(False)
@@ -978,16 +983,8 @@ class CardUsageTab(QWidget):
             f"최근 동기화: {self._last_synced_at.strftime('%Y. %m. %d. %p %I:%M')}"
         )
 
-        confirmed = sum(1 for it in logs if (it.amount or 0) != 0)
-        empty = len(logs) - confirmed
-        self.status_banner.setText(
-            f"● 동기화 완료 · 조회 {len(logs)}건 / 저장 {len(logs)}건 · "
-            f"금액확인 {confirmed}건 / 금액없음 {empty}건"
-        )
-        self.status_banner.setStyleSheet(
-            "QLabel { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; "
-            "padding: 10px 14px; color: #166534; font-size: 12px; }"
-        )
+        # 성공 시 배너 숨김 (요약카드/last_sync_label 로 충분)
+        self.status_banner.setVisible(False)
 
         try:
             self._refresh_summary_cards()
