@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
 
 from inventory_app.config import AppConfig
 from inventory_app.models import ChannelProduct
+from inventory_app.ui.card_usage_tab import CardUsageTab
 from inventory_app.ui.fassto_tab import FasstoTab
 from inventory_app.ui.product_master_tab import ProductMasterTab
 from inventory_app.ui.purchase_history_tab import PurchaseHistoryTab
@@ -3814,6 +3815,7 @@ class MainWindow(QMainWindow):
             default_days=sales_days,
         )
         self.purchase_history_tab = PurchaseHistoryTab()
+        self.card_usage_tab = CardUsageTab(config)
         self.fassto_tab = FasstoTab(config)
 
         self._build_ui()
@@ -3907,6 +3909,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.revenue_tab, "매출비교")
         self.tabs.addTab(self.keyword_tab, "키워드매출")
         self.tabs.addTab(self.purchase_history_tab, "구매내역")
+        self.tabs.addTab(self.card_usage_tab, "카드사용내역")
         self.tabs.addTab(self.fassto_tab, "파스토")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         corner = QWidget()
@@ -4269,4 +4272,5 @@ class MainWindow(QMainWindow):
         self.revenue_tab.shutdown()
         self.keyword_tab.shutdown()
         self.purchase_history_tab.shutdown()
+        self.card_usage_tab.shutdown()
         super().closeEvent(event)

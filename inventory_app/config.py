@@ -29,6 +29,12 @@ class AppConfig:
     fassto_api_cd: str = ""
     fassto_api_key: str = ""
     fassto_cst_cd: str = ""
+    card_api_base_url: str = ""              # 외부 card-api-service base URL (옵션)
+    card_api_service_token: str = ""         # Bearer token (디자인 §6)
+    barobill_certkey: str = ""               # 바로빌 SOAP CERTKEY
+    barobill_corp_num: str = ""              # 사업자번호 ('-' 제거)
+    barobill_user_id: str = ""               # 바로빌 계정 ID
+    barobill_use_test: bool = False          # 테스트 서버 사용 여부
 
 
 def _get(config: Dict[str, Any], *keys: str) -> Any:
@@ -134,4 +140,10 @@ def load_config(path: Path | None = None) -> AppConfig:
         fassto_api_cd=str(_get_optional(raw, "", "fassto", "api_cd")),
         fassto_api_key=str(_get_optional(raw, "", "fassto", "api_key")),
         fassto_cst_cd=str(_get_optional(raw, "", "fassto", "cst_cd")),
+        card_api_base_url=str(_get_optional(raw, "", "card_api", "base_url")).strip(),
+        card_api_service_token=str(_get_optional(raw, "", "card_api", "service_token")).strip(),
+        barobill_certkey=str(_get_optional(raw, "", "barobill", "certkey")).strip(),
+        barobill_corp_num=str(_get_optional(raw, "", "barobill", "corp_num")).strip(),
+        barobill_user_id=str(_get_optional(raw, "", "barobill", "id")).strip(),
+        barobill_use_test=bool(_get_optional(raw, False, "barobill", "use_test")),
     )
