@@ -147,6 +147,17 @@ class PurchaseHistoryTab(QWidget):
         self.reload_btn = QPushButton("\uc0c8\ub85c\uace0\uce68")
         self.reload_btn.clicked.connect(self.reload)
 
+        # \ud30c\uc774 \uc77c\uad04 \uc5c5\ub85c\ub4dc (\uae30\uc874 \ub85c\uceec \ub370\uc774\ud130\ub97c Pi \uc5d0 \ud478\uc2dc)
+        self.pi_sync_btn = QPushButton("\u2601 \ud30c\uc774 \uc77c\uad04 \uc5c5\ub85c\ub4dc")
+        self.pi_sync_btn.setToolTip(
+            "\ub85c\uceec DB \uc758 \ubaa8\ub4e0 \uad6c\ub9e4\ub0b4\uc5ed\uacfc \uc8fc\ubb38\uc744 \ub77c\uc988\ubca0\ub9ac\ud30c\uc774 DB \ub85c \uc5c5\ub85c\ub4dc.\n"
+            "(\uc774\ubbf8 \uc788\ub294 \uac74 \ub77c\uc988\ubca0\ub9ac \uce21\uc5d0\uc11c fingerprint/order_no \ub85c \uc911\ubcf5 \ubb34\uc2dc.)"
+        )
+        self.pi_sync_btn.clicked.connect(self._pi_sync_all)
+        if self.store._pi is None or not getattr(self.store._pi, "is_configured", False):
+            self.pi_sync_btn.setEnabled(False)
+            self.pi_sync_btn.setToolTip("monitor_url \ubbf8\uc124\uc815 \u2014 credentials.json \uc758 monitor \uc139\uc158 \ud655\uc778")
+
         top.addWidget(QLabel("\ucc44\ub110"))
         top.addWidget(self.channel_combo)
         top.addWidget(self.open_naver_btn)
@@ -154,6 +165,7 @@ class PurchaseHistoryTab(QWidget):
         top.addWidget(self.import_btn)
         top.addWidget(self.clipboard_btn)
         top.addWidget(self.reload_btn)
+        top.addWidget(self.pi_sync_btn)
         top.addStretch(1)
 
         auto_row = QHBoxLayout()
@@ -272,6 +284,49 @@ class PurchaseHistoryTab(QWidget):
     def _signed_amount(cls, record: PurchaseRecord) -> int:
         amount = int(record.amount or 0)
         return -amount if cls._is_cancelled(record) else amount
+
+    def _pi_sync_all(self) -> None:
+        """로컬 DB 의 모든 구매내역 + 주문을 Pi 로 일괄 업로드."""
+        pi = self.store._pi
+        if pi is None or not getattr(pi, "is_configured", False):
+            QMessageBox.warning(
+                self, "파이 동기화 불가",
+                "monitor_url 이 설정돼 있지 않습니다. credentials.json 의 monitor 섹션을 확인하세요.",
+            )
+            return
+
+        self.pi_sync_btn.setEnabled(False)
+        self.status.setText("파이 업로드 중... (잠시 대기)")
+        QApplication.processEvents()
+
+        result_lines: list[str] = []
+        try:
+            # 1) 구매내역 (records)
+            recs = self.store.load_records(channel="all", limit=20000)
+            if recs:
+                inserted = pi.upload_purchase_records(recs, self.store._fingerprint)
+                result_lines.append(f"구매내역 {len(recs)}건 전송 → 신규 {inserted}건")
+            else:
+                result_lines.append("구매내역: 로컬에 데이터 없음")
+
+            # 2) 주문 단위 (orders)
+            orders = self.store.load_orders(channel="all", limit=20000)
+            if orders:
+                changed = pi.upload_purchase_orders(orders)
+                result_lines.append(f"주문 {len(orders)}개 전송 → 변경 {changed}건")
+            else:
+                result_lines.append("주문: 로컬에 데이터 없음 (쿠팡 자동수집 시 자동 채워짐)")
+
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "파이 업로드 실패", str(exc))
+            self.status.setText(f"파이 업로드 실패: {exc}")
+            self.pi_sync_btn.setEnabled(True)
+            return
+
+        self.pi_sync_btn.setEnabled(True)
+        msg = "✓ 파이 업로드 완료\n" + "\n".join(result_lines)
+        self.status.setText(msg.replace("\n", " · "))
+        QMessageBox.information(self, "파이 업로드 결과", msg)
 
     def reload(self) -> None:
         channel = self._selected_channel()
