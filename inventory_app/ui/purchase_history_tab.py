@@ -200,9 +200,23 @@ class _OrderDetailDialog(QDialog):
         h.setSectionResizeMode(1, QHeaderView.Stretch)
         h.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        items_table.setRowCount(len(items))
+        from PySide6.QtGui import QBrush as _QB, QColor as _QC
+        # rows + 합계 row
+        rowcount_with_sum = len(items) + 1 if items else 1
+        items_table.setRowCount(rowcount_with_sum)
+        sum_amount = 0
+        sum_positive = 0
+        sum_negative = 0
+        any_payment_method = ""
         for r, rec in enumerate(items):
             ramt = int(rec.amount or 0)
+            sum_amount += ramt
+            if ramt >= 0:
+                sum_positive += ramt
+            else:
+                sum_negative += ramt
+            if not any_payment_method and rec.payment_method:
+                any_payment_method = rec.payment_method
             cancelled = ramt < 0
             d_item = QTableWidgetItem(rec.order_date or "")
             t_item = QTableWidgetItem((rec.title or "").strip())
@@ -212,17 +226,38 @@ class _OrderDetailDialog(QDialog):
             af = QFont(); af.setBold(True); a_item.setFont(af)
             pm_item = QTableWidgetItem(rec.payment_method or "-")
             if cancelled:
-                from PySide6.QtGui import QBrush as _QB, QColor as _QC
                 a_item.setForeground(_QB(_QC("#dc2626")))
                 t_item.setForeground(_QB(_QC("#dc2626")))
             items_table.setItem(r, 0, d_item)
             items_table.setItem(r, 1, t_item)
             items_table.setItem(r, 2, a_item)
             items_table.setItem(r, 3, pm_item)
-        if not items:
-            items_table.setRowCount(1)
+        if items:
+            sum_row = len(items)
+            sum_bg = _QB(_QC("#f1f5f9"))
+            sum_label_text = f"합계 ({len(items)}건"
+            if sum_negative != 0:
+                sum_label_text += f", 취소 {sum_negative:,}원 포함"
+            sum_label_text += ")"
+            sl_item = QTableWidgetItem(sum_label_text)
+            sl_item.setBackground(sum_bg)
+            slf = QFont(); slf.setBold(True); sl_item.setFont(slf)
+            sl_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            empty_item = QTableWidgetItem("")
+            empty_item.setBackground(sum_bg)
+            sa_item = QTableWidgetItem(f"{sum_amount:,}원")
+            sa_item.setBackground(sum_bg)
+            sa_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            sf = QFont(); sf.setBold(True); sf.setPointSize(12); sa_item.setFont(sf)
+            sa_item.setForeground(_QB(_QC("#0f172a")))
+            spm_item = QTableWidgetItem(any_payment_method or "")
+            spm_item.setBackground(sum_bg)
+            items_table.setItem(sum_row, 0, empty_item)
+            items_table.setItem(sum_row, 1, sl_item)
+            items_table.setItem(sum_row, 2, sa_item)
+            items_table.setItem(sum_row, 3, spm_item)
+        else:
             ph = QTableWidgetItem("(품목 데이터 없음 — 자동수집 필요)")
-            from PySide6.QtGui import QBrush as _QB, QColor as _QC
             ph.setForeground(_QB(_QC("#94a3b8")))
             items_table.setSpan(0, 0, 1, 4)
             items_table.setItem(0, 0, ph)
@@ -257,6 +292,7 @@ class _CrawlerWorker(QObject):
         reset_session: bool,
         coupang_email: str = "",
         coupang_password: str = "",
+        login_only: bool = False,
     ) -> None:
         super().__init__()
         self.channel = channel
@@ -265,6 +301,7 @@ class _CrawlerWorker(QObject):
         self.reset_session = reset_session
         self.coupang_email = coupang_email
         self.coupang_password = coupang_password
+        self.login_only = login_only
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -286,6 +323,7 @@ class _CrawlerWorker(QObject):
                 progress=progress,
                 coupang_email=self.coupang_email,
                 coupang_password=self.coupang_password,
+                login_only=self.login_only,
             )
         except PlaywrightUnavailable as exc:
             result = CrawlResult(channel=self.channel, records=[], error=str(exc))
@@ -504,6 +542,17 @@ class PurchaseHistoryTab(QWidget):
         return channel if channel in {"naver", "coupang"} else "naver"
 
     def _open_order_page(self, channel: str) -> None:
+        # 쿠팡: 선택된 계정이 있으면 자동로그인 후 주문 페이지 진입까지 자동화
+        if channel == "coupang":
+            account = self._selected_account()
+            if account is not None:
+                if self._worker_thread is not None and self._worker_thread.isRunning():
+                    QMessageBox.information(
+                        self, "안내", "이미 작업이 진행 중입니다.",
+                    )
+                    return
+                self._start_auto_crawl("coupang", login_only=True)
+                return
         url = self.ORDER_URLS.get(channel)
         if url:
             QDesktopServices.openUrl(QUrl(url))

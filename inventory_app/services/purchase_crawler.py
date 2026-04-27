@@ -222,6 +222,7 @@ def crawl_channel(
     progress: Optional[CrawlerProgress] = None,
     coupang_email: str = "",
     coupang_password: str = "",
+    login_only: bool = False,
 ) -> CrawlResult:
     progress = progress or CrawlerProgress()
     channel = channel.lower().strip()
@@ -237,6 +238,7 @@ def crawl_channel(
             progress=progress,
             email=coupang_email,
             password=coupang_password,
+            login_only=login_only,
         )
 
     if reset_session:
@@ -565,6 +567,7 @@ def _crawl_coupang_via_cdp(
     progress: CrawlerProgress,
     email: str = "",
     password: str = "",
+    login_only: bool = False,
 ) -> CrawlResult:
     """쿠팡 전용 CDP attach 방식.
 
@@ -712,6 +715,11 @@ def _crawl_coupang_via_cdp(
                     error="주문 페이지에 도달하지 못했습니다 (시간 초과 또는 차단).",
                 )
 
+            # login_only 모드: 로그인 + 주문 페이지 도달 후 즉시 종료 (Chrome 은 그대로 살림)
+            if login_only:
+                progress.on_log("로그인/주문 페이지 진입 완료 — 사용자 직접 탐색 모드")
+                return CrawlResult(channel="coupang", records=[], error=None)
+
             # 데이터 추출 — 1 ~ max_pages 페이지 순회
             # NEXT_DATA 는 SSR HTML 에 이미 들어있으므로 networkidle 대기 불필요
 
@@ -793,11 +801,47 @@ def _crawl_coupang_via_cdp(
                         progress.on_log("주문 0건 → 마지막 페이지로 간주")
                         break
 
-            # __NEXT_DATA__ 가 모든 정보를 담고 있어 주문 상세 페이지 추가 호출 불필요
             paid_count = sum(1 for o in orders if o.payment_total is not None)
             progress.on_log(
                 f"주문 추출 완료: 총 {len(orders)}개 (결제금 확정 {paid_count}개)"
             )
+
+            # 보충 패스: payment_method / cash_used 는 NEXT_DATA 에 없으므로
+            # 디테일 페이지를 방문해 추출. 시간 절약을 위해 최대 30개로 제한.
+            need_detail = [
+                o for o in orders
+                if (o.payment_method is None or (o.cash_used in (None, 0)))
+                and o.source_url
+            ][:30]
+            if need_detail:
+                progress.on_log(f"디테일 페이지 보충 {len(need_detail)}개 조회 시작...")
+                detail_orders = _crawl_coupang_order_details(
+                    target_page,
+                    [o.source_url for o in need_detail],
+                    progress,
+                    max_details=len(need_detail),
+                )
+                detail_by_no = {o.order_no: o for o in detail_orders if o.order_no}
+                merged = 0
+                for o in orders:
+                    d = detail_by_no.get(o.order_no)
+                    if d is None:
+                        continue
+                    if o.payment_method is None and d.payment_method:
+                        o.payment_method = d.payment_method
+                        merged += 1
+                    if (o.cash_used in (None, 0)) and d.cash_used:
+                        o.cash_used = d.cash_used
+                        # card_amount 재계산
+                        if o.payment_total is not None:
+                            o.card_amount = max(0, int(o.payment_total) - int(d.cash_used))
+                        merged += 1
+                progress.on_log(f"보충 완료: {merged}개 필드 갱신")
+                # records 에도 payment_method 전파
+                pm_by_order = {o.order_no: o.payment_method for o in orders if o.payment_method}
+                for rec in records:
+                    if rec.payment_method is None and rec.order_no in pm_by_order:
+                        rec.payment_method = pm_by_order[rec.order_no]
 
     except Exception as exc:  # noqa: BLE001
         progress.on_log(f"오류: {exc}")
@@ -833,6 +877,10 @@ _COUPANG_PAYMENT_TOTAL_RE = re.compile(
 _COUPANG_PAYMENT_METHOD_RE = re.compile(
     r"(신용카드|체크카드|쿠페이머니|쿠페이|간편결제|계좌이체|토스페이|카카오페이|페이코)"
     r"(?:\s*\(?([0-9*\-]{4,})\)?)?"
+)
+# 캐시/포인트/적립금/쿠폰 등 차감 합산 (디테일 페이지 텍스트)
+_COUPANG_CASH_RE = re.compile(
+    r"(쿠팡캐시|쿠페이캐시|적립금|쿠폰\s*할인|포인트|즉시\s*할인)\s*[:\s]*[-−]?\s*([0-9][0-9,]+)\s*원"
 )
 
 
@@ -996,7 +1044,7 @@ def _coupang_order_status(order: dict) -> str:
 
 
 def _parse_coupang_order_detail(text: str) -> dict:
-    """주문 상세 페이지 본문 텍스트에서 order_no / payment_total / status 추출."""
+    """주문 상세 페이지 본문 텍스트에서 order_no / payment_total / status / 캐시차감 추출."""
     info: dict = {}
     m = _COUPANG_ORDER_NO_RE.search(text or "")
     if m:
@@ -1012,6 +1060,15 @@ def _parse_coupang_order_detail(text: str) -> dict:
         method = m.group(1)
         last4 = m.group(2)
         info["payment_method"] = f"{method} {last4}".strip() if last4 else method
+    # 캐시/포인트/쿠폰 등 차감 합산
+    cash_total = 0
+    for cm in _COUPANG_CASH_RE.finditer(text or ""):
+        try:
+            cash_total += int(cm.group(2).replace(",", ""))
+        except (ValueError, IndexError):
+            pass
+    if cash_total > 0:
+        info["cash_used"] = cash_total
     # 주문일 (yyyy. M. d 주문)
     md = _COUPANG_DATE_RE.search(text or "")
     if md:
@@ -1061,17 +1118,24 @@ def _crawl_coupang_order_details(
             if not order_no:
                 progress.on_log(f"  detail {idx + 1}: 주문번호 추출 실패 ({url[:60]})")
                 continue
+            cash = info.get("cash_used")
+            pt = info.get("payment_total")
+            card_amt: Optional[int] = None
+            if pt is not None:
+                card_amt = max(0, int(pt) - int(cash or 0))
             order = PurchaseOrder(
                 channel="coupang",
                 order_no=str(order_no),
                 order_date=info.get("order_date"),
-                payment_total=info.get("payment_total"),
+                payment_total=pt,
                 item_count=0,  # 호출부에서 records 와 매핑 후 채움
                 status=info.get("status"),
                 payment_method=info.get("payment_method"),
                 source_url=url,
                 raw_text=(body or "")[:4000],
                 imported_at=now,
+                cash_used=int(cash) if cash else None,
+                card_amount=card_amt,
             )
             out.append(order)
             pt = order.payment_total

@@ -3350,6 +3350,7 @@ class SalesDailyTab(QWidget):
 
         self._sales_dates: dict[str, int] = {}
         self._highlighted_dates: set[str] = set()
+        self._last_master_refresh_ts: float = 0.0  # 30초 내 재조회는 스킵 (판매일보 속도)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -3370,8 +3371,27 @@ class SalesDailyTab(QWidget):
         left.addStretch(1)
         layout.addLayout(left, 0)
 
-        # 오른쪽: 마스터 단위 판매 집계 테이블
+        # 오른쪽: 매출 요약 카드 + 마스터 단위 판매 집계 테이블
         right = QVBoxLayout()
+        rev_row = QHBoxLayout()
+        rev_row.setSpacing(8)
+        self.rev_naver_label = QLabel("네이버 매출\n-")
+        self.rev_coupang_label = QLabel("쿠팡 매출\n-")
+        self.rev_total_label = QLabel("합산 매출\n-")
+        for w, color in (
+            (self.rev_naver_label, "#10b981"),
+            (self.rev_coupang_label, "#f97316"),
+            (self.rev_total_label, "#0f172a"),
+        ):
+            w.setAlignment(Qt.AlignCenter)
+            w.setMinimumHeight(48)
+            w.setStyleSheet(
+                f"QLabel {{ background: #ffffff; border: 1px solid #e2e8f0; "
+                f"border-radius: 8px; padding: 6px 10px; color: {color}; "
+                f"font-weight: 700; font-size: 12px; }}"
+            )
+            rev_row.addWidget(w, 1)
+        right.addLayout(rev_row)
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
             [
@@ -3563,12 +3583,15 @@ class SalesDailyTab(QWidget):
 
         sales = data.get("sales", [])
 
-        # 마스터/링크 로드 — 상품등록 탭과 동일하게 Pi 에서 최신 스냅샷 fetch.
-        # 실패 시 로컬 캐시 사용 + 요약 영역에 경고.
+        # 마스터/링크 로드 — 30초 내 재조회는 스킵해 판매일보 응답성 확보.
+        # (마스터/링크는 자주 변하지 않으므로 짧은 캐시로 충분)
         self._master_remote_warning = ""
-        if self.master_service.has_remote():
+        import time as _t
+        now_ts = _t.time()
+        if self.master_service.has_remote() and (now_ts - self._last_master_refresh_ts) > 30:
             try:
                 self.master_service.refresh_from_remote()
+                self._last_master_refresh_ts = now_ts
             except MasterRemoteError as exc:
                 self._master_remote_warning = (
                     f"Pi 마스터 동기화 실패 (로컬 캐시 사용): {exc}"
@@ -3579,6 +3602,28 @@ class SalesDailyTab(QWidget):
         except Exception:  # noqa: BLE001
             links = {}
             masters_by_id = {}
+
+        # 채널별 총매출 (마스터 연결 여부와 무관 — 모든 판매 이벤트 포함)
+        rev_naver = 0
+        rev_coupang = 0
+        for ev in sales:
+            if not isinstance(ev, dict):
+                continue
+            try:
+                ch = str(ev.get("channel") or "").strip().lower()
+                qty_v = int(ev.get("qty_sold") or 0)
+                price_v = int(ev.get("price") or 0)
+                rev_v = qty_v * price_v
+            except (TypeError, ValueError):
+                continue
+            if ch == "naver":
+                rev_naver += rev_v
+            elif ch == "coupang":
+                rev_coupang += rev_v
+        rev_total = rev_naver + rev_coupang
+        self.rev_naver_label.setText(f"네이버 매출\n₩{rev_naver:,}")
+        self.rev_coupang_label.setText(f"쿠팡 매출\n₩{rev_coupang:,}")
+        self.rev_total_label.setText(f"합산 매출\n₩{rev_total:,}")
 
         # 마스터별 집계 — 미연결 상품은 무시 (마스터 단위 판매일보)
         agg: dict[int, dict] = {}
@@ -3802,7 +3847,6 @@ class MainWindow(QMainWindow):
             timeout_seconds=config.timeout_seconds,
         )
         self.product_master_tab = ProductMasterTab(monitor_url=config.monitor_url)
-        self.inventory_tab = InventoryManagementTab()
         self.sales_daily_tab = SalesDailyTab(
             monitor_url=config.monitor_url,
             timeout=config.timeout_seconds,
@@ -3869,8 +3913,6 @@ class MainWindow(QMainWindow):
 
         self.naver_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.coupang_tab.sync_finished.connect(self._on_sub_sync_finished)
-        self.naver_tab.favorites_changed.connect(self._refresh_inventory_tab)
-        self.coupang_tab.favorites_changed.connect(self._refresh_inventory_tab)
         self.naver_tab.sync_finished.connect(self._on_channel_sync_finished_for_masters)
         self.coupang_tab.sync_finished.connect(self._on_channel_sync_finished_for_masters)
         self.naver_tab.masters_changed.connect(self._on_masters_changed)
@@ -3879,7 +3921,6 @@ class MainWindow(QMainWindow):
         self.revenue_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.keyword_tab.sync_finished.connect(self._on_sub_sync_finished)
         self._on_purchase_pi_done.connect(self._on_purchase_pi_finished, Qt.QueuedConnection)
-        self._refresh_inventory_tab()
         QTimer.singleShot(0, self._load_initial_visible_channel_tab)
         # 자동 동기화는 사용자가 요청할 때만 (F5 또는 동기화 버튼).
         # 시작 시에는 캐시만 표시하고 네트워크 호출 안 함.
@@ -3911,7 +3952,6 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.naver_tab, "네이버")
         self.tabs.addTab(self.coupang_tab, "쿠팡")
         self.tabs.addTab(self.product_master_tab, "상품등록")
-        self.tabs.addTab(self.inventory_tab, "재고관리")
         self.tabs.addTab(self.sales_daily_tab, "판매일보")
         self.tabs.addTab(self.revenue_tab, "매출비교")
         self.tabs.addTab(self.keyword_tab, "키워드매출")
@@ -4077,7 +4117,6 @@ class MainWindow(QMainWindow):
         for attr_name in (
             "naver_tab",
             "coupang_tab",
-            "inventory_tab",
             "revenue_tab",
             "keyword_tab",
             "sales_daily_tab",
@@ -4132,23 +4171,6 @@ class MainWindow(QMainWindow):
                 f"동기화 중: {in_progress} ... {percent}%" if in_progress
                 else f"동기화 진행 중... {percent}%"
             )
-
-    def _collect_favorite_inventory_rows(self) -> List[FavoriteInventoryRow]:
-        rows: List[FavoriteInventoryRow] = []
-        rows.extend(self.naver_tab.favorite_inventory_rows())
-        rows.extend(self.coupang_tab.favorite_inventory_rows())
-        rows.sort(
-            key=lambda row: (
-                row.stock is None,
-                int(row.stock or 0),
-                row.channel,
-                row.serial,
-            )
-        )
-        return rows
-
-    def _refresh_inventory_tab(self, *_args: object) -> None:
-        self.inventory_tab.set_rows(self._collect_favorite_inventory_rows())
 
     @Slot()
     def _check_pi_status(self) -> None:
@@ -4244,7 +4266,6 @@ class MainWindow(QMainWindow):
                 tab.refresh_master_links_from_external()
             except Exception:  # noqa: BLE001
                 pass
-        self._refresh_inventory_tab()
 
     @Slot(bool, int, int, str)
     def _on_purchase_pi_finished(self, ok: bool, rec_n: int, ord_n: int, err: str) -> None:
@@ -4308,7 +4329,6 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         self.naver_tab.shutdown()
         self.coupang_tab.shutdown()
-        self.inventory_tab.shutdown()
         self.sales_daily_tab.shutdown()
         self.revenue_tab.shutdown()
         self.keyword_tab.shutdown()
