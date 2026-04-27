@@ -197,6 +197,11 @@ class InventoryHistoryDB:
                 conn.execute("ALTER TABLE purchase_orders ADD COLUMN cash_used INTEGER")
             if "card_amount" not in order_cols:
                 conn.execute("ALTER TABLE purchase_orders ADD COLUMN card_amount INTEGER")
+            if "account_label" not in order_cols:
+                conn.execute("ALTER TABLE purchase_orders ADD COLUMN account_label TEXT")
+            rec_cols = {row[1] for row in conn.execute("PRAGMA table_info(purchase_records)").fetchall()}
+            if "account_label" not in rec_cols:
+                conn.execute("ALTER TABLE purchase_records ADD COLUMN account_label TEXT")
             # 카드사용내역
             conn.execute(
                 """
@@ -1117,6 +1122,7 @@ class InventoryHistoryDB:
                     str(r.get("raw_text") or ""),
                     fp,
                     str(r.get("imported_at") or datetime.now().isoformat()),
+                    r.get("account_label"),
                 )
             )
         if not rows:
@@ -1127,8 +1133,8 @@ class InventoryHistoryDB:
                 """
                 INSERT OR IGNORE INTO purchase_records
                     (channel, order_date, order_no, title, amount, payment_method,
-                     source_url, raw_text, fingerprint, imported_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     source_url, raw_text, fingerprint, imported_at, account_label)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -1156,6 +1162,7 @@ class InventoryHistoryDB:
                     str(o.get("imported_at") or datetime.now().isoformat()),
                     self._opt_int(o.get("cash_used")),
                     self._opt_int(o.get("card_amount")),
+                    o.get("account_label"),
                 )
             )
         if not rows:
@@ -1167,8 +1174,8 @@ class InventoryHistoryDB:
                 INSERT INTO purchase_orders (
                     channel, order_no, order_date, payment_total, item_count,
                     status, payment_method, source_url, raw_text, imported_at,
-                    cash_used, card_amount
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cash_used, card_amount, account_label
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(channel, order_no) DO UPDATE SET
                     order_date     = excluded.order_date,
                     payment_total  = COALESCE(excluded.payment_total, purchase_orders.payment_total),
@@ -1179,7 +1186,8 @@ class InventoryHistoryDB:
                     raw_text       = excluded.raw_text,
                     imported_at    = excluded.imported_at,
                     cash_used      = COALESCE(excluded.cash_used, purchase_orders.cash_used),
-                    card_amount    = COALESCE(excluded.card_amount, purchase_orders.card_amount)
+                    card_amount    = COALESCE(excluded.card_amount, purchase_orders.card_amount),
+                    account_label  = COALESCE(excluded.account_label, purchase_orders.account_label)
                 """,
                 rows,
             )
@@ -1198,7 +1206,7 @@ class InventoryHistoryDB:
                 f"""
                 SELECT channel, order_no, order_date, payment_total, item_count,
                        status, payment_method, source_url, raw_text, imported_at,
-                       cash_used, card_amount
+                       cash_used, card_amount, account_label
                 FROM purchase_orders
                 {where}
                 ORDER BY COALESCE(order_date, imported_at) DESC
@@ -1209,7 +1217,7 @@ class InventoryHistoryDB:
             cols = [
                 "channel", "order_no", "order_date", "payment_total", "item_count",
                 "status", "payment_method", "source_url", "raw_text", "imported_at",
-                "cash_used", "card_amount",
+                "cash_used", "card_amount", "account_label",
             ]
             return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
@@ -1224,7 +1232,7 @@ class InventoryHistoryDB:
             cursor = conn.execute(
                 f"""
                 SELECT id, channel, order_date, order_no, title, amount, payment_method,
-                       source_url, raw_text, fingerprint, imported_at
+                       source_url, raw_text, fingerprint, imported_at, account_label
                 FROM purchase_records
                 {where}
                 ORDER BY COALESCE(order_date, imported_at) DESC, id DESC
@@ -1235,6 +1243,7 @@ class InventoryHistoryDB:
             cols = [
                 "id", "channel", "order_date", "order_no", "title", "amount",
                 "payment_method", "source_url", "raw_text", "fingerprint", "imported_at",
+                "account_label",
             ]
             return [dict(zip(cols, row)) for row in cursor.fetchall()]
 

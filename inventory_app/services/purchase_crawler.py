@@ -223,6 +223,7 @@ def crawl_channel(
     coupang_email: str = "",
     coupang_password: str = "",
     login_only: bool = False,
+    account_label: str = "",
 ) -> CrawlResult:
     progress = progress or CrawlerProgress()
     channel = channel.lower().strip()
@@ -239,6 +240,7 @@ def crawl_channel(
             email=coupang_email,
             password=coupang_password,
             login_only=login_only,
+            account_label=account_label,
         )
 
     if reset_session:
@@ -568,6 +570,7 @@ def _crawl_coupang_via_cdp(
     email: str = "",
     password: str = "",
     login_only: bool = False,
+    account_label: str = "",
 ) -> CrawlResult:
     """쿠팡 전용 CDP attach 방식.
 
@@ -855,10 +858,22 @@ def _crawl_coupang_via_cdp(
             pass
 
     final_orders = locals().get("orders") or []
+    # account_label 주입 (수집된 모든 records/orders 에 동일 적용)
+    if account_label:
+        for r in records:
+            try:
+                r.account_label = account_label
+            except Exception:  # noqa: BLE001
+                pass
+        for o in final_orders:
+            try:
+                o.account_label = account_label
+            except Exception:  # noqa: BLE001
+                pass
     paid = sum(1 for o in final_orders if o.payment_total is not None)
     progress.on_log(
         f"쿠팡 수집 완료: 품목 {len(records)}건 / 주문 {len(final_orders)}개 "
-        f"(결제금 {paid}개)"
+        f"(결제금 {paid}개){f' · 계정 {account_label}' if account_label else ''}"
     )
     return CrawlResult(
         channel="coupang",

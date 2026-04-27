@@ -91,6 +91,7 @@ class PiDataClient:
                 "raw_text": r.raw_text,
                 "fingerprint": fingerprint_of(r),
                 "imported_at": r.imported_at.isoformat() if r.imported_at else datetime.now().isoformat(),
+                "account_label": getattr(r, "account_label", None),
             })
         data = self._request("POST", "/purchase-records", json_body={"records": body_records})
         return int(data.get("inserted") or 0)
@@ -132,6 +133,7 @@ class PiDataClient:
                 source_url=row.get("source_url"),
                 raw_text=str(row.get("raw_text") or ""),
                 imported_at=imported_at,
+                account_label=row.get("account_label"),
             ))
         return out
 
@@ -155,6 +157,7 @@ class PiDataClient:
                 "imported_at": o.imported_at.isoformat() if o.imported_at else datetime.now().isoformat(),
                 "cash_used": o.cash_used,
                 "card_amount": o.card_amount,
+                "account_label": getattr(o, "account_label", None),
             })
         data = self._request("POST", "/purchase-orders", json_body={"orders": body_orders})
         return int(data.get("changed") or 0)
@@ -184,6 +187,7 @@ class PiDataClient:
                 imported_at=imported_at,
                 cash_used=row.get("cash_used"),
                 card_amount=row.get("card_amount"),
+                account_label=row.get("account_label"),
             ))
         return out
 

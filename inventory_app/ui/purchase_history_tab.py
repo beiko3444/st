@@ -111,6 +111,17 @@ class _OrderDetailDialog(QDialog):
             sub_parts.append(f"품목 {len(items)}건")
         if payment_method:
             sub_parts.append(f"결제수단 {payment_method}")
+        account_label_str = ""
+        if order is not None and getattr(order, "account_label", None):
+            account_label_str = order.account_label or ""
+        if not account_label_str:
+            for r in items:
+                lbl = getattr(r, "account_label", None)
+                if lbl:
+                    account_label_str = lbl
+                    break
+        if account_label_str:
+            sub_parts.append(f"계정 {account_label_str}")
         if sub_parts:
             rows_html.append(
                 f"<div style='color:#64748b; font-size:11px; margin-bottom:10px;'>"
@@ -293,6 +304,7 @@ class _CrawlerWorker(QObject):
         coupang_email: str = "",
         coupang_password: str = "",
         login_only: bool = False,
+        account_label: str = "",
     ) -> None:
         super().__init__()
         self.channel = channel
@@ -302,6 +314,7 @@ class _CrawlerWorker(QObject):
         self.coupang_email = coupang_email
         self.coupang_password = coupang_password
         self.login_only = login_only
+        self.account_label = account_label
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -324,6 +337,7 @@ class _CrawlerWorker(QObject):
                 coupang_email=self.coupang_email,
                 coupang_password=self.coupang_password,
                 login_only=self.login_only,
+                account_label=self.account_label,
             )
         except PlaywrightUnavailable as exc:
             result = CrawlResult(channel=self.channel, records=[], error=str(exc))
@@ -349,6 +363,7 @@ class PurchaseHistoryTab(QWidget):
         "\uc0c1\ud488/\ub0b4\uc5ed",
         "\uacb0\uc81c\uae08\uc561",
         "\uacb0\uc81c\uc218\ub2e8",
+        "\uacc4\uc815",
         "\uac00\uc838\uc628 \uc2dc\uac01",
     )
     CANCEL_KEYWORDS = (
@@ -797,6 +812,7 @@ class PurchaseHistoryTab(QWidget):
                 record.title,
                 record.amount,
                 record.payment_method or "-",
+                getattr(record, "account_label", None) or "-",
                 record.imported_at.strftime("%Y-%m-%d %H:%M"),
             ]
             for col_idx, value in enumerate(values):
@@ -961,6 +977,7 @@ class PurchaseHistoryTab(QWidget):
             reset_session=self.reset_session_chk.isChecked(),
             coupang_email=self.coupang_email_edit.text().strip(),
             coupang_password=self.coupang_password_edit.text(),
+            account_label=self.account_label_edit.text().strip(),
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)

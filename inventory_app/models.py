@@ -54,6 +54,7 @@ class PurchaseRecord:
     source_url: Optional[str]
     raw_text: str
     imported_at: datetime
+    account_label: Optional[str] = None
 
 
 @dataclass
@@ -75,6 +76,7 @@ class PurchaseOrder:
     imported_at: datetime
     cash_used: Optional[int] = None     # 쿠페이캐시/쿠폰/적립금 등 카드 외 차감 합계 (원)
     card_amount: Optional[int] = None   # payment_total - cash_used (실 카드 청구액)
+    account_label: Optional[str] = None  # 크롤링 시 사용한 계정 별칭
 
 
 @dataclass
