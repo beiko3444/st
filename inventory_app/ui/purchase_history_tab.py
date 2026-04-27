@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -41,6 +42,36 @@ from inventory_app.services.purchase_crawler import (
     ensure_browser_installed,
 )
 from inventory_app.services.purchase_history_service import PurchaseHistoryParser, PurchaseHistoryStore
+
+
+_STATUS_PREFIX_RE = re.compile(r"^\s*\[[^\]]+\]\s*")
+
+
+def _normalize_title(title: Optional[str]) -> str:
+    s = (title or "").strip()
+    s = _STATUS_PREFIX_RE.sub("", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _dedupe_order_items(items: List[PurchaseRecord]) -> List[PurchaseRecord]:
+    """동일 주문 내 (order_date, title, amount, payment_method) 가 같은 품목 중복 제거.
+
+    title 은 [배송완료] 등 상태 prefix 와 공백 정규화 후 비교.
+    """
+    seen: set = set()
+    out: List[PurchaseRecord] = []
+    for r in items:
+        key = (
+            (r.order_date or "").strip(),
+            _normalize_title(r.title),
+            int(r.amount or 0),
+            (r.payment_method or "").strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
 
 
 class _OrderDetailDialog(QDialog):
@@ -705,6 +736,13 @@ class PurchaseHistoryTab(QWidget):
                     ]
             except Exception:  # noqa: BLE001
                 pass
+
+        # 같은 주문 내에서 (order_date, 정규화된 title, amount, payment_method) 가
+        # 동일한 품목이 여러 번 잡히는 경우 표시 단계에서 dedupe.
+        # 원인: Pi 의 fingerprint 변경 이력 등으로 같은 품목이 다중 레코드로 저장되어 있음.
+        # 결제총액과 품목합계의 배수 관계가 이 현상의 신호.
+        items = _dedupe_order_items(items)
+
         dlg = _OrderDetailDialog(order_no, order, items, parent=self)
         dlg.exec()
 
