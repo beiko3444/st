@@ -15,6 +15,43 @@ from typing import Iterable, List, Optional
 from inventory_app.models import PurchaseOrder, PurchaseRecord
 
 
+_STATUS_PREFIX_RE = re.compile(r"^\s*\[[^\]]+\]\s*")
+
+
+def normalize_record_title(title: Optional[str]) -> str:
+    """status prefix '[배송완료]' 등 제거 + 공백 정규화.
+
+    같은 품목이 시점에 따라 다른 status 로 저장돼 있어도 비교가 가능하도록 한다.
+    """
+    s = (title or "").strip()
+    s = _STATUS_PREFIX_RE.sub("", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def dedupe_order_items(items: List[PurchaseRecord]) -> List[PurchaseRecord]:
+    """같은 주문 내에서 (order_date, 정규화 title, amount, payment_method) 가 동일한
+    품목 record 를 표시 단계에서 dedupe.
+
+    원인: Pi 의 fingerprint 계산 로직이 과거에 바뀌면서 동일 품목이 서로 다른
+    fingerprint 로 여러 행 저장돼 있는 케이스가 있음. 결제총액과 품목 합계가
+    정확히 배수 관계인 것이 이 현상의 신호.
+    """
+    seen: set = set()
+    out: List[PurchaseRecord] = []
+    for r in items:
+        key = (
+            (r.order_date or "").strip(),
+            normalize_record_title(r.title),
+            int(r.amount or 0),
+            (r.payment_method or "").strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
 @dataclass
 class PurchaseGroup:
     """주문/결제 단위 묶음.
@@ -261,6 +298,11 @@ class PurchaseHistoryStore:
                 conn.execute("ALTER TABLE purchase_orders ADD COLUMN cash_used INTEGER")
             if "card_amount" not in cols:
                 conn.execute("ALTER TABLE purchase_orders ADD COLUMN card_amount INTEGER")
+            if "account_label" not in cols:
+                conn.execute("ALTER TABLE purchase_orders ADD COLUMN account_label TEXT")
+            rec_cols = {row[1] for row in conn.execute("PRAGMA table_info(purchase_records)").fetchall()}
+            if "account_label" not in rec_cols:
+                conn.execute("ALTER TABLE purchase_records ADD COLUMN account_label TEXT")
             conn.commit()
 
     @staticmethod
@@ -300,6 +342,7 @@ class PurchaseHistoryStore:
                     record.raw_text,
                     self._fingerprint(record),
                     record.imported_at.isoformat(),
+                    getattr(record, "account_label", None),
                 )
             )
         if not rows:
@@ -310,9 +353,9 @@ class PurchaseHistoryStore:
                 """
                 INSERT OR IGNORE INTO purchase_records (
                     channel, order_date, order_no, title, amount, payment_method,
-                    source_url, raw_text, fingerprint, imported_at
+                    source_url, raw_text, fingerprint, imported_at, account_label
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -371,6 +414,7 @@ class PurchaseHistoryStore:
                     o.imported_at.isoformat(),
                     int(o.cash_used) if o.cash_used is not None else None,
                     int(o.card_amount) if o.card_amount is not None else None,
+                    getattr(o, "account_label", None),
                 )
             )
         if not rows:
@@ -382,8 +426,8 @@ class PurchaseHistoryStore:
                 INSERT INTO purchase_orders (
                     channel, order_no, order_date, payment_total, item_count,
                     status, payment_method, source_url, raw_text, imported_at,
-                    cash_used, card_amount
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cash_used, card_amount, account_label
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(channel, order_no) DO UPDATE SET
                     order_date     = excluded.order_date,
                     payment_total  = COALESCE(excluded.payment_total, purchase_orders.payment_total),
@@ -394,7 +438,8 @@ class PurchaseHistoryStore:
                     raw_text       = excluded.raw_text,
                     imported_at    = excluded.imported_at,
                     cash_used      = COALESCE(excluded.cash_used, purchase_orders.cash_used),
-                    card_amount    = COALESCE(excluded.card_amount, purchase_orders.card_amount)
+                    card_amount    = COALESCE(excluded.card_amount, purchase_orders.card_amount),
+                    account_label  = COALESCE(excluded.account_label, purchase_orders.account_label)
                 """,
                 rows,
             )
@@ -420,7 +465,7 @@ class PurchaseHistoryStore:
                 f"""
                 SELECT channel, order_no, order_date, payment_total, item_count,
                        status, payment_method, source_url, raw_text, imported_at,
-                       cash_used, card_amount
+                       cash_used, card_amount, account_label
                 FROM purchase_orders
                 {where}
                 ORDER BY COALESCE(order_date, imported_at) DESC
@@ -448,6 +493,7 @@ class PurchaseHistoryStore:
                     imported_at=imported_at,
                     cash_used=row[10] if len(row) > 10 else None,
                     card_amount=row[11] if len(row) > 11 else None,
+                    account_label=row[12] if len(row) > 12 else None,
                 )
             )
         return result
@@ -498,6 +544,7 @@ class PurchaseHistoryStore:
                 r.raw_text,
                 self._fingerprint(r),
                 r.imported_at.isoformat() if r.imported_at else datetime.now().isoformat(),
+                getattr(r, "account_label", None),
             ))
 
         records_inserted = 0
@@ -508,9 +555,9 @@ class PurchaseHistoryStore:
                     """
                     INSERT OR IGNORE INTO purchase_records (
                         channel, order_date, order_no, title, amount, payment_method,
-                        source_url, raw_text, fingerprint, imported_at
+                        source_url, raw_text, fingerprint, imported_at, account_label
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     rec_rows,
                 )
@@ -538,6 +585,7 @@ class PurchaseHistoryStore:
                 o.imported_at.isoformat() if o.imported_at else datetime.now().isoformat(),
                 o.cash_used,
                 o.card_amount,
+                getattr(o, "account_label", None),
             ))
 
         orders_changed = 0
@@ -549,9 +597,9 @@ class PurchaseHistoryStore:
                     INSERT OR REPLACE INTO purchase_orders (
                         channel, order_no, order_date, payment_total, item_count,
                         status, payment_method, source_url, raw_text, imported_at,
-                        cash_used, card_amount
+                        cash_used, card_amount, account_label
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     order_rows,
                 )
@@ -571,7 +619,7 @@ class PurchaseHistoryStore:
             rows = conn.execute(
                 f"""
                 SELECT id, channel, order_date, order_no, title, amount, payment_method,
-                       source_url, raw_text, imported_at
+                       source_url, raw_text, imported_at, account_label
                 FROM purchase_records
                 {where}
                 ORDER BY COALESCE(order_date, imported_at) DESC, id DESC
@@ -597,6 +645,7 @@ class PurchaseHistoryStore:
                     source_url=row[7],
                     raw_text=row[8],
                     imported_at=imported_at,
+                    account_label=row[10] if len(row) > 10 else None,
                 )
             )
         return result

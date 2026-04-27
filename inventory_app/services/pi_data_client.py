@@ -91,6 +91,7 @@ class PiDataClient:
                 "raw_text": r.raw_text,
                 "fingerprint": fingerprint_of(r),
                 "imported_at": r.imported_at.isoformat() if r.imported_at else datetime.now().isoformat(),
+                "account_label": getattr(r, "account_label", None),
             })
         data = self._request("POST", "/purchase-records", json_body={"records": body_records})
         return int(data.get("inserted") or 0)
@@ -132,6 +133,7 @@ class PiDataClient:
                 source_url=row.get("source_url"),
                 raw_text=str(row.get("raw_text") or ""),
                 imported_at=imported_at,
+                account_label=row.get("account_label"),
             ))
         return out
 
@@ -155,6 +157,7 @@ class PiDataClient:
                 "imported_at": o.imported_at.isoformat() if o.imported_at else datetime.now().isoformat(),
                 "cash_used": o.cash_used,
                 "card_amount": o.card_amount,
+                "account_label": getattr(o, "account_label", None),
             })
         data = self._request("POST", "/purchase-orders", json_body={"orders": body_orders})
         return int(data.get("changed") or 0)
@@ -184,6 +187,7 @@ class PiDataClient:
                 imported_at=imported_at,
                 cash_used=row.get("cash_used"),
                 card_amount=row.get("card_amount"),
+                account_label=row.get("account_label"),
             ))
         return out
 
@@ -278,6 +282,28 @@ class PiDataClient:
         if not body:
             return
         self._request("PATCH", f"/card-usages/{use_key}", json_body=body)
+
+
+    # ── 쿠팡 자격증명 ─────────────────────────────────────────
+
+    def list_coupang_credentials(self) -> List[Dict[str, Any]]:
+        if not self.is_configured:
+            return []
+        try:
+            payload = self._request("GET", "/coupang-credentials")
+        except PiDataError:
+            return []
+        rows = payload.get("credentials") or []
+        return rows if isinstance(rows, list) else []
+
+    def save_coupang_credential(self, label: str, email: str, password_obf: str) -> None:
+        self._request(
+            "POST", "/coupang-credentials",
+            json_body={"label": label, "email": email, "password_obf": password_obf},
+        )
+
+    def delete_coupang_credential(self, label: str) -> None:
+        self._request("DELETE", "/coupang-credentials", params={"label": label})
 
 
 __all__ = ["PiDataClient", "PiDataError"]

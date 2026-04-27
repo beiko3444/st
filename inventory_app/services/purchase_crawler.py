@@ -220,6 +220,10 @@ def crawl_channel(
     max_pages: int = 5,
     reset_session: bool = False,
     progress: Optional[CrawlerProgress] = None,
+    coupang_email: str = "",
+    coupang_password: str = "",
+    login_only: bool = False,
+    account_label: str = "",
     crawl_days: int = 0,
 ) -> CrawlResult:
     progress = progress or CrawlerProgress()
@@ -234,6 +238,10 @@ def crawl_channel(
             max_pages=max_pages,
             reset_session=reset_session,
             progress=progress,
+            email=coupang_email,
+            password=coupang_password,
+            login_only=login_only,
+            account_label=account_label,
             crawl_days=crawl_days,
         )
 
@@ -242,6 +250,7 @@ def crawl_channel(
 
     try:
         _ensure_playwright()
+        _kill_chrome(progress)
         with sync_playwright() as pw:  # type: ignore[misc]
             context = _launch_persistent_context(pw, channel, headless, progress)
             try:
@@ -355,18 +364,12 @@ def _setup_chrome_junction(progress: CrawlerProgress) -> bool:
     return True
 
 
-def _kill_chrome(progress: CrawlerProgress, only_debug_instance: bool = False) -> None:
-    """Chrome 인스턴스 종료.
-
-    Windows: 모든 chrome.exe 종료 (NTFS junction 으로 사용자 프로필 공유).
-    macOS/Linux:
-        only_debug_instance=False (기본): 종료 안 함 (사용자 Chrome 보존)
-        only_debug_instance=True: junction user-data-dir 매칭하는 인스턴스만 종료
-    """
+def _kill_chrome(progress: CrawlerProgress) -> None:
+    """Chrome 모든 인스턴스 종료 후 재시작 준비."""
     import subprocess as _sp
     import sys
+    progress.on_log("Chrome 모든 인스턴스 종료 중...")
     if sys.platform == "win32":
-        progress.on_log("Chrome 모든 인스턴스 종료 중...")
         try:
             _sp.run(
                 ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
@@ -377,21 +380,40 @@ def _kill_chrome(progress: CrawlerProgress, only_debug_instance: bool = False) -
         time.sleep(2)
         return
 
-    if not only_debug_instance:
-        progress.on_log("(macOS/Linux: 사용자 Chrome 종료 안 함, 새 인스턴스 사용)")
+    if sys.platform == "darwin":
+        # 1) 정상 종료 시도 (세션/탭 보존)
+        try:
+            _sp.run(
+                ["osascript", "-e", 'tell application "Google Chrome" to quit'],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        # 종료 대기 (최대 5초)
+        for _ in range(10):
+            try:
+                r = _sp.run(["pgrep", "-x", "Google Chrome"], capture_output=True, text=True, timeout=2)
+                if r.returncode != 0:
+                    break
+            except Exception:  # noqa: BLE001
+                break
+            time.sleep(0.5)
+        # 2) 강제 종료 (메인 + 헬퍼 프로세스)
+        for name in ("Google Chrome", "Google Chrome Helper", "Google Chrome Helper (Renderer)", "Google Chrome Helper (GPU)"):
+            try:
+                _sp.run(["pkill", "-9", "-f", name], capture_output=True, timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+        time.sleep(1.5)
         return
 
-    # macOS/Linux: junction 매칭하는 Chrome 만 종료
-    junction = str(_coupang_junction_path())
-    progress.on_log(f"디버깅 Chrome 인스턴스 종료 중 ({junction})")
-    try:
-        _sp.run(
-            ["pkill", "-f", f"user-data-dir={junction}"],
-            capture_output=True, text=True, timeout=10,
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    time.sleep(1)
+    # Linux
+    for name in ("chrome", "google-chrome", "chromium"):
+        try:
+            _sp.run(["pkill", "-9", "-f", name], capture_output=True, timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+    time.sleep(1.5)
 
 
 def _wait_for_debug_port(port: int, timeout_sec: int, progress: CrawlerProgress) -> bool:
@@ -448,37 +470,16 @@ def _start_chrome_with_debug(
     if sys.platform == "darwin":
         # macOS: 사용자가 평상시 Chrome 을 켜둔 상태에서 binary 직접 실행하면
         # Launch Services 가 기존 인스턴스로 라우팅해 --remote-debugging-port 가 무시됨.
-        # `open -na` 로 강제 새 인스턴스 생성. PyInstaller frozen 환경에서는
-        # 부모의 stdio pipe 가 자식에게 전파되면 Chrome 이 이상하게 시작될 수 있어 DEVNULL 로 분리.
+        # `open -na` 로 강제 새 인스턴스 생성.
         app_path = "/Applications/Google Chrome.app"
         if not Path(app_path).exists():
+            # chrome_path 에서 .app 추출 시도
             app_path = chrome_path.split(".app/")[0] + ".app"
         cmd = ["open", "-na", app_path, "--args"] + chrome_args
-        progress.on_log(f"실행: {' '.join(cmd[:4])} ...")
         try:
-            result = _sp.run(
-                cmd,
-                stdout=_sp.PIPE, stderr=_sp.PIPE,
-                timeout=10,
-            )
-            if result.returncode != 0:
-                err = (result.stderr or b"").decode("utf-8", errors="replace").strip()
-                progress.on_log(f"open -na 실패 ({result.returncode}): {err}")
-                # 최후 수단: 직접 binary launch 시도 (사용자 Chrome 이 꺼져 있다면 동작)
-                progress.on_log("직접 binary 실행 fallback...")
-                fallback = [chrome_path] + chrome_args
-                proc = _sp.Popen(
-                    fallback,
-                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, stdin=_sp.DEVNULL,
-                    start_new_session=True,
-                )
-                progress.on_log(f"Chrome 직접 시작 (PID {proc.pid})")
-                return proc.pid
+            proc = _sp.Popen(cmd)
             progress.on_log(f"Chrome 디버깅 모드 시작 (open -na, port {port})")
-            return -1  # open 은 즉시 종료. PID 추적 불필요. truthy 값이어야 함 (0 은 falsy → 호출부에서 실패로 인식)
-        except _sp.TimeoutExpired:
-            progress.on_log("open -na 타임아웃")
-            return None
+            return proc.pid
         except Exception as exc:  # noqa: BLE001
             progress.on_log(f"Chrome 시작 실패 (open -na): {exc}")
             return None
@@ -494,11 +495,53 @@ def _start_chrome_with_debug(
         return None
 
 
+def _try_coupang_auto_login(page, email: str, password: str, progress: CrawlerProgress) -> bool:
+    """쿠팡 로그인 폼이 이미 (Chrome 비밀번호 매니저로) 채워져 있다고 가정.
+    로그인 버튼만 클릭. captcha/2FA 가 뜨면 사용자가 마무리.
+    """
+    if not email or not password:
+        return False
+    submit_selectors = [
+        "button[type='submit']",
+        ".login__button-submit",
+        "button.login__button-submit",
+        "form button:has-text('로그인')",
+    ]
+    # 폼이 채워질 시간을 주기 위한 잠깐 대기
+    time.sleep(1.2)
+    try:
+        for sel in submit_selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() == 0:
+                    continue
+                if not loc.is_visible(timeout=1000):
+                    continue
+                loc.click(timeout=3000)
+                progress.on_log("로그인 버튼 클릭")
+                return True
+            except Exception:
+                continue
+        try:
+            page.keyboard.press("Enter")
+            progress.on_log("로그인 (Enter)")
+            return True
+        except Exception:
+            return False
+    except Exception as exc:  # noqa: BLE001
+        progress.on_log(f"자동로그인 예외: {exc}")
+        return False
+
+
 def _crawl_coupang_via_cdp(
     *,
     max_pages: int,
     reset_session: bool,
     progress: CrawlerProgress,
+    email: str = "",
+    password: str = "",
+    login_only: bool = False,
+    account_label: str = "",
     crawl_days: int = 0,
 ) -> CrawlResult:
     """쿠팡 전용 CDP attach 방식.
@@ -536,74 +579,48 @@ def _crawl_coupang_via_cdp(
 
     _ensure_playwright()
 
-    import sys as _sys
-    use_cdp_attach = (_sys.platform == "win32")
-
-    if use_cdp_attach:
-        _kill_chrome(progress)
-        if not _setup_chrome_junction(progress):
-            return CrawlResult(
-                channel="coupang", records=[],
-                error="Chrome 프로파일 junction 생성 실패. 평상시 Chrome 을 한 번 실행한 적이 있어야 합니다.",
-            )
-        junction = _coupang_junction_path()
-        if not _start_chrome_with_debug(chrome, junction, _COUPANG_DEBUG_PORT, _COUPANG_ORDER_URL, progress):
-            return CrawlResult(channel="coupang", records=[], error="Chrome 시작 실패")
-        if not _wait_for_debug_port(_COUPANG_DEBUG_PORT, timeout_sec=20, progress=progress):
-            return CrawlResult(
-                channel="coupang", records=[],
-                error=(
-                    f"Chrome 디버깅 포트({_COUPANG_DEBUG_PORT}) 응답 없음.\n"
-                    "다른 Chrome 인스턴스가 실행 중일 수 있습니다. Chrome 을 모두 종료하고 다시 시도하세요."
-                ),
-            )
-    else:
-        # macOS/Linux: 단순 별도 user-data-dir
-        _setup_chrome_junction(progress)
-
+    _kill_chrome(progress)
+    if not _setup_chrome_junction(progress):
+        return CrawlResult(
+            channel="coupang", records=[],
+            error="Chrome 프로파일 junction 생성 실패. 평상시 Chrome 을 한 번 실행한 적이 있어야 합니다.",
+        )
     junction = _coupang_junction_path()
+    if not _start_chrome_with_debug(chrome, junction, _COUPANG_DEBUG_PORT, _COUPANG_ORDER_URL, progress):
+        return CrawlResult(channel="coupang", records=[], error="Chrome 시작 실패")
+    # 포트 readiness 폴링 (최대 20초)
+    if not _wait_for_debug_port(_COUPANG_DEBUG_PORT, timeout_sec=20, progress=progress):
+        return CrawlResult(
+            channel="coupang", records=[],
+            error=(
+                f"Chrome 디버깅 포트({_COUPANG_DEBUG_PORT}) 응답 없음.\n"
+                "다른 Chrome 인스턴스가 실행 중일 수 있습니다. Chrome 을 모두 종료하고 다시 시도하세요."
+            ),
+        )
+
     records: List[PurchaseRecord] = []
     try:
         with sync_playwright() as pw:  # type: ignore[misc]
-            if use_cdp_attach:
-                try:
-                    browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{_COUPANG_DEBUG_PORT}")
-                except Exception as exc:  # noqa: BLE001
-                    return CrawlResult(
-                        channel="coupang", records=[],
-                        error=(
-                            f"CDP 연결 실패: {exc}\n\n"
-                            "Chrome 을 모두 종료하고 다시 시도하세요."
-                        ),
-                    )
-                progress.on_log(f"CDP 연결 OK (contexts={len(browser.contexts)})")
-                ctx = browser.contexts[0]
-            else:
-                # macOS/Linux: launch_persistent_context — 안정적, CDP 'Browser context management' 오류 회피
-                try:
-                    ctx = pw.chromium.launch_persistent_context(
-                        user_data_dir=str(junction),
-                        executable_path=chrome,
-                        headless=False,
-                        args=["--no-first-run", "--no-default-browser-check"],
-                    )
-                    # 쿠팡 페이지 열기
-                    if ctx.pages:
-                        ctx.pages[0].goto(_COUPANG_ORDER_URL, wait_until="domcontentloaded", timeout=60_000)
-                    else:
-                        page = ctx.new_page()
-                        page.goto(_COUPANG_ORDER_URL, wait_until="domcontentloaded", timeout=60_000)
-                except Exception as exc:  # noqa: BLE001
-                    return CrawlResult(
-                        channel="coupang", records=[],
-                        error=f"Chrome 시작 실패 (Playwright): {exc}",
-                    )
-                progress.on_log("Chrome 시작 (Playwright persistent context)")
+            try:
+                # Chrome 은 127.0.0.1 에만 바인딩 → localhost 가 IPv6(::1)로 해석되면 실패. 명시.
+                browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{_COUPANG_DEBUG_PORT}")
+            except Exception as exc:  # noqa: BLE001
+                return CrawlResult(
+                    channel="coupang", records=[],
+                    error=(
+                        f"CDP 연결 실패: {exc}\n\n"
+                        "다른 Chrome 인스턴스가 디버깅 포트를 가로챘을 수 있습니다.\n"
+                        "Chrome 을 모두 종료하고 다시 시도하세요."
+                    ),
+                )
+            progress.on_log(f"CDP 연결 OK (contexts={len(browser.contexts)})")
+            ctx = browser.contexts[0]
 
             # 쿠팡 탭 찾기 (poll)
             target_page = None
             deadline = time.time() + 480  # 8분
             notified_login = False
+            auto_login_attempted = False
             last_state = ""
             while time.time() < deadline:
                 if progress.cancelled():
@@ -640,10 +657,20 @@ def _crawl_coupang_via_cdp(
                     time.sleep(3)
                     continue
 
-                # 로그인 페이지인지
+                # 로그인 페이지인지 — 저장된 계정 있으면 자동 입력 + 로그인 클릭 (1회만)
                 if "이메일 로그인" in content and "회원가입" in content:
+                    if not auto_login_attempted and email and password:
+                        auto_login_attempted = True
+                        if _try_coupang_auto_login(cp, email, password, progress):
+                            time.sleep(3)
+                            continue
                     if not notified_login:
-                        progress.on_login_required("쿠팡 로그인이 필요합니다. 브라우저 창에서 직접 로그인해주세요.")
+                        if email and password and auto_login_attempted:
+                            progress.on_login_required(
+                                "자동 로그인 후에도 로그인 화면입니다. captcha/2단계 인증이 있으면 직접 완료해주세요."
+                            )
+                        else:
+                            progress.on_login_required("쿠팡 로그인이 필요합니다. 브라우저 창에서 직접 로그인해주세요.")
                         notified_login = True
                     time.sleep(3)
                     continue
@@ -662,10 +689,15 @@ def _crawl_coupang_via_cdp(
                     error="주문 페이지에 도달하지 못했습니다 (시간 초과 또는 차단).",
                 )
 
+            # login_only 모드: 로그인 + 주문 페이지 도달 후 즉시 종료 (Chrome 은 그대로 살림)
+            if login_only:
+                progress.on_log("로그인/주문 페이지 진입 완료 — 사용자 직접 탐색 모드")
+                return CrawlResult(channel="coupang", records=[], error=None)
+
             # 데이터 추출 — 1 ~ max_pages 페이지 순회
             # NEXT_DATA 는 SSR HTML 에 이미 들어있으므로 networkidle 대기 불필요
 
-            # 날짜 컷오프 계산 (crawl_days > 0 이면 그 이전 주문은 무시 + 그 페이지에서 종료)
+            # 날짜 컷오프 계산 (crawl_days > 0 이면 그 이전 주문 페이지에서 종료)
             cutoff_date_str: Optional[str] = None
             if crawl_days and crawl_days > 0:
                 from datetime import date as _date, timedelta as _td
@@ -674,7 +706,6 @@ def _crawl_coupang_via_cdp(
                 progress.on_log(f"날짜 컷오프: {cutoff_date_str} 이전 주문은 무시")
 
             def _page_oldest_date(orders_list: List[PurchaseOrder]) -> Optional[str]:
-                """주문 목록 중 가장 오래된 order_date (ISO yyyy-mm-dd) 반환."""
                 dates = [o.order_date for o in orders_list if o.order_date]
                 return min(dates) if dates else None
 
@@ -703,13 +734,11 @@ def _crawl_coupang_via_cdp(
             )
             if not has_next:
                 progress.on_log("✓ orderPagination.hasNext=false → 1페이지가 마지막")
-            # 컷오프 도달 검사: 이 페이지의 가장 오래된 주문이 컷오프 이전이면 종료
+            # 컷오프 도달 검사 (1페이지)
             if cutoff_date_str:
                 oldest = _page_oldest_date(page1_orders)
                 if oldest and oldest < cutoff_date_str:
-                    progress.on_log(
-                        f"✓ 컷오프 도달 (가장 오래된 주문 {oldest} < {cutoff_date_str}) → 종료"
-                    )
+                    progress.on_log(f"✓ 컷오프 도달 ({oldest} < {cutoff_date_str}) → 종료")
                     has_next = False
 
             # 2 ~ max_pages 페이지 (URL ?pageIndex=N-1)
@@ -757,7 +786,6 @@ def _crawl_coupang_via_cdp(
                     # 종료 판단:
                     # 1) NEXT_DATA 의 hasNext=false → 정확한 마지막 페이지 신호
                     # 2) orderList 가 빈 페이지가 나왔다 → 비정상 (보호용)
-                    # 3) 날짜 컷오프 도달
                     if not has_next:
                         progress.on_log("✓ orderPagination.hasNext=false → 마지막 페이지")
                         break
@@ -767,33 +795,79 @@ def _crawl_coupang_via_cdp(
                     if cutoff_date_str:
                         oldest = _page_oldest_date(page_orders)
                         if oldest and oldest < cutoff_date_str:
-                            progress.on_log(
-                                f"✓ 컷오프 도달 (가장 오래된 주문 {oldest} < {cutoff_date_str}) → 종료"
-                            )
+                            progress.on_log(f"✓ 컷오프 도달 ({oldest} < {cutoff_date_str}) → 종료")
                             break
 
-            # __NEXT_DATA__ 가 모든 정보를 담고 있어 주문 상세 페이지 추가 호출 불필요
             paid_count = sum(1 for o in orders if o.payment_total is not None)
             progress.on_log(
                 f"주문 추출 완료: 총 {len(orders)}개 (결제금 확정 {paid_count}개)"
             )
 
+            # 보충 패스: payment_method / cash_used 는 NEXT_DATA 에 없으므로
+            # 디테일 페이지를 방문해 추출. 시간 절약을 위해 최대 30개로 제한.
+            need_detail = [
+                o for o in orders
+                if (o.payment_method is None or (o.cash_used in (None, 0)))
+                and o.source_url
+            ][:30]
+            if need_detail:
+                progress.on_log(f"디테일 페이지 보충 {len(need_detail)}개 조회 시작...")
+                detail_orders = _crawl_coupang_order_details(
+                    target_page,
+                    [o.source_url for o in need_detail],
+                    progress,
+                    max_details=len(need_detail),
+                )
+                detail_by_no = {o.order_no: o for o in detail_orders if o.order_no}
+                merged = 0
+                for o in orders:
+                    d = detail_by_no.get(o.order_no)
+                    if d is None:
+                        continue
+                    if o.payment_method is None and d.payment_method:
+                        o.payment_method = d.payment_method
+                        merged += 1
+                    if (o.cash_used in (None, 0)) and d.cash_used:
+                        o.cash_used = d.cash_used
+                        # card_amount 재계산
+                        if o.payment_total is not None:
+                            o.card_amount = max(0, int(o.payment_total) - int(d.cash_used))
+                        merged += 1
+                progress.on_log(f"보충 완료: {merged}개 필드 갱신")
+                # records 에도 payment_method 전파
+                pm_by_order = {o.order_no: o.payment_method for o in orders if o.payment_method}
+                for rec in records:
+                    if rec.payment_method is None and rec.order_no in pm_by_order:
+                        rec.payment_method = pm_by_order[rec.order_no]
+
     except Exception as exc:  # noqa: BLE001
         progress.on_log(f"오류: {exc}")
         return CrawlResult(channel="coupang", records=[], error=str(exc))
     finally:
-        # 수집 종료 시 우리가 띄운 Chrome 창만 자동 닫음 (사용자 Chrome 은 보존)
+        # 수집 종료 시 Chrome 창 자동 닫음
         try:
-            _kill_chrome(progress, only_debug_instance=True)
+            _kill_chrome(progress)
             progress.on_log("Chrome 창 자동 종료")
         except Exception:  # noqa: BLE001
             pass
 
     final_orders = locals().get("orders") or []
+    # account_label 주입 (수집된 모든 records/orders 에 동일 적용)
+    if account_label:
+        for r in records:
+            try:
+                r.account_label = account_label
+            except Exception:  # noqa: BLE001
+                pass
+        for o in final_orders:
+            try:
+                o.account_label = account_label
+            except Exception:  # noqa: BLE001
+                pass
     paid = sum(1 for o in final_orders if o.payment_total is not None)
     progress.on_log(
         f"쿠팡 수집 완료: 품목 {len(records)}건 / 주문 {len(final_orders)}개 "
-        f"(결제금 {paid}개)"
+        f"(결제금 {paid}개){f' · 계정 {account_label}' if account_label else ''}"
     )
     return CrawlResult(
         channel="coupang",
@@ -812,6 +886,10 @@ _COUPANG_PAYMENT_TOTAL_RE = re.compile(
 _COUPANG_PAYMENT_METHOD_RE = re.compile(
     r"(신용카드|체크카드|쿠페이머니|쿠페이|간편결제|계좌이체|토스페이|카카오페이|페이코)"
     r"(?:\s*\(?([0-9*\-]{4,})\)?)?"
+)
+# 캐시/포인트/적립금/쿠폰 등 차감 합산 (디테일 페이지 텍스트)
+_COUPANG_CASH_RE = re.compile(
+    r"(쿠팡캐시|쿠페이캐시|적립금|쿠폰\s*할인|포인트|즉시\s*할인)\s*[:\s]*[-−]?\s*([0-9][0-9,]+)\s*원"
 )
 
 
@@ -975,7 +1053,7 @@ def _coupang_order_status(order: dict) -> str:
 
 
 def _parse_coupang_order_detail(text: str) -> dict:
-    """주문 상세 페이지 본문 텍스트에서 order_no / payment_total / status 추출."""
+    """주문 상세 페이지 본문 텍스트에서 order_no / payment_total / status / 캐시차감 추출."""
     info: dict = {}
     m = _COUPANG_ORDER_NO_RE.search(text or "")
     if m:
@@ -991,6 +1069,15 @@ def _parse_coupang_order_detail(text: str) -> dict:
         method = m.group(1)
         last4 = m.group(2)
         info["payment_method"] = f"{method} {last4}".strip() if last4 else method
+    # 캐시/포인트/쿠폰 등 차감 합산
+    cash_total = 0
+    for cm in _COUPANG_CASH_RE.finditer(text or ""):
+        try:
+            cash_total += int(cm.group(2).replace(",", ""))
+        except (ValueError, IndexError):
+            pass
+    if cash_total > 0:
+        info["cash_used"] = cash_total
     # 주문일 (yyyy. M. d 주문)
     md = _COUPANG_DATE_RE.search(text or "")
     if md:
@@ -1038,19 +1125,37 @@ def _crawl_coupang_order_details(
             info = _parse_coupang_order_detail(body)
             order_no = info.get("order_no")
             if not order_no:
-                progress.on_log(f"  detail {idx + 1}: 주문번호 추출 실패 ({url[:60]})")
+                # 진단: URL 의 orderId 와 본문 첫 200자 / 에러 키워드 포함 여부
+                import re as _re
+                m = _re.search(r"orderId=(\d+)", url)
+                req_oid = m.group(1) if m else "?"
+                snippet = (body or "").replace("\n", " ").strip()[:200]
+                err_flags = []
+                for kw in ("ERR_CODE_SYSTEM_ERROR", "주문정보가 존재하지 않습니다", "주문 정보가 존재하지", "Access Denied", "edgesuite"):
+                    if kw in (body or ""):
+                        err_flags.append(kw)
+                progress.on_log(
+                    f"  detail {idx + 1} 추출실패: orderId={req_oid} · err={err_flags or '없음'} · body[:200]={snippet!r}"
+                )
                 continue
+            cash = info.get("cash_used")
+            pt = info.get("payment_total")
+            card_amt: Optional[int] = None
+            if pt is not None:
+                card_amt = max(0, int(pt) - int(cash or 0))
             order = PurchaseOrder(
                 channel="coupang",
                 order_no=str(order_no),
                 order_date=info.get("order_date"),
-                payment_total=info.get("payment_total"),
+                payment_total=pt,
                 item_count=0,  # 호출부에서 records 와 매핑 후 채움
                 status=info.get("status"),
                 payment_method=info.get("payment_method"),
                 source_url=url,
                 raw_text=(body or "")[:4000],
                 imported_at=now,
+                cash_used=int(cash) if cash else None,
+                card_amount=card_amt,
             )
             out.append(order)
             pt = order.payment_total
@@ -1123,8 +1228,9 @@ def _navigate_coupang_to_page(page, page_no: int, progress: CrawlerProgress) -> 
     page_index = max(0, page_no - 1)
     new_url = f"{base}?pageIndex={page_index}"
     try:
-        # SSR 이라 domcontentloaded 시점에 NEXT_DATA 는 이미 HTML 안에 있음 → 추가 대기 불필요
         page.goto(new_url, wait_until="domcontentloaded", timeout=20_000)
+        # 쿠팡 서버 부담 + 봇 감지 회피용 페이지 간 대기 (1.8초)
+        time.sleep(1.8)
         progress.on_log(f"  pageIndex={page_index} (앱 페이지 {page_no}) 이동")
         return True
     except Exception as exc:  # noqa: BLE001
@@ -1163,6 +1269,21 @@ def _extract_coupang_orders_from_next_data(
         order_id = str(o.get("orderId") or "").strip()
         if not order_id:
             continue
+        # 진단: 주문의 최상위 키 + 채널/타입 후보 필드 로깅
+        try:
+            type_hint = {
+                "orderType": o.get("orderType"),
+                "channelType": o.get("channelType"),
+                "businessType": o.get("businessType"),
+                "service": o.get("service"),
+                "deliveryType": o.get("deliveryType"),
+                "source": o.get("source"),
+            }
+            type_hint = {k: v for k, v in type_hint.items() if v is not None}
+            if type_hint:
+                progress.on_log(f"    order {order_id} 메타: {type_hint}")
+        except Exception:  # noqa: BLE001
+            pass
         ts_ms = int(o.get("orderedAt") or 0)
         order_date: Optional[str] = None
         if ts_ms:

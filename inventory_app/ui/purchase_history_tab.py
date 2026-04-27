@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Optional
 
 from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QBrush, QColor, QDesktopServices
@@ -10,9 +10,13 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -21,8 +25,15 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PySide6.QtGui import QFont
 
-from inventory_app.models import PurchaseRecord
+from inventory_app.models import PurchaseOrder, PurchaseRecord
+from inventory_app.services.coupang_credentials import (
+    CoupangAccount,
+    delete_account as delete_coupang_account,
+    list_accounts as list_coupang_accounts,
+    save_account as save_coupang_account,
+)
 from inventory_app.services.purchase_crawler import (
     CrawlerProgress,
     CrawlResult,
@@ -30,7 +41,244 @@ from inventory_app.services.purchase_crawler import (
     crawl_channel,
     ensure_browser_installed,
 )
-from inventory_app.services.purchase_history_service import PurchaseHistoryParser, PurchaseHistoryStore
+from inventory_app.services.purchase_history_service import (
+    PurchaseHistoryParser,
+    PurchaseHistoryStore,
+    dedupe_order_items as _dedupe_order_items,
+    normalize_record_title as _normalize_title,
+)
+
+
+class _OrderDetailDialog(QDialog):
+    """주문번호 상세 팝업: 결제총액, 캐시 차감, 실 카드결제, 품목 목록."""
+
+    def __init__(
+        self,
+        order_no: str,
+        order: Optional[PurchaseOrder],
+        items: List[PurchaseRecord],
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"주문 {order_no} 상세")
+        self.resize(1000, 760)
+        self.setMinimumSize(720, 500)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        head_font = QFont(); head_font.setBold(True); head_font.setPointSize(11)
+
+        # 1) 주문 요약 박스
+        summary = QLabel()
+        summary.setTextFormat(Qt.RichText)
+        summary.setWordWrap(True)
+        summary.setStyleSheet(
+            "QLabel { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; "
+            "padding: 12px 14px; }"
+        )
+
+        items_total = sum(int(r.amount or 0) for r in items if (r.amount or 0) > 0)
+        payment_total: Optional[int] = None
+        cash_used: Optional[int] = None
+        card_amount: Optional[int] = None
+        status = ""
+        order_date = ""
+        payment_method = ""
+
+        if order is not None:
+            payment_total = order.payment_total
+            cash_used = order.cash_used
+            card_amount = order.card_amount
+            status = order.status or ""
+            order_date = order.order_date or ""
+            payment_method = order.payment_method or ""
+
+        # card_amount 가 None 이면 payment_total - cash_used 로 추정
+        if card_amount is None and payment_total is not None:
+            card_amount = int(payment_total) - int(cash_used or 0)
+
+        rows_html: List[str] = []
+        rows_html.append(
+            f"<div style='font-size:13px; font-weight:700; color:#0f172a; margin-bottom:6px;'>"
+            f"주문 {order_no}{(' · ' + status) if status else ''}"
+            f"</div>"
+        )
+        sub_parts: List[str] = []
+        if order_date:
+            sub_parts.append(f"주문일 {order_date}")
+        if items:
+            sub_parts.append(f"품목 {len(items)}건")
+        if payment_method:
+            sub_parts.append(f"결제수단 {payment_method}")
+        account_label_str = ""
+        if order is not None and getattr(order, "account_label", None):
+            account_label_str = order.account_label or ""
+        if not account_label_str:
+            for r in items:
+                lbl = getattr(r, "account_label", None)
+                if lbl:
+                    account_label_str = lbl
+                    break
+        if account_label_str:
+            sub_parts.append(f"계정 {account_label_str}")
+        if sub_parts:
+            rows_html.append(
+                f"<div style='color:#64748b; font-size:11px; margin-bottom:10px;'>"
+                f"{' · '.join(sub_parts)}</div>"
+            )
+
+        # 결제 breakdown 표
+        rows_html.append("<table style='border-collapse:collapse; width:100%; font-size:12px;'>")
+
+        def _row(label: str, value: str, *, color: str = "#334155", bold: bool = False, hr: bool = False) -> str:
+            border = "border-top: 1px solid #e2e8f0;" if hr else ""
+            wt = "700" if bold else "500"
+            return (
+                f"<tr><td style='padding:6px 4px; color:#64748b; {border}'>{label}</td>"
+                f"<td style='padding:6px 4px; text-align:right; color:{color}; "
+                f"font-weight:{wt}; {border}'>{value}</td></tr>"
+            )
+
+        rows_html.append(_row("품목 합계 (양수)", f"{items_total:,}원"))
+        if payment_total is not None:
+            rows_html.append(_row("결제 총액", f"{int(payment_total):,}원", color="#0f172a", bold=True))
+        else:
+            rows_html.append(_row("결제 총액", "(데이터 없음)", color="#94a3b8"))
+        rows_html.append(
+            _row(
+                "쿠팡캐시/포인트 차감",
+                f"− {int(cash_used or 0):,}원" if cash_used else "0원",
+                color="#dc2626" if cash_used else "#94a3b8",
+            )
+        )
+        rows_html.append(
+            _row(
+                "실 카드 결제금액",
+                f"{int(card_amount):,}원" if card_amount is not None else "(데이터 없음)",
+                color="#15803d" if card_amount is not None else "#94a3b8",
+                bold=True,
+                hr=True,
+            )
+        )
+        rows_html.append("</table>")
+
+        # 일치/차이 배지
+        if payment_total is not None and items_total > 0:
+            diff = items_total - int(payment_total)
+            if diff == 0:
+                badge = (
+                    "<div style='margin-top:10px;'>"
+                    "<span style='background:#dcfce7; color:#166534; padding:3px 10px; "
+                    "border-radius:10px; font-size:11px; font-weight:600;'>"
+                    "✓ 품목합계 = 결제총액</span></div>"
+                )
+            else:
+                sign = "+" if diff > 0 else ""
+                badge = (
+                    "<div style='margin-top:10px;'>"
+                    f"<span style='background:#fef3c7; color:#92400e; padding:3px 10px; "
+                    f"border-radius:10px; font-size:11px; font-weight:600;'>"
+                    f"⚠ 품목합계 − 결제총액 = {sign}{diff:,}원 (배송비/할인/쿠폰 차이)</span></div>"
+                )
+            rows_html.append(badge)
+
+        summary.setText("".join(rows_html))
+        layout.addWidget(summary)
+
+        # 2) 품목 목록
+        items_label = QLabel(f"📦 품목 ({len(items)}건)")
+        items_label.setFont(head_font)
+        items_label.setStyleSheet("color: #0f172a;")
+        layout.addWidget(items_label)
+
+        items_table = QTableWidget(0, 4)
+        items_table.setHorizontalHeaderLabels(["일자", "상품/내역", "금액", "결제수단"])
+        items_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        items_table.setAlternatingRowColors(True)
+        items_table.verticalHeader().setVisible(False)
+        items_table.setShowGrid(False)
+        items_table.setStyleSheet(
+            "QTableWidget { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px;"
+            " gridline-color: #e2e8f0; }"
+            "QHeaderView::section { background: #f8fafc; border: none;"
+            " border-bottom: 1px solid #e2e8f0; padding: 6px; font-weight: 600; color: #475569; }"
+            "QTableWidget::item { padding: 6px 8px; border: none; }"
+        )
+        h = items_table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(1, QHeaderView.Stretch)
+        h.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        from PySide6.QtGui import QBrush as _QB, QColor as _QC
+        # rows + 합계 row
+        rowcount_with_sum = len(items) + 1 if items else 1
+        items_table.setRowCount(rowcount_with_sum)
+        sum_amount = 0
+        sum_positive = 0
+        sum_negative = 0
+        any_payment_method = ""
+        for r, rec in enumerate(items):
+            ramt = int(rec.amount or 0)
+            sum_amount += ramt
+            if ramt >= 0:
+                sum_positive += ramt
+            else:
+                sum_negative += ramt
+            if not any_payment_method and rec.payment_method:
+                any_payment_method = rec.payment_method
+            cancelled = ramt < 0
+            d_item = QTableWidgetItem(rec.order_date or "")
+            t_item = QTableWidgetItem((rec.title or "").strip())
+            t_item.setToolTip(rec.title or "")
+            a_item = QTableWidgetItem(f"{ramt:,}원")
+            a_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            af = QFont(); af.setBold(True); a_item.setFont(af)
+            pm_item = QTableWidgetItem(rec.payment_method or "-")
+            if cancelled:
+                a_item.setForeground(_QB(_QC("#dc2626")))
+                t_item.setForeground(_QB(_QC("#dc2626")))
+            items_table.setItem(r, 0, d_item)
+            items_table.setItem(r, 1, t_item)
+            items_table.setItem(r, 2, a_item)
+            items_table.setItem(r, 3, pm_item)
+        if items:
+            sum_row = len(items)
+            sum_bg = _QB(_QC("#f1f5f9"))
+            sum_label_text = f"합계 ({len(items)}건"
+            if sum_negative != 0:
+                sum_label_text += f", 취소 {sum_negative:,}원 포함"
+            sum_label_text += ")"
+            sl_item = QTableWidgetItem(sum_label_text)
+            sl_item.setBackground(sum_bg)
+            slf = QFont(); slf.setBold(True); sl_item.setFont(slf)
+            sl_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            empty_item = QTableWidgetItem("")
+            empty_item.setBackground(sum_bg)
+            sa_item = QTableWidgetItem(f"{sum_amount:,}원")
+            sa_item.setBackground(sum_bg)
+            sa_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            sf = QFont(); sf.setBold(True); sf.setPointSize(12); sa_item.setFont(sf)
+            sa_item.setForeground(_QB(_QC("#0f172a")))
+            spm_item = QTableWidgetItem(any_payment_method or "")
+            spm_item.setBackground(sum_bg)
+            items_table.setItem(sum_row, 0, empty_item)
+            items_table.setItem(sum_row, 1, sl_item)
+            items_table.setItem(sum_row, 2, sa_item)
+            items_table.setItem(sum_row, 3, spm_item)
+        else:
+            ph = QTableWidgetItem("(품목 데이터 없음 — 자동수집 필요)")
+            ph.setForeground(_QB(_QC("#94a3b8")))
+            items_table.setSpan(0, 0, 1, 4)
+            items_table.setItem(0, 0, ph)
+        layout.addWidget(items_table, 1)
+
+        btn_row = QDialogButtonBox(QDialogButtonBox.Close)
+        btn_row.rejected.connect(self.reject)
+        btn_row.accepted.connect(self.accept)
+        layout.addWidget(btn_row)
 
 
 class _NumberItem(QTableWidgetItem):
@@ -47,12 +295,28 @@ class _CrawlerWorker(QObject):
     login_required = Signal(str)
     finished = Signal(object)
 
-    def __init__(self, channel: str, *, headless: bool, max_pages: int, reset_session: bool, crawl_days: int = 0) -> None:
+    def __init__(
+        self,
+        channel: str,
+        *,
+        headless: bool,
+        max_pages: int,
+        reset_session: bool,
+        coupang_email: str = "",
+        coupang_password: str = "",
+        login_only: bool = False,
+        account_label: str = "",
+        crawl_days: int = 0,
+    ) -> None:
         super().__init__()
         self.channel = channel
         self.headless = headless
         self.max_pages = max_pages
         self.reset_session = reset_session
+        self.coupang_email = coupang_email
+        self.coupang_password = coupang_password
+        self.login_only = login_only
+        self.account_label = account_label
         self.crawl_days = crawl_days
         self._cancelled = False
 
@@ -73,6 +337,10 @@ class _CrawlerWorker(QObject):
                 max_pages=self.max_pages,
                 reset_session=self.reset_session,
                 progress=progress,
+                coupang_email=self.coupang_email,
+                coupang_password=self.coupang_password,
+                login_only=self.login_only,
+                account_label=self.account_label,
                 crawl_days=self.crawl_days,
             )
         except PlaywrightUnavailable as exc:
@@ -99,6 +367,7 @@ class PurchaseHistoryTab(QWidget):
         "\uc0c1\ud488/\ub0b4\uc5ed",
         "\uacb0\uc81c\uae08\uc561",
         "\uacb0\uc81c\uc218\ub2e8",
+        "\uacc4\uc815",
         "\uac00\uc838\uc628 \uc2dc\uac01",
     )
     CANCEL_KEYWORDS = (
@@ -120,6 +389,7 @@ class PurchaseHistoryTab(QWidget):
                 pi_client = PiDataClient(monitor_url)
             except Exception:  # noqa: BLE001
                 pi_client = None
+        self._pi_client = pi_client
         self.store = PurchaseHistoryStore(pi_client=pi_client)
         self.parser = PurchaseHistoryParser()
         self._worker_thread: QThread | None = None
@@ -198,14 +468,11 @@ class PurchaseHistoryTab(QWidget):
         self.reset_session_chk = QCheckBox("\uc138\uc158 \ucd08\uae30\ud654(\uc0c8\ub85c \ub85c\uadf8\uc778)")
         self.reset_session_chk.setToolTip("\uc800\uc7a5\ub41c \ub85c\uadf8\uc778 \uc138\uc158\uc744 \uc9c0\uc6b0\uace0 \ucc98\uc74c\ubd80\ud130 \ub85c\uadf8\uc778\ud569\ub2c8\ub2e4.")
 
-        # \ud06c\ub864\ub9c1 \uae30\uac04 (\ucd5c\uadfc N\uc77c)
         self.crawl_days_spin = QSpinBox()
-        self.crawl_days_spin.setRange(1, 730)  # \ucd5c\ub300 2\ub144
+        self.crawl_days_spin.setRange(1, 730)
         self.crawl_days_spin.setValue(90)
         self.crawl_days_spin.setSuffix("\uc77c")
-        self.crawl_days_spin.setToolTip(
-            "\ucd5c\uadfc N\uc77c \uc774\ub0b4\uc758 \uc8fc\ubb38\ub9cc \uc218\uc9d1. \ud398\uc774\uc9c0 \uc21c\ud68c \uc911 \ucef7\uc624\ud504 \ub3c4\ub2ec \uc2dc \uc790\ub3d9 \uc885\ub8cc."
-        )
+        self.crawl_days_spin.setToolTip("\ucd5c\uadfc N\uc77c \uc774\ub0b4\uc758 \uc8fc\ubb38\ub9cc \uc218\uc9d1. \ucef7\uc624\ud504 \ub3c4\ub2ec \uc2dc \uc790\ub3d9 \uc885\ub8cc.")
 
         self.cancel_auto_btn = QPushButton("\ucde8\uc18c")
         self.cancel_auto_btn.clicked.connect(self._cancel_auto)
@@ -222,6 +489,63 @@ class PurchaseHistoryTab(QWidget):
         auto_row.addWidget(self.cancel_auto_btn)
         auto_row.addWidget(self.status, 1)
 
+        # 쿠팡 자동로그인용 다중 계정 row
+        cred_row = QHBoxLayout()
+        cred_row.addWidget(QLabel("저장 계정"))
+        self.account_combo = QComboBox()
+        self.account_combo.setMinimumWidth(180)
+        self.account_combo.setToolTip("계정 선택 후 「선택 계정으로 수집」을 누르면 자동 로그인 + 크롤링.")
+        self.account_combo.currentIndexChanged.connect(self._on_account_selected)
+        cred_row.addWidget(self.account_combo)
+
+        self.start_with_account_btn = QPushButton("▶ 선택 계정으로 수집")
+        self.start_with_account_btn.setToolTip(
+            "선택된 쿠팡 계정으로 자동 로그인 후 즉시 주문내역을 크롤링합니다."
+        )
+        self.start_with_account_btn.clicked.connect(self._start_with_selected_account)
+        cred_row.addWidget(self.start_with_account_btn)
+
+        self.delete_account_btn = QPushButton("선택 삭제")
+        self.delete_account_btn.clicked.connect(self._delete_selected_account)
+        cred_row.addWidget(self.delete_account_btn)
+
+        cred_row.addSpacing(12)
+        cred_row.addWidget(QLabel("계정명"))
+        self.account_label_edit = QLineEdit()
+        self.account_label_edit.setPlaceholderText("예: 메인계정")
+        self.account_label_edit.setMinimumWidth(120)
+        cred_row.addWidget(self.account_label_edit)
+
+        cred_row.addWidget(QLabel("쿠팡 ID"))
+        self.coupang_email_edit = QLineEdit()
+        self.coupang_email_edit.setPlaceholderText("이메일 주소")
+        self.coupang_email_edit.setMinimumWidth(180)
+        cred_row.addWidget(self.coupang_email_edit)
+
+        cred_row.addWidget(QLabel("비밀번호"))
+        self.coupang_password_edit = QLineEdit()
+        self.coupang_password_edit.setEchoMode(QLineEdit.Password)
+        self.coupang_password_edit.setPlaceholderText("비밀번호")
+        self.coupang_password_edit.setMinimumWidth(140)
+        cred_row.addWidget(self.coupang_password_edit)
+
+        self.show_pw_chk = QCheckBox("표시")
+        self.show_pw_chk.toggled.connect(
+            lambda checked: self.coupang_password_edit.setEchoMode(
+                QLineEdit.Normal if checked else QLineEdit.Password
+            )
+        )
+        cred_row.addWidget(self.show_pw_chk)
+
+        self.save_cred_btn = QPushButton("저장")
+        self.save_cred_btn.setToolTip("계정명/ID/비번을 입력하고 저장 → 라즈베리DB 에 영구 저장.")
+        self.save_cred_btn.clicked.connect(self._save_coupang_account)
+        cred_row.addWidget(self.save_cred_btn)
+        cred_row.addStretch(1)
+
+        # 저장된 계정 목록 로드
+        self._refresh_account_combo()
+
         self.table = QTableWidget(0, len(self.HEADERS))
         self.table.setHorizontalHeaderLabels(self.HEADERS)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -233,6 +557,7 @@ class PurchaseHistoryTab(QWidget):
 
         layout.addLayout(top)
         layout.addLayout(auto_row)
+        layout.addLayout(cred_row)
         layout.addWidget(self.table, 1)
         self.reload()
 
@@ -244,6 +569,17 @@ class PurchaseHistoryTab(QWidget):
         return channel if channel in {"naver", "coupang"} else "naver"
 
     def _open_order_page(self, channel: str) -> None:
+        # 쿠팡: 선택된 계정이 있으면 자동로그인 후 주문 페이지 진입까지 자동화
+        if channel == "coupang":
+            account = self._selected_account()
+            if account is not None:
+                if self._worker_thread is not None and self._worker_thread.isRunning():
+                    QMessageBox.information(
+                        self, "안내", "이미 작업이 진행 중입니다.",
+                    )
+                    return
+                self._start_auto_crawl("coupang", login_only=True)
+                return
         url = self.ORDER_URLS.get(channel)
         if url:
             QDesktopServices.openUrl(QUrl(url))
@@ -392,23 +728,93 @@ class PurchaseHistoryTab(QWidget):
             self.status.setText(f"{len(rows):,}\uac74 | {net:,}\uc6d0")
 
     def _on_cell_double_clicked(self, row: int, col: int) -> None:
-        """상품/내역 컬럼 더블클릭 → 상품 페이지 열기."""
-        if col != 3:  # 상품/내역 컬럼만
+        """주문번호(2) → 결제 상세 / 상품(3) → 상품페이지."""
+        if col == 2:
+            order_no_item = self.table.item(row, col)
+            if order_no_item is None:
+                return
+            order_no = (order_no_item.text() or "").strip()
+            if not order_no or order_no == "-":
+                return
+            channel_item = self.table.item(row, 1)
+            channel_label = (channel_item.text() if channel_item else "") or ""
+            channel = "coupang" if "쿠팡" in channel_label else (
+                "naver" if "네이버" in channel_label else "coupang"
+            )
+            self._open_order_detail(channel, order_no)
             return
-        item = self.table.item(row, col)
-        if item is None:
-            return
-        url = item.data(Qt.UserRole + 1)
-        if not url:
-            return
-        QDesktopServices.openUrl(QUrl(str(url)))
+        if col == 3:  # 상품/내역 컬럼
+            item = self.table.item(row, col)
+            if item is None:
+                return
+            url = item.data(Qt.UserRole + 1)
+            if not url:
+                return
+            QDesktopServices.openUrl(QUrl(str(url)))
+
+    def _open_order_detail(self, channel: str, order_no: str) -> None:
+        order: Optional[PurchaseOrder] = None
+        items: List[PurchaseRecord] = []
+        # Pi 우선
+        if self._pi_client is not None and getattr(self._pi_client, "is_configured", False):
+            try:
+                for o in self._pi_client.list_purchase_orders(channel=channel, limit=5000):
+                    if (o.order_no or "") == order_no:
+                        order = o
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                items = [
+                    r for r in self._pi_client.list_purchase_records(channel=channel, limit=10000)
+                    if (r.order_no or "") == order_no
+                ]
+            except Exception:  # noqa: BLE001
+                items = []
+        # 로컬 fallback
+        if order is None or not items:
+            try:
+                if order is None:
+                    for o in self.store.load_orders(channel=channel, limit=5000):
+                        if (o.order_no or "") == order_no:
+                            order = o
+                            break
+                if not items:
+                    items = [
+                        r for r in self.store.load_records(channel=channel, limit=20000)
+                        if (r.order_no or "") == order_no
+                    ]
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 같은 주문 내에서 (order_date, 정규화된 title, amount, payment_method) 가
+        # 동일한 품목이 여러 번 잡히는 경우 표시 단계에서 dedupe.
+        # 원인: Pi 의 fingerprint 변경 이력 등으로 같은 품목이 다중 레코드로 저장되어 있음.
+        # 결제총액과 품목합계의 배수 관계가 이 현상의 신호.
+        items = _dedupe_order_items(items)
+
+        dlg = _OrderDetailDialog(order_no, order, items, parent=self)
+        dlg.exec()
 
     def _render(self, rows: List[PurchaseRecord]) -> None:
         self.table.setSortingEnabled(False)
+        self.table.setAlternatingRowColors(False)
         self.table.setRowCount(len(rows))
         red_brush = QBrush(QColor("#dc2626"))
         gray_brush = QBrush(QColor("#9ca3af"))
+        # \uc8fc\ubb38\ubc88\ud638 \uae30\uc900 \uc9c0\ube0c\ub77c: \uc8fc\ubb38\ubc88\ud638\uac00 \ubc14\ub014 \ub54c\ub9c8\ub2e4 \uc0c9 \ud1a0\uae00
+        zebra_brushes = [QBrush(QColor("#ffffff")), QBrush(QColor("#eef2f7"))]
+        zebra_idx = 0
+        prev_order_no: Optional[str] = None
         for row_idx, record in enumerate(rows):
+            current_order_no = (record.order_no or "").strip() or f"__row_{row_idx}"
+            if prev_order_no is None:
+                zebra_idx = 0
+            elif current_order_no != prev_order_no:
+                zebra_idx = 1 - zebra_idx
+            prev_order_no = current_order_no
+            row_bg = zebra_brushes[zebra_idx]
+
             cancelled = self._is_cancelled(record)
             signed_amount = self._signed_amount(record)
             values: list[Any] = [
@@ -418,6 +824,7 @@ class PurchaseHistoryTab(QWidget):
                 record.title,
                 record.amount,
                 record.payment_method or "-",
+                getattr(record, "account_label", None) or "-",
                 record.imported_at.strftime("%Y-%m-%d %H:%M"),
             ]
             for col_idx, value in enumerate(values):
@@ -436,6 +843,7 @@ class PurchaseHistoryTab(QWidget):
                     if cancelled:
                         item.setForeground(red_brush if col_idx == 3 else gray_brush)
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                item.setBackground(row_bg)
                 if col_idx == 3:
                     # 상품 페이지 URL 을 cell 에 임베드 → 더블클릭 시 사용 (색상은 기본 유지)
                     if record.source_url and record.source_url != self.ORDER_URLS.get(record.channel, ""):
@@ -450,6 +858,104 @@ class PurchaseHistoryTab(QWidget):
         self.table.resizeColumnsToContents()
         self.table.setSortingEnabled(True)
 
+    # ---------- 쿠팡 다중 계정 ----------
+
+    def _refresh_account_combo(self) -> None:
+        try:
+            accounts = list_coupang_accounts(pi_client=self._pi_client)
+        except Exception:  # noqa: BLE001
+            accounts = []
+        self.account_combo.blockSignals(True)
+        self.account_combo.clear()
+        self.account_combo.addItem("(계정 없음)", None)
+        for a in accounts:
+            self.account_combo.addItem(f"{a.label}  ·  {a.email}", a.label)
+        self.account_combo.blockSignals(False)
+
+    def _selected_account(self) -> Optional["CoupangAccount"]:
+        label = self.account_combo.currentData()
+        if not label:
+            return None
+        try:
+            for a in list_coupang_accounts(pi_client=self._pi_client):
+                if a.label == label:
+                    return a
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _on_account_selected(self, _idx: int) -> None:
+        a = self._selected_account()
+        if a is None:
+            return
+        # 입력 필드를 선택된 계정 값으로 채움 (편집/덮어쓰기 편의)
+        self.account_label_edit.setText(a.label)
+        self.coupang_email_edit.setText(a.email)
+        self.coupang_password_edit.setText(a.password)
+
+    def _save_coupang_account(self) -> None:
+        label = self.account_label_edit.text().strip()
+        email = self.coupang_email_edit.text().strip()
+        pw = self.coupang_password_edit.text()
+        if not label:
+            QMessageBox.warning(self, "저장 실패", "계정명(별칭)을 입력하세요.")
+            return
+        if not email or not pw:
+            QMessageBox.warning(self, "저장 실패", "이메일과 비밀번호를 모두 입력하세요.")
+            return
+        partial_only = False
+        try:
+            save_coupang_account(label, email, pw, pi_client=self._pi_client)
+        except RuntimeError as exc:
+            # 로컬은 저장됨, Pi 만 실패
+            partial_only = True
+            self.status.setText(f"⚠ {exc}")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "저장 실패", str(exc))
+            return
+        self._refresh_account_combo()
+        idx = self.account_combo.findData(label)
+        if idx >= 0:
+            self.account_combo.setCurrentIndex(idx)
+        if not partial_only:
+            self.status.setText(f"✓ 계정 '{label}' 저장됨 (라즈베리DB)")
+
+    def _delete_selected_account(self) -> None:
+        a = self._selected_account()
+        if a is None:
+            QMessageBox.information(self, "삭제", "삭제할 계정을 먼저 선택하세요.")
+            return
+        ans = QMessageBox.question(
+            self, "계정 삭제", f"'{a.label}' 계정을 삭제할까요?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+        try:
+            delete_coupang_account(a.label, pi_client=self._pi_client)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "삭제 실패", str(exc))
+            return
+        self._refresh_account_combo()
+        self.account_label_edit.clear()
+        self.coupang_email_edit.clear()
+        self.coupang_password_edit.clear()
+        self.status.setText(f"✓ 계정 '{a.label}' 삭제됨")
+
+    def _start_with_selected_account(self) -> None:
+        a = self._selected_account()
+        if a is None:
+            QMessageBox.information(
+                self, "계정 선택 필요",
+                "저장된 계정이 없습니다. 계정명/ID/비번을 입력하고 저장 후 다시 시도하세요.",
+            )
+            return
+        # 입력 필드도 동기화 후 즉시 쿠팡 크롤링 시작
+        self.account_label_edit.setText(a.label)
+        self.coupang_email_edit.setText(a.email)
+        self.coupang_password_edit.setText(a.password)
+        self._start_auto_crawl("coupang")
+
     def _set_auto_busy(self, busy: bool) -> None:
         for btn in (
             self.auto_naver_btn,
@@ -460,6 +966,13 @@ class PurchaseHistoryTab(QWidget):
             self.open_coupang_btn,
             self.reload_btn,
             self.reset_session_chk,
+            self.account_combo,
+            self.account_label_edit,
+            self.coupang_email_edit,
+            self.coupang_password_edit,
+            self.save_cred_btn,
+            self.delete_account_btn,
+            self.start_with_account_btn,
         ):
             btn.setEnabled(not busy)
         self.cancel_auto_btn.setEnabled(busy)
@@ -470,14 +983,16 @@ class PurchaseHistoryTab(QWidget):
             return
         thread = QThread(self)
         days = int(self.crawl_days_spin.value())
-        # 페이지당 약 10개 주문 가정 → 최대 페이지 = max(10, 일수/3) 정도로 안전 여유.
-        # 컷오프 도달 시 페이지 루프가 자동 종료하므로 max_pages 는 상한일 뿐.
+        # 페이지당 약 10개 가정 → 일수/3 + 여유. 컷오프 도달 시 조기 종료.
         max_pages = max(10, (days // 3) + 5)
         worker = _CrawlerWorker(
             channel,
             headless=False,
             max_pages=max_pages,
             reset_session=self.reset_session_chk.isChecked(),
+            coupang_email=self.coupang_email_edit.text().strip(),
+            coupang_password=self.coupang_password_edit.text(),
+            account_label=self.account_label_edit.text().strip(),
             crawl_days=days,
         )
         worker.moveToThread(thread)
@@ -518,7 +1033,6 @@ class PurchaseHistoryTab(QWidget):
     def _on_crawler_finished(self, result: object) -> None:
         if not isinstance(result, CrawlResult):
             self.status.setText("\uc218\uc9d1\uc774 \uc885\ub8cc\ub418\uc5c8\uc9c0\ub9cc \uacb0\uacfc\ub97c \uc77d\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4.")
-            QMessageBox.warning(self, "\uc218\uc9d1 \uacb0\uacfc \uc5c6\uc74c", "\uc218\uc9d1 \uc791\uc5c5\uc774 \uc885\ub8cc\ub410\uc9c0\ub9cc \uacb0\uacfc\ub97c \uc77d\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4.")
             return
         channel_label = self.CHANNEL_LABELS.get(result.channel, result.channel)
         if result.error:
@@ -530,28 +1044,19 @@ class PurchaseHistoryTab(QWidget):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "\uc800\uc7a5 \uc2e4\ud328", str(exc))
             added = 0
-        order_count = 0
-        paid_count = 0
         order_msg = ""
         orders_attr = getattr(result, "orders", None) or []
         if orders_attr:
             try:
                 self.store.save_orders(orders_attr)
-                order_count = len(orders_attr)
-                paid_count = sum(1 for o in orders_attr if o.payment_total is not None)
-                order_msg = f" \u00b7 \uc8fc\ubb38 {order_count}\uac1c (\uacb0\uc81c\uae08 {paid_count}\uac1c)"
+                paid = sum(1 for o in orders_attr if o.payment_total is not None)
+                order_msg = f" \u00b7 \uc8fc\ubb38 {len(orders_attr)}\uac1c (\uacb0\uc81c\uae08 {paid}\uac1c)"
             except Exception as exc:  # noqa: BLE001
                 order_msg = f" \u00b7 \uc8fc\ubb38 \uc800\uc7a5 \uc2e4\ud328: {exc}"
-        summary = (
-            f"{channel_label} \uc790\ub3d9 \uc218\uc9d1 \uc644\ub8cc\n\n"
-            f"\ud488\ubaa9: {len(result.records)}\uac74 \ucd94\ucd9c \u00b7 {added}\uac74 \uc2e0\uaddc \uc800\uc7a5\n"
-            f"\uc8fc\ubb38: {order_count}\uac1c (\uacb0\uc81c\uae08 \ud655\uc778 {paid_count}\uac1c)"
-        )
         self.status.setText(
-            f"\u2713 {channel_label} \uc790\ub3d9 \uc218\uc9d1 \uc644\ub8cc: {len(result.records)}\uac74 \ucd94\ucd9c, "
+            f"{channel_label} \uc790\ub3d9 \uc218\uc9d1 \uc644\ub8cc: {len(result.records)}\uac74 \ucd94\ucd9c, "
             f"{added}\uac74 \uc2e0\uaddc \uc800\uc7a5{order_msg}"
         )
-        QMessageBox.information(self, f"{channel_label} \uc218\uc9d1 \uc644\ub8cc", summary)
         self.reload()
 
     def shutdown(self) -> None:
