@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -41,37 +40,12 @@ from inventory_app.services.purchase_crawler import (
     crawl_channel,
     ensure_browser_installed,
 )
-from inventory_app.services.purchase_history_service import PurchaseHistoryParser, PurchaseHistoryStore
-
-
-_STATUS_PREFIX_RE = re.compile(r"^\s*\[[^\]]+\]\s*")
-
-
-def _normalize_title(title: Optional[str]) -> str:
-    s = (title or "").strip()
-    s = _STATUS_PREFIX_RE.sub("", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def _dedupe_order_items(items: List[PurchaseRecord]) -> List[PurchaseRecord]:
-    """동일 주문 내 (order_date, title, amount, payment_method) 가 같은 품목 중복 제거.
-
-    title 은 [배송완료] 등 상태 prefix 와 공백 정규화 후 비교.
-    """
-    seen: set = set()
-    out: List[PurchaseRecord] = []
-    for r in items:
-        key = (
-            (r.order_date or "").strip(),
-            _normalize_title(r.title),
-            int(r.amount or 0),
-            (r.payment_method or "").strip(),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(r)
-    return out
+from inventory_app.services.purchase_history_service import (
+    PurchaseHistoryParser,
+    PurchaseHistoryStore,
+    dedupe_order_items as _dedupe_order_items,
+    normalize_record_title as _normalize_title,
+)
 
 
 class _OrderDetailDialog(QDialog):

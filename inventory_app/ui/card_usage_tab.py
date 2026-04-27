@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
-from PySide6.QtCore import QDate, QEvent, QObject, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QDate, QEvent, QObject, QPointF, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -54,6 +54,7 @@ from inventory_app.services.card_category import (
 from inventory_app.services.purchase_history_service import (
     PurchaseGroup,
     PurchaseHistoryStore,
+    dedupe_order_items,
     group_records_by_order,
 )
 from inventory_app.services.pi_data_client import PiDataClient, PiDataError
@@ -150,6 +151,64 @@ def _format_used_at_short(used_at: Optional[str]) -> str:
     ampm = "오전" if dt.hour < 12 else "오후"
     h12 = dt.hour % 12 or 12
     return f"{dt.month}월 {dt.day}일 · {ampm} {h12}:{dt.minute:02d}"
+
+
+class _ReviewCheckButton(QPushButton):
+    """검토 토글 — 정사각형 체크박스. ✓ 마크는 QPainter 로 직접 스트로크."""
+
+    _SIZE = 22
+
+    def __init__(self, reviewed: bool, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._reviewed = bool(reviewed)
+        self.setFixedSize(self._SIZE, self._SIZE)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFlat(True)
+        self.setStyleSheet("QPushButton { background: transparent; border: none; padding: 0; }")
+
+    def set_reviewed(self, reviewed: bool) -> None:
+        if bool(reviewed) != self._reviewed:
+            self._reviewed = bool(reviewed)
+            self.update()
+
+    def paintEvent(self, event):  # type: ignore[override]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        rect = self.rect().adjusted(1, 1, -1, -1)
+        radius = 4.0
+
+        hovered = self.underMouse()
+        bg = QColor("#f1f5f9") if hovered else QColor("#ffffff")
+        border = QColor("#64748b") if hovered else QColor("#94a3b8")
+        p.setBrush(QBrush(bg))
+        pen = QPen(border)
+        pen.setWidthF(1.2)
+        p.setPen(pen)
+        p.drawRoundedRect(rect, radius, radius)
+
+        if self._reviewed:
+            pen = QPen(QColor("#0f172a"))
+            pen.setWidthF(2.2)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            p.setPen(pen)
+            w = rect.width()
+            h = rect.height()
+            x0 = rect.left()
+            y0 = rect.top()
+            p1 = QPointF(x0 + w * 0.24, y0 + h * 0.52)
+            p2 = QPointF(x0 + w * 0.44, y0 + h * 0.70)
+            p3 = QPointF(x0 + w * 0.76, y0 + h * 0.34)
+            p.drawPolyline([p1, p2, p3])
+        p.end()
+
+    def enterEvent(self, event):  # type: ignore[override]
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):  # type: ignore[override]
+        self.update()
+        super().leaveEvent(event)
 
 
 class _SummaryCard(QFrame):
@@ -1562,23 +1621,8 @@ class CardUsageTab(QWidget):
                 self.table.setItem(r, self.COL_REVIEW, review_placeholder)
                 self.table.setItem(r, self.COL_MEMO, memo_item)
 
-                # 검토 버튼 — 정사각형 체크박스 스타일
-                review_btn = QPushButton("✓" if reviewed else "")
-                review_btn.setCursor(Qt.PointingHandCursor)
-                review_btn.setFixedSize(24, 24)
-                if reviewed:
-                    review_btn.setStyleSheet(
-                        "QPushButton { background: #16a34a; color: #ffffff; border: none; "
-                        "border-radius: 0px; padding: 0px; font-size: 14px; font-weight: 700; }"
-                        "QPushButton:hover { background: #15803d; }"
-                    )
-                else:
-                    review_btn.setStyleSheet(
-                        "QPushButton { background: #ffffff; color: #475569; "
-                        "border: 1px solid #cbd5e1; border-radius: 0px; padding: 0px; "
-                        "font-size: 11px; font-weight: 500; }"
-                        "QPushButton:hover { background: #f1f5f9; border-color: #94a3b8; }"
-                    )
+                # 검토 버튼 — 커스텀 페인팅 정사각형 체크박스
+                review_btn = _ReviewCheckButton(reviewed)
                 key = usage.use_key or usage.id or ""
                 review_btn.clicked.connect(
                     lambda _checked=False, k=key: self._on_review_btn_clicked(k)
@@ -1737,18 +1781,12 @@ class CardUsageTab(QWidget):
     @staticmethod
     def _style_review_btn(btn: QPushButton, reviewed: bool) -> None:
         btn.setText("✓" if reviewed else "")
-        if reviewed:
-            btn.setStyleSheet(
-                "QPushButton { background: #16a34a; color: #ffffff; border: none; "
-                "border-radius: 4px; font-size: 12px; font-weight: 700; }"
-                "QPushButton:hover { background: #15803d; }"
-            )
-        else:
-            btn.setStyleSheet(
-                "QPushButton { background: #ffffff; color: transparent; "
-                "border: 1px solid #cbd5e1; border-radius: 4px; }"
-                "QPushButton:hover { background: #f1f5f9; border-color: #94a3b8; }"
-            )
+        btn.setStyleSheet(
+            "QPushButton { background: #ffffff; color: #0f172a; "
+            "border: 1px solid #94a3b8; border-radius: 4px; "
+            "font-size: 12px; font-weight: 700; }"
+            "QPushButton:hover { background: #f1f5f9; border-color: #64748b; }"
+        )
 
     def _make_review_btn(self, usage: CardUsage) -> QPushButton:
         btn = QPushButton()
@@ -1806,7 +1844,12 @@ class CardUsageTab(QWidget):
                     rp.setData(Qt.BackgroundRole, None)
             # 버튼 위젯은 재생성하지 않고 기존 위젯만 스타일 갱신 (포커스 이동 방지)
             existing = self.table.cellWidget(row, self.COL_REVIEW)
-            if isinstance(existing, QPushButton):
+            chk = existing.findChild(_ReviewCheckButton) if existing is not None else None
+            if isinstance(chk, _ReviewCheckButton):
+                chk.set_reviewed(reviewed)
+            elif isinstance(existing, _ReviewCheckButton):
+                existing.set_reviewed(reviewed)
+            elif isinstance(existing, QPushButton):
                 self._style_review_btn(existing, reviewed)
             else:
                 self.table.setCellWidget(row, self.COL_REVIEW, self._make_review_btn(usage))
@@ -1929,7 +1972,9 @@ class CardUsageTab(QWidget):
                     ]
             except Exception:  # noqa: BLE001
                 pass
-        return order, items
+        # 같은 주문 내 동일 품목이 여러 행 저장된 케이스(Pi fingerprint 변경 이력 등)를
+        # 표시 단계에서 제거.
+        return order, dedupe_order_items(items)
 
     def _render_calendar(self, items: List[CardUsage]) -> None:
         # 기존 캘린더 클리어

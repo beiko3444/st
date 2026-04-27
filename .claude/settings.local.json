@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(p, encoding='utf-8'\\).read\\(\\), p\\) for p in ['inventory_app/ui/card_usage_tab.py', 'inventory_app/ui/purchase_history_tab.py', 'inventory_app/services/purchase_history_service.py']]; print\\('OK'\\)\")",
+      "Bash(python -c ' *)"
+    ]
+  }
+}

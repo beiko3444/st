@@ -15,6 +15,43 @@ from typing import Iterable, List, Optional
 from inventory_app.models import PurchaseOrder, PurchaseRecord
 
 
+_STATUS_PREFIX_RE = re.compile(r"^\s*\[[^\]]+\]\s*")
+
+
+def normalize_record_title(title: Optional[str]) -> str:
+    """status prefix '[배송완료]' 등 제거 + 공백 정규화.
+
+    같은 품목이 시점에 따라 다른 status 로 저장돼 있어도 비교가 가능하도록 한다.
+    """
+    s = (title or "").strip()
+    s = _STATUS_PREFIX_RE.sub("", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def dedupe_order_items(items: List[PurchaseRecord]) -> List[PurchaseRecord]:
+    """같은 주문 내에서 (order_date, 정규화 title, amount, payment_method) 가 동일한
+    품목 record 를 표시 단계에서 dedupe.
+
+    원인: Pi 의 fingerprint 계산 로직이 과거에 바뀌면서 동일 품목이 서로 다른
+    fingerprint 로 여러 행 저장돼 있는 케이스가 있음. 결제총액과 품목 합계가
+    정확히 배수 관계인 것이 이 현상의 신호.
+    """
+    seen: set = set()
+    out: List[PurchaseRecord] = []
+    for r in items:
+        key = (
+            (r.order_date or "").strip(),
+            normalize_record_title(r.title),
+            int(r.amount or 0),
+            (r.payment_method or "").strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
 @dataclass
 class PurchaseGroup:
     """주문/결제 단위 묶음.
