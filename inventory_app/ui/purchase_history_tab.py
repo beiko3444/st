@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -46,12 +47,13 @@ class _CrawlerWorker(QObject):
     login_required = Signal(str)
     finished = Signal(object)
 
-    def __init__(self, channel: str, *, headless: bool, max_pages: int, reset_session: bool) -> None:
+    def __init__(self, channel: str, *, headless: bool, max_pages: int, reset_session: bool, crawl_days: int = 0) -> None:
         super().__init__()
         self.channel = channel
         self.headless = headless
         self.max_pages = max_pages
         self.reset_session = reset_session
+        self.crawl_days = crawl_days
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -71,6 +73,7 @@ class _CrawlerWorker(QObject):
                 max_pages=self.max_pages,
                 reset_session=self.reset_session,
                 progress=progress,
+                crawl_days=self.crawl_days,
             )
         except PlaywrightUnavailable as exc:
             result = CrawlResult(channel=self.channel, records=[], error=str(exc))
@@ -195,6 +198,15 @@ class PurchaseHistoryTab(QWidget):
         self.reset_session_chk = QCheckBox("\uc138\uc158 \ucd08\uae30\ud654(\uc0c8\ub85c \ub85c\uadf8\uc778)")
         self.reset_session_chk.setToolTip("\uc800\uc7a5\ub41c \ub85c\uadf8\uc778 \uc138\uc158\uc744 \uc9c0\uc6b0\uace0 \ucc98\uc74c\ubd80\ud130 \ub85c\uadf8\uc778\ud569\ub2c8\ub2e4.")
 
+        # \ud06c\ub864\ub9c1 \uae30\uac04 (\ucd5c\uadfc N\uc77c)
+        self.crawl_days_spin = QSpinBox()
+        self.crawl_days_spin.setRange(1, 730)  # \ucd5c\ub300 2\ub144
+        self.crawl_days_spin.setValue(90)
+        self.crawl_days_spin.setSuffix("\uc77c")
+        self.crawl_days_spin.setToolTip(
+            "\ucd5c\uadfc N\uc77c \uc774\ub0b4\uc758 \uc8fc\ubb38\ub9cc \uc218\uc9d1. \ud398\uc774\uc9c0 \uc21c\ud68c \uc911 \ucef7\uc624\ud504 \ub3c4\ub2ec \uc2dc \uc790\ub3d9 \uc885\ub8cc."
+        )
+
         self.cancel_auto_btn = QPushButton("\ucde8\uc18c")
         self.cancel_auto_btn.clicked.connect(self._cancel_auto)
         self.cancel_auto_btn.setEnabled(False)
@@ -204,6 +216,8 @@ class PurchaseHistoryTab(QWidget):
 
         auto_row.addWidget(self.auto_naver_btn)
         auto_row.addWidget(self.auto_coupang_btn)
+        auto_row.addWidget(QLabel("최근"))
+        auto_row.addWidget(self.crawl_days_spin)
         auto_row.addWidget(self.reset_session_chk)
         auto_row.addWidget(self.cancel_auto_btn)
         auto_row.addWidget(self.status, 1)
@@ -455,11 +469,16 @@ class PurchaseHistoryTab(QWidget):
             QMessageBox.information(self, "\uc548\ub0b4", "\uc774\ubbf8 \uc218\uc9d1 \uc791\uc5c5\uc774 \uc9c4\ud589 \uc911\uc785\ub2c8\ub2e4.")
             return
         thread = QThread(self)
+        days = int(self.crawl_days_spin.value())
+        # 페이지당 약 10개 주문 가정 → 최대 페이지 = max(10, 일수/3) 정도로 안전 여유.
+        # 컷오프 도달 시 페이지 루프가 자동 종료하므로 max_pages 는 상한일 뿐.
+        max_pages = max(10, (days // 3) + 5)
         worker = _CrawlerWorker(
             channel,
             headless=False,
-            max_pages=10,
+            max_pages=max_pages,
             reset_session=self.reset_session_chk.isChecked(),
+            crawl_days=days,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -499,6 +518,7 @@ class PurchaseHistoryTab(QWidget):
     def _on_crawler_finished(self, result: object) -> None:
         if not isinstance(result, CrawlResult):
             self.status.setText("\uc218\uc9d1\uc774 \uc885\ub8cc\ub418\uc5c8\uc9c0\ub9cc \uacb0\uacfc\ub97c \uc77d\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4.")
+            QMessageBox.warning(self, "\uc218\uc9d1 \uacb0\uacfc \uc5c6\uc74c", "\uc218\uc9d1 \uc791\uc5c5\uc774 \uc885\ub8cc\ub410\uc9c0\ub9cc \uacb0\uacfc\ub97c \uc77d\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4.")
             return
         channel_label = self.CHANNEL_LABELS.get(result.channel, result.channel)
         if result.error:
@@ -510,19 +530,28 @@ class PurchaseHistoryTab(QWidget):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "\uc800\uc7a5 \uc2e4\ud328", str(exc))
             added = 0
+        order_count = 0
+        paid_count = 0
         order_msg = ""
         orders_attr = getattr(result, "orders", None) or []
         if orders_attr:
             try:
                 self.store.save_orders(orders_attr)
-                paid = sum(1 for o in orders_attr if o.payment_total is not None)
-                order_msg = f" \u00b7 \uc8fc\ubb38 {len(orders_attr)}\uac1c (\uacb0\uc81c\uae08 {paid}\uac1c)"
+                order_count = len(orders_attr)
+                paid_count = sum(1 for o in orders_attr if o.payment_total is not None)
+                order_msg = f" \u00b7 \uc8fc\ubb38 {order_count}\uac1c (\uacb0\uc81c\uae08 {paid_count}\uac1c)"
             except Exception as exc:  # noqa: BLE001
                 order_msg = f" \u00b7 \uc8fc\ubb38 \uc800\uc7a5 \uc2e4\ud328: {exc}"
+        summary = (
+            f"{channel_label} \uc790\ub3d9 \uc218\uc9d1 \uc644\ub8cc\n\n"
+            f"\ud488\ubaa9: {len(result.records)}\uac74 \ucd94\ucd9c \u00b7 {added}\uac74 \uc2e0\uaddc \uc800\uc7a5\n"
+            f"\uc8fc\ubb38: {order_count}\uac1c (\uacb0\uc81c\uae08 \ud655\uc778 {paid_count}\uac1c)"
+        )
         self.status.setText(
-            f"{channel_label} \uc790\ub3d9 \uc218\uc9d1 \uc644\ub8cc: {len(result.records)}\uac74 \ucd94\ucd9c, "
+            f"\u2713 {channel_label} \uc790\ub3d9 \uc218\uc9d1 \uc644\ub8cc: {len(result.records)}\uac74 \ucd94\ucd9c, "
             f"{added}\uac74 \uc2e0\uaddc \uc800\uc7a5{order_msg}"
         )
+        QMessageBox.information(self, f"{channel_label} \uc218\uc9d1 \uc644\ub8cc", summary)
         self.reload()
 
     def shutdown(self) -> None:

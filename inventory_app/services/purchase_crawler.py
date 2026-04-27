@@ -220,6 +220,7 @@ def crawl_channel(
     max_pages: int = 5,
     reset_session: bool = False,
     progress: Optional[CrawlerProgress] = None,
+    crawl_days: int = 0,
 ) -> CrawlResult:
     progress = progress or CrawlerProgress()
     channel = channel.lower().strip()
@@ -233,6 +234,7 @@ def crawl_channel(
             max_pages=max_pages,
             reset_session=reset_session,
             progress=progress,
+            crawl_days=crawl_days,
         )
 
     if reset_session:
@@ -353,27 +355,43 @@ def _setup_chrome_junction(progress: CrawlerProgress) -> bool:
     return True
 
 
-def _kill_chrome(progress: CrawlerProgress) -> None:
-    """Chrome 모든 인스턴스 종료.
+def _kill_chrome(progress: CrawlerProgress, only_debug_instance: bool = False) -> None:
+    """Chrome 인스턴스 종료.
 
-    Windows: 쿠팡 자동수집 전 필수 (NTFS junction 으로 사용자 프로필 공유하므로).
-    macOS: open -na 로 새 인스턴스 강제 생성하므로 불필요. 사용자 작업 보존.
-    Linux: 별도 user-data-dir 사용, 불필요.
+    Windows: 모든 chrome.exe 종료 (NTFS junction 으로 사용자 프로필 공유).
+    macOS/Linux:
+        only_debug_instance=False (기본): 종료 안 함 (사용자 Chrome 보존)
+        only_debug_instance=True: junction user-data-dir 매칭하는 인스턴스만 종료
     """
     import subprocess as _sp
     import sys
-    if sys.platform != "win32":
+    if sys.platform == "win32":
+        progress.on_log("Chrome 모든 인스턴스 종료 중...")
+        try:
+            _sp.run(
+                ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(2)
+        return
+
+    if not only_debug_instance:
         progress.on_log("(macOS/Linux: 사용자 Chrome 종료 안 함, 새 인스턴스 사용)")
         return
-    progress.on_log("Chrome 모든 인스턴스 종료 중...")
+
+    # macOS/Linux: junction 매칭하는 Chrome 만 종료
+    junction = str(_coupang_junction_path())
+    progress.on_log(f"디버깅 Chrome 인스턴스 종료 중 ({junction})")
     try:
         _sp.run(
-            ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
+            ["pkill", "-f", f"user-data-dir={junction}"],
             capture_output=True, text=True, timeout=10,
         )
     except Exception:  # noqa: BLE001
         pass
-    time.sleep(2)
+    time.sleep(1)
 
 
 def _wait_for_debug_port(port: int, timeout_sec: int, progress: CrawlerProgress) -> bool:
@@ -430,16 +448,37 @@ def _start_chrome_with_debug(
     if sys.platform == "darwin":
         # macOS: 사용자가 평상시 Chrome 을 켜둔 상태에서 binary 직접 실행하면
         # Launch Services 가 기존 인스턴스로 라우팅해 --remote-debugging-port 가 무시됨.
-        # `open -na` 로 강제 새 인스턴스 생성.
+        # `open -na` 로 강제 새 인스턴스 생성. PyInstaller frozen 환경에서는
+        # 부모의 stdio pipe 가 자식에게 전파되면 Chrome 이 이상하게 시작될 수 있어 DEVNULL 로 분리.
         app_path = "/Applications/Google Chrome.app"
         if not Path(app_path).exists():
-            # chrome_path 에서 .app 추출 시도
             app_path = chrome_path.split(".app/")[0] + ".app"
         cmd = ["open", "-na", app_path, "--args"] + chrome_args
+        progress.on_log(f"실행: {' '.join(cmd[:4])} ...")
         try:
-            proc = _sp.Popen(cmd)
+            result = _sp.run(
+                cmd,
+                stdout=_sp.PIPE, stderr=_sp.PIPE,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                err = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+                progress.on_log(f"open -na 실패 ({result.returncode}): {err}")
+                # 최후 수단: 직접 binary launch 시도 (사용자 Chrome 이 꺼져 있다면 동작)
+                progress.on_log("직접 binary 실행 fallback...")
+                fallback = [chrome_path] + chrome_args
+                proc = _sp.Popen(
+                    fallback,
+                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, stdin=_sp.DEVNULL,
+                    start_new_session=True,
+                )
+                progress.on_log(f"Chrome 직접 시작 (PID {proc.pid})")
+                return proc.pid
             progress.on_log(f"Chrome 디버깅 모드 시작 (open -na, port {port})")
-            return proc.pid
+            return -1  # open 은 즉시 종료. PID 추적 불필요. truthy 값이어야 함 (0 은 falsy → 호출부에서 실패로 인식)
+        except _sp.TimeoutExpired:
+            progress.on_log("open -na 타임아웃")
+            return None
         except Exception as exc:  # noqa: BLE001
             progress.on_log(f"Chrome 시작 실패 (open -na): {exc}")
             return None
@@ -460,6 +499,7 @@ def _crawl_coupang_via_cdp(
     max_pages: int,
     reset_session: bool,
     progress: CrawlerProgress,
+    crawl_days: int = 0,
 ) -> CrawlResult:
     """쿠팡 전용 CDP attach 방식.
 
@@ -496,42 +536,69 @@ def _crawl_coupang_via_cdp(
 
     _ensure_playwright()
 
-    _kill_chrome(progress)
-    if not _setup_chrome_junction(progress):
-        return CrawlResult(
-            channel="coupang", records=[],
-            error="Chrome 프로파일 junction 생성 실패. 평상시 Chrome 을 한 번 실행한 적이 있어야 합니다.",
-        )
-    junction = _coupang_junction_path()
-    if not _start_chrome_with_debug(chrome, junction, _COUPANG_DEBUG_PORT, _COUPANG_ORDER_URL, progress):
-        return CrawlResult(channel="coupang", records=[], error="Chrome 시작 실패")
-    # 포트 readiness 폴링 (최대 20초)
-    if not _wait_for_debug_port(_COUPANG_DEBUG_PORT, timeout_sec=20, progress=progress):
-        return CrawlResult(
-            channel="coupang", records=[],
-            error=(
-                f"Chrome 디버깅 포트({_COUPANG_DEBUG_PORT}) 응답 없음.\n"
-                "다른 Chrome 인스턴스가 실행 중일 수 있습니다. Chrome 을 모두 종료하고 다시 시도하세요."
-            ),
-        )
+    import sys as _sys
+    use_cdp_attach = (_sys.platform == "win32")
 
+    if use_cdp_attach:
+        _kill_chrome(progress)
+        if not _setup_chrome_junction(progress):
+            return CrawlResult(
+                channel="coupang", records=[],
+                error="Chrome 프로파일 junction 생성 실패. 평상시 Chrome 을 한 번 실행한 적이 있어야 합니다.",
+            )
+        junction = _coupang_junction_path()
+        if not _start_chrome_with_debug(chrome, junction, _COUPANG_DEBUG_PORT, _COUPANG_ORDER_URL, progress):
+            return CrawlResult(channel="coupang", records=[], error="Chrome 시작 실패")
+        if not _wait_for_debug_port(_COUPANG_DEBUG_PORT, timeout_sec=20, progress=progress):
+            return CrawlResult(
+                channel="coupang", records=[],
+                error=(
+                    f"Chrome 디버깅 포트({_COUPANG_DEBUG_PORT}) 응답 없음.\n"
+                    "다른 Chrome 인스턴스가 실행 중일 수 있습니다. Chrome 을 모두 종료하고 다시 시도하세요."
+                ),
+            )
+    else:
+        # macOS/Linux: 단순 별도 user-data-dir
+        _setup_chrome_junction(progress)
+
+    junction = _coupang_junction_path()
     records: List[PurchaseRecord] = []
     try:
         with sync_playwright() as pw:  # type: ignore[misc]
-            try:
-                # Chrome 은 127.0.0.1 에만 바인딩 → localhost 가 IPv6(::1)로 해석되면 실패. 명시.
-                browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{_COUPANG_DEBUG_PORT}")
-            except Exception as exc:  # noqa: BLE001
-                return CrawlResult(
-                    channel="coupang", records=[],
-                    error=(
-                        f"CDP 연결 실패: {exc}\n\n"
-                        "다른 Chrome 인스턴스가 디버깅 포트를 가로챘을 수 있습니다.\n"
-                        "Chrome 을 모두 종료하고 다시 시도하세요."
-                    ),
-                )
-            progress.on_log(f"CDP 연결 OK (contexts={len(browser.contexts)})")
-            ctx = browser.contexts[0]
+            if use_cdp_attach:
+                try:
+                    browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{_COUPANG_DEBUG_PORT}")
+                except Exception as exc:  # noqa: BLE001
+                    return CrawlResult(
+                        channel="coupang", records=[],
+                        error=(
+                            f"CDP 연결 실패: {exc}\n\n"
+                            "Chrome 을 모두 종료하고 다시 시도하세요."
+                        ),
+                    )
+                progress.on_log(f"CDP 연결 OK (contexts={len(browser.contexts)})")
+                ctx = browser.contexts[0]
+            else:
+                # macOS/Linux: launch_persistent_context — 안정적, CDP 'Browser context management' 오류 회피
+                try:
+                    ctx = pw.chromium.launch_persistent_context(
+                        user_data_dir=str(junction),
+                        executable_path=chrome,
+                        headless=False,
+                        args=["--no-first-run", "--no-default-browser-check"],
+                    )
+                    # 쿠팡 페이지 열기
+                    if ctx.pages:
+                        ctx.pages[0].goto(_COUPANG_ORDER_URL, wait_until="domcontentloaded", timeout=60_000)
+                    else:
+                        page = ctx.new_page()
+                        page.goto(_COUPANG_ORDER_URL, wait_until="domcontentloaded", timeout=60_000)
+                except Exception as exc:  # noqa: BLE001
+                    return CrawlResult(
+                        channel="coupang", records=[],
+                        error=f"Chrome 시작 실패 (Playwright): {exc}",
+                    )
+                progress.on_log("Chrome 시작 (Playwright persistent context)")
 
             # 쿠팡 탭 찾기 (poll)
             target_page = None
@@ -598,6 +665,19 @@ def _crawl_coupang_via_cdp(
             # 데이터 추출 — 1 ~ max_pages 페이지 순회
             # NEXT_DATA 는 SSR HTML 에 이미 들어있으므로 networkidle 대기 불필요
 
+            # 날짜 컷오프 계산 (crawl_days > 0 이면 그 이전 주문은 무시 + 그 페이지에서 종료)
+            cutoff_date_str: Optional[str] = None
+            if crawl_days and crawl_days > 0:
+                from datetime import date as _date, timedelta as _td
+                cutoff = _date.today() - _td(days=int(crawl_days))
+                cutoff_date_str = cutoff.isoformat()
+                progress.on_log(f"날짜 컷오프: {cutoff_date_str} 이전 주문은 무시")
+
+            def _page_oldest_date(orders_list: List[PurchaseOrder]) -> Optional[str]:
+                """주문 목록 중 가장 오래된 order_date (ISO yyyy-mm-dd) 반환."""
+                dates = [o.order_date for o in orders_list if o.order_date]
+                return min(dates) if dates else None
+
             # 첫 페이지 추출 (__NEXT_DATA__ 기반 → 품목 + 주문 동시 획득)
             seen_keys: set[str] = set()
             seen_orders: set[str] = set()
@@ -623,6 +703,14 @@ def _crawl_coupang_via_cdp(
             )
             if not has_next:
                 progress.on_log("✓ orderPagination.hasNext=false → 1페이지가 마지막")
+            # 컷오프 도달 검사: 이 페이지의 가장 오래된 주문이 컷오프 이전이면 종료
+            if cutoff_date_str:
+                oldest = _page_oldest_date(page1_orders)
+                if oldest and oldest < cutoff_date_str:
+                    progress.on_log(
+                        f"✓ 컷오프 도달 (가장 오래된 주문 {oldest} < {cutoff_date_str}) → 종료"
+                    )
+                    has_next = False
 
             # 2 ~ max_pages 페이지 (URL ?pageIndex=N-1)
             # 종료 조건: hasNext=false 또는 max_pages 도달 또는 사용자 취소
@@ -669,12 +757,20 @@ def _crawl_coupang_via_cdp(
                     # 종료 판단:
                     # 1) NEXT_DATA 의 hasNext=false → 정확한 마지막 페이지 신호
                     # 2) orderList 가 빈 페이지가 나왔다 → 비정상 (보호용)
+                    # 3) 날짜 컷오프 도달
                     if not has_next:
                         progress.on_log("✓ orderPagination.hasNext=false → 마지막 페이지")
                         break
                     if len(page_recs) == 0 and len(page_orders) == 0:
                         progress.on_log("주문 0건 → 마지막 페이지로 간주")
                         break
+                    if cutoff_date_str:
+                        oldest = _page_oldest_date(page_orders)
+                        if oldest and oldest < cutoff_date_str:
+                            progress.on_log(
+                                f"✓ 컷오프 도달 (가장 오래된 주문 {oldest} < {cutoff_date_str}) → 종료"
+                            )
+                            break
 
             # __NEXT_DATA__ 가 모든 정보를 담고 있어 주문 상세 페이지 추가 호출 불필요
             paid_count = sum(1 for o in orders if o.payment_total is not None)
@@ -686,9 +782,9 @@ def _crawl_coupang_via_cdp(
         progress.on_log(f"오류: {exc}")
         return CrawlResult(channel="coupang", records=[], error=str(exc))
     finally:
-        # 수집 종료 시 Chrome 창 자동 닫음
+        # 수집 종료 시 우리가 띄운 Chrome 창만 자동 닫음 (사용자 Chrome 은 보존)
         try:
-            _kill_chrome(progress)
+            _kill_chrome(progress, only_debug_instance=True)
             progress.on_log("Chrome 창 자동 종료")
         except Exception:  # noqa: BLE001
             pass
