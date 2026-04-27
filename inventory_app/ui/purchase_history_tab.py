@@ -10,8 +10,11 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -21,8 +24,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PySide6.QtGui import QFont
 
-from inventory_app.models import PurchaseRecord
+from inventory_app.models import PurchaseOrder, PurchaseRecord
 from inventory_app.services.coupang_credentials import (
     CoupangAccount,
     delete_account as delete_coupang_account,
@@ -37,6 +41,192 @@ from inventory_app.services.purchase_crawler import (
     ensure_browser_installed,
 )
 from inventory_app.services.purchase_history_service import PurchaseHistoryParser, PurchaseHistoryStore
+
+
+class _OrderDetailDialog(QDialog):
+    """주문번호 상세 팝업: 결제총액, 캐시 차감, 실 카드결제, 품목 목록."""
+
+    def __init__(
+        self,
+        order_no: str,
+        order: Optional[PurchaseOrder],
+        items: List[PurchaseRecord],
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"주문 {order_no} 상세")
+        self.resize(1000, 760)
+        self.setMinimumSize(720, 500)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        head_font = QFont(); head_font.setBold(True); head_font.setPointSize(11)
+
+        # 1) 주문 요약 박스
+        summary = QLabel()
+        summary.setTextFormat(Qt.RichText)
+        summary.setWordWrap(True)
+        summary.setStyleSheet(
+            "QLabel { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; "
+            "padding: 12px 14px; }"
+        )
+
+        items_total = sum(int(r.amount or 0) for r in items if (r.amount or 0) > 0)
+        payment_total: Optional[int] = None
+        cash_used: Optional[int] = None
+        card_amount: Optional[int] = None
+        status = ""
+        order_date = ""
+        payment_method = ""
+
+        if order is not None:
+            payment_total = order.payment_total
+            cash_used = order.cash_used
+            card_amount = order.card_amount
+            status = order.status or ""
+            order_date = order.order_date or ""
+            payment_method = order.payment_method or ""
+
+        # card_amount 가 None 이면 payment_total - cash_used 로 추정
+        if card_amount is None and payment_total is not None:
+            card_amount = int(payment_total) - int(cash_used or 0)
+
+        rows_html: List[str] = []
+        rows_html.append(
+            f"<div style='font-size:13px; font-weight:700; color:#0f172a; margin-bottom:6px;'>"
+            f"주문 {order_no}{(' · ' + status) if status else ''}"
+            f"</div>"
+        )
+        sub_parts: List[str] = []
+        if order_date:
+            sub_parts.append(f"주문일 {order_date}")
+        if items:
+            sub_parts.append(f"품목 {len(items)}건")
+        if payment_method:
+            sub_parts.append(f"결제수단 {payment_method}")
+        if sub_parts:
+            rows_html.append(
+                f"<div style='color:#64748b; font-size:11px; margin-bottom:10px;'>"
+                f"{' · '.join(sub_parts)}</div>"
+            )
+
+        # 결제 breakdown 표
+        rows_html.append("<table style='border-collapse:collapse; width:100%; font-size:12px;'>")
+
+        def _row(label: str, value: str, *, color: str = "#334155", bold: bool = False, hr: bool = False) -> str:
+            border = "border-top: 1px solid #e2e8f0;" if hr else ""
+            wt = "700" if bold else "500"
+            return (
+                f"<tr><td style='padding:6px 4px; color:#64748b; {border}'>{label}</td>"
+                f"<td style='padding:6px 4px; text-align:right; color:{color}; "
+                f"font-weight:{wt}; {border}'>{value}</td></tr>"
+            )
+
+        rows_html.append(_row("품목 합계 (양수)", f"{items_total:,}원"))
+        if payment_total is not None:
+            rows_html.append(_row("결제 총액", f"{int(payment_total):,}원", color="#0f172a", bold=True))
+        else:
+            rows_html.append(_row("결제 총액", "(데이터 없음)", color="#94a3b8"))
+        rows_html.append(
+            _row(
+                "쿠팡캐시/포인트 차감",
+                f"− {int(cash_used or 0):,}원" if cash_used else "0원",
+                color="#dc2626" if cash_used else "#94a3b8",
+            )
+        )
+        rows_html.append(
+            _row(
+                "실 카드 결제금액",
+                f"{int(card_amount):,}원" if card_amount is not None else "(데이터 없음)",
+                color="#15803d" if card_amount is not None else "#94a3b8",
+                bold=True,
+                hr=True,
+            )
+        )
+        rows_html.append("</table>")
+
+        # 일치/차이 배지
+        if payment_total is not None and items_total > 0:
+            diff = items_total - int(payment_total)
+            if diff == 0:
+                badge = (
+                    "<div style='margin-top:10px;'>"
+                    "<span style='background:#dcfce7; color:#166534; padding:3px 10px; "
+                    "border-radius:10px; font-size:11px; font-weight:600;'>"
+                    "✓ 품목합계 = 결제총액</span></div>"
+                )
+            else:
+                sign = "+" if diff > 0 else ""
+                badge = (
+                    "<div style='margin-top:10px;'>"
+                    f"<span style='background:#fef3c7; color:#92400e; padding:3px 10px; "
+                    f"border-radius:10px; font-size:11px; font-weight:600;'>"
+                    f"⚠ 품목합계 − 결제총액 = {sign}{diff:,}원 (배송비/할인/쿠폰 차이)</span></div>"
+                )
+            rows_html.append(badge)
+
+        summary.setText("".join(rows_html))
+        layout.addWidget(summary)
+
+        # 2) 품목 목록
+        items_label = QLabel(f"📦 품목 ({len(items)}건)")
+        items_label.setFont(head_font)
+        items_label.setStyleSheet("color: #0f172a;")
+        layout.addWidget(items_label)
+
+        items_table = QTableWidget(0, 4)
+        items_table.setHorizontalHeaderLabels(["일자", "상품/내역", "금액", "결제수단"])
+        items_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        items_table.setAlternatingRowColors(True)
+        items_table.verticalHeader().setVisible(False)
+        items_table.setShowGrid(False)
+        items_table.setStyleSheet(
+            "QTableWidget { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px;"
+            " gridline-color: #e2e8f0; }"
+            "QHeaderView::section { background: #f8fafc; border: none;"
+            " border-bottom: 1px solid #e2e8f0; padding: 6px; font-weight: 600; color: #475569; }"
+            "QTableWidget::item { padding: 6px 8px; border: none; }"
+        )
+        h = items_table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(1, QHeaderView.Stretch)
+        h.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        items_table.setRowCount(len(items))
+        for r, rec in enumerate(items):
+            ramt = int(rec.amount or 0)
+            cancelled = ramt < 0
+            d_item = QTableWidgetItem(rec.order_date or "")
+            t_item = QTableWidgetItem((rec.title or "").strip())
+            t_item.setToolTip(rec.title or "")
+            a_item = QTableWidgetItem(f"{ramt:,}원")
+            a_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            af = QFont(); af.setBold(True); a_item.setFont(af)
+            pm_item = QTableWidgetItem(rec.payment_method or "-")
+            if cancelled:
+                from PySide6.QtGui import QBrush as _QB, QColor as _QC
+                a_item.setForeground(_QB(_QC("#dc2626")))
+                t_item.setForeground(_QB(_QC("#dc2626")))
+            items_table.setItem(r, 0, d_item)
+            items_table.setItem(r, 1, t_item)
+            items_table.setItem(r, 2, a_item)
+            items_table.setItem(r, 3, pm_item)
+        if not items:
+            items_table.setRowCount(1)
+            ph = QTableWidgetItem("(품목 데이터 없음 — 자동수집 필요)")
+            from PySide6.QtGui import QBrush as _QB, QColor as _QC
+            ph.setForeground(_QB(_QC("#94a3b8")))
+            items_table.setSpan(0, 0, 1, 4)
+            items_table.setItem(0, 0, ph)
+        layout.addWidget(items_table, 1)
+
+        btn_row = QDialogButtonBox(QDialogButtonBox.Close)
+        btn_row.rejected.connect(self.reject)
+        btn_row.accepted.connect(self.accept)
+        layout.addWidget(btn_row)
 
 
 class _NumberItem(QTableWidgetItem):
@@ -457,16 +647,66 @@ class PurchaseHistoryTab(QWidget):
             self.status.setText(f"{len(rows):,}\uac74 | {net:,}\uc6d0")
 
     def _on_cell_double_clicked(self, row: int, col: int) -> None:
-        """상품/내역 컬럼 더블클릭 → 상품 페이지 열기."""
-        if col != 3:  # 상품/내역 컬럼만
+        """주문번호(2) → 결제 상세 / 상품(3) → 상품페이지."""
+        if col == 2:
+            order_no_item = self.table.item(row, col)
+            if order_no_item is None:
+                return
+            order_no = (order_no_item.text() or "").strip()
+            if not order_no or order_no == "-":
+                return
+            channel_item = self.table.item(row, 1)
+            channel_label = (channel_item.text() if channel_item else "") or ""
+            channel = "coupang" if "쿠팡" in channel_label else (
+                "naver" if "네이버" in channel_label else "coupang"
+            )
+            self._open_order_detail(channel, order_no)
             return
-        item = self.table.item(row, col)
-        if item is None:
-            return
-        url = item.data(Qt.UserRole + 1)
-        if not url:
-            return
-        QDesktopServices.openUrl(QUrl(str(url)))
+        if col == 3:  # 상품/내역 컬럼
+            item = self.table.item(row, col)
+            if item is None:
+                return
+            url = item.data(Qt.UserRole + 1)
+            if not url:
+                return
+            QDesktopServices.openUrl(QUrl(str(url)))
+
+    def _open_order_detail(self, channel: str, order_no: str) -> None:
+        order: Optional[PurchaseOrder] = None
+        items: List[PurchaseRecord] = []
+        # Pi 우선
+        if self._pi_client is not None and getattr(self._pi_client, "is_configured", False):
+            try:
+                for o in self._pi_client.list_purchase_orders(channel=channel, limit=5000):
+                    if (o.order_no or "") == order_no:
+                        order = o
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                items = [
+                    r for r in self._pi_client.list_purchase_records(channel=channel, limit=10000)
+                    if (r.order_no or "") == order_no
+                ]
+            except Exception:  # noqa: BLE001
+                items = []
+        # 로컬 fallback
+        if order is None or not items:
+            try:
+                if order is None:
+                    for o in self.store.load_orders(channel=channel, limit=5000):
+                        if (o.order_no or "") == order_no:
+                            order = o
+                            break
+                if not items:
+                    items = [
+                        r for r in self.store.load_records(channel=channel, limit=20000)
+                        if (r.order_no or "") == order_no
+                    ]
+            except Exception:  # noqa: BLE001
+                pass
+        dlg = _OrderDetailDialog(order_no, order, items, parent=self)
+        dlg.exec()
 
     def _render(self, rows: List[PurchaseRecord]) -> None:
         self.table.setSortingEnabled(False)
