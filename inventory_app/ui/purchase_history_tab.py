@@ -710,10 +710,23 @@ class PurchaseHistoryTab(QWidget):
 
     def _render(self, rows: List[PurchaseRecord]) -> None:
         self.table.setSortingEnabled(False)
+        self.table.setAlternatingRowColors(False)
         self.table.setRowCount(len(rows))
         red_brush = QBrush(QColor("#dc2626"))
         gray_brush = QBrush(QColor("#9ca3af"))
+        # \uc8fc\ubb38\ubc88\ud638 \uae30\uc900 \uc9c0\ube0c\ub77c: \uc8fc\ubb38\ubc88\ud638\uac00 \ubc14\ub014 \ub54c\ub9c8\ub2e4 \uc0c9 \ud1a0\uae00
+        zebra_brushes = [QBrush(QColor("#ffffff")), QBrush(QColor("#eef2f7"))]
+        zebra_idx = 0
+        prev_order_no: Optional[str] = None
         for row_idx, record in enumerate(rows):
+            current_order_no = (record.order_no or "").strip() or f"__row_{row_idx}"
+            if prev_order_no is None:
+                zebra_idx = 0
+            elif current_order_no != prev_order_no:
+                zebra_idx = 1 - zebra_idx
+            prev_order_no = current_order_no
+            row_bg = zebra_brushes[zebra_idx]
+
             cancelled = self._is_cancelled(record)
             signed_amount = self._signed_amount(record)
             values: list[Any] = [
@@ -741,6 +754,7 @@ class PurchaseHistoryTab(QWidget):
                     if cancelled:
                         item.setForeground(red_brush if col_idx == 3 else gray_brush)
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                item.setBackground(row_bg)
                 if col_idx == 3:
                     # 상품 페이지 URL 을 cell 에 임베드 → 더블클릭 시 사용 (색상은 기본 유지)
                     if record.source_url and record.source_url != self.ORDER_URLS.get(record.channel, ""):
