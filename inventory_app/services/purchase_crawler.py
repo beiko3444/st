@@ -317,24 +317,23 @@ def _coupang_junction_path() -> Path:
 
 
 def _setup_chrome_junction(progress: CrawlerProgress) -> bool:
-    """사용자 평상시 Chrome User Data 를 다른 경로로 보이게 함.
+    """디버깅 포트가 활성화 가능한 별도 user-data-dir 준비.
 
-    Windows: NTFS junction (mklink /J)
-    macOS/Linux: symbolic link (os.symlink)
-
-    이렇게 하면 Chrome 보안 정책 (default user-data-dir 에 디버깅 거부) 우회 가능.
+    Windows: NTFS junction (mklink /J) — Chrome 이 canonical path 비교를 안 함.
+    macOS/Linux: 별도의 빈 디렉토리 사용 — symlink 는 Chrome 이 canonical 화하여 default 와 동일로 판단해 디버깅 포트 거부.
+        → 첫 실행 시 사용자가 쿠팡 로그인을 한 번 해야 함. 이후엔 이 폴더에 세션 저장됨.
     """
     import sys
     junction = _coupang_junction_path()
-    real = _real_chrome_user_data()
-    if not real.exists():
-        progress.on_log(f"사용자 Chrome User Data 폴더 없음: {real}")
-        return False
-    if junction.exists() or junction.is_symlink():
-        return True
-    junction.parent.mkdir(parents=True, exist_ok=True)
 
     if sys.platform == "win32":
+        real = _real_chrome_user_data()
+        if not real.exists():
+            progress.on_log(f"사용자 Chrome User Data 폴더 없음: {real}")
+            return False
+        if junction.exists():
+            return True
+        junction.parent.mkdir(parents=True, exist_ok=True)
         import subprocess as _sp
         cmd = ["cmd", "/c", "mklink", "/J", str(junction), str(real)]
         progress.on_log(f"Junction 생성: {junction.name} → {real.name}")
@@ -348,43 +347,70 @@ def _setup_chrome_junction(progress: CrawlerProgress) -> bool:
             return False
         return True
 
-    # macOS / Linux: 심볼릭 링크
-    import os as _os
-    progress.on_log(f"Symlink 생성: {junction} → {real}")
-    try:
-        _os.symlink(str(real), str(junction))
-    except FileExistsError:
-        return True
-    except Exception as exc:  # noqa: BLE001
-        progress.on_log(f"Symlink 실패: {exc}")
-        return False
+    # macOS / Linux: 별도 폴더 사용 (symlink 는 Chrome 보안정책 우회 못함).
+    # 첫 실행 시에만 사용자가 쿠팡 로그인 1회 필요. 이후 폴더에 세션 저장.
+    junction.mkdir(parents=True, exist_ok=True)
     return True
 
 
 def _kill_chrome(progress: CrawlerProgress) -> None:
-    """Chrome 모든 인스턴스 종료. 쿠팡 자동수집 전 필수."""
+    """Chrome 모든 인스턴스 종료.
+
+    Windows: 쿠팡 자동수집 전 필수 (NTFS junction 으로 사용자 프로필 공유하므로).
+    macOS: open -na 로 새 인스턴스 강제 생성하므로 불필요. 사용자 작업 보존.
+    Linux: 별도 user-data-dir 사용, 불필요.
+    """
     import subprocess as _sp
     import sys
+    if sys.platform != "win32":
+        progress.on_log("(macOS/Linux: 사용자 Chrome 종료 안 함, 새 인스턴스 사용)")
+        return
     progress.on_log("Chrome 모든 인스턴스 종료 중...")
     try:
-        if sys.platform == "win32":
-            _sp.run(
-                ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
-                capture_output=True, text=True, timeout=10,
-            )
-        else:
-            # macOS / Linux: pkill
-            _sp.run(["pkill", "-f", "Google Chrome"], capture_output=True, text=True, timeout=10)
-            _sp.run(["pkill", "-f", "chrome"], capture_output=True, text=True, timeout=10)
+        _sp.run(
+            ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
+            capture_output=True, text=True, timeout=10,
+        )
     except Exception:  # noqa: BLE001
         pass
     time.sleep(2)
+
+
+def _wait_for_debug_port(port: int, timeout_sec: int, progress: CrawlerProgress) -> bool:
+    """Chrome 의 CDP 포트가 응답할 때까지 대기. /json/version 200 OK 면 성공."""
+    import socket
+    import urllib.request
+    deadline = time.time() + timeout_sec
+    last_err: Optional[str] = None
+    while time.time() < deadline:
+        # 1) TCP 연결 가능?
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        try:
+            s.connect(("127.0.0.1", port))
+            s.close()
+        except Exception as exc:  # noqa: BLE001
+            last_err = f"tcp: {exc}"
+            time.sleep(0.5)
+            continue
+        # 2) HTTP /json/version 응답?
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2) as resp:
+                if resp.status == 200:
+                    progress.on_log(f"디버깅 포트 {port} 준비 완료")
+                    return True
+        except Exception as exc:  # noqa: BLE001
+            last_err = f"http: {exc}"
+        time.sleep(0.5)
+    progress.on_log(f"디버깅 포트 {port} 타임아웃: {last_err}")
+    return False
 
 
 def _start_chrome_with_debug(
     chrome_path: str, junction: Path, port: int, target_url: str, progress: CrawlerProgress
 ) -> Optional[int]:
     import subprocess as _sp
+    import sys
     # SingletonLock 정리
     for f in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
         try:
@@ -392,13 +418,34 @@ def _start_chrome_with_debug(
         except Exception:
             pass
 
-    args = [
-        chrome_path,
+    chrome_args = [
         f"--remote-debugging-port={port}",
         f"--user-data-dir={junction}",
         "--profile-directory=Default",
+        "--no-first-run",
+        "--no-default-browser-check",
         target_url,
     ]
+
+    if sys.platform == "darwin":
+        # macOS: 사용자가 평상시 Chrome 을 켜둔 상태에서 binary 직접 실행하면
+        # Launch Services 가 기존 인스턴스로 라우팅해 --remote-debugging-port 가 무시됨.
+        # `open -na` 로 강제 새 인스턴스 생성.
+        app_path = "/Applications/Google Chrome.app"
+        if not Path(app_path).exists():
+            # chrome_path 에서 .app 추출 시도
+            app_path = chrome_path.split(".app/")[0] + ".app"
+        cmd = ["open", "-na", app_path, "--args"] + chrome_args
+        try:
+            proc = _sp.Popen(cmd)
+            progress.on_log(f"Chrome 디버깅 모드 시작 (open -na, port {port})")
+            return proc.pid
+        except Exception as exc:  # noqa: BLE001
+            progress.on_log(f"Chrome 시작 실패 (open -na): {exc}")
+            return None
+
+    # Windows / Linux: binary 직접 실행
+    args = [chrome_path] + chrome_args
     try:
         proc = _sp.Popen(args)
         progress.on_log(f"Chrome 디버깅 모드 시작 (port {port}, PID {proc.pid})")
@@ -424,12 +471,19 @@ def _crawl_coupang_via_cdp(
     6) 주문 데이터 추출
     """
     if reset_session:
-        # 세션 초기화 = junction 만 삭제 (사용자 실제 Chrome 데이터는 절대 안 건드림)
+        # 세션 초기화 = junction 링크만 삭제 (사용자 실제 Chrome 데이터는 절대 안 건드림)
         try:
             jp = _coupang_junction_path()
-            if jp.exists():
-                import subprocess as _sp
-                _sp.run(["cmd", "/c", "rmdir", str(jp)], capture_output=True, timeout=5)
+            if jp.exists() or jp.is_symlink():
+                import sys, subprocess as _sp
+                if sys.platform == "win32":
+                    _sp.run(["cmd", "/c", "rmdir", str(jp)], capture_output=True, timeout=5)
+                else:
+                    # macOS/Linux: symlink 또는 directory
+                    if jp.is_symlink():
+                        jp.unlink()
+                    else:
+                        _sp.run(["rm", "-rf", str(jp)], capture_output=True, timeout=5)
         except Exception:  # noqa: BLE001
             pass
 
@@ -451,13 +505,22 @@ def _crawl_coupang_via_cdp(
     junction = _coupang_junction_path()
     if not _start_chrome_with_debug(chrome, junction, _COUPANG_DEBUG_PORT, _COUPANG_ORDER_URL, progress):
         return CrawlResult(channel="coupang", records=[], error="Chrome 시작 실패")
-    time.sleep(3)
+    # 포트 readiness 폴링 (최대 20초)
+    if not _wait_for_debug_port(_COUPANG_DEBUG_PORT, timeout_sec=20, progress=progress):
+        return CrawlResult(
+            channel="coupang", records=[],
+            error=(
+                f"Chrome 디버깅 포트({_COUPANG_DEBUG_PORT}) 응답 없음.\n"
+                "다른 Chrome 인스턴스가 실행 중일 수 있습니다. Chrome 을 모두 종료하고 다시 시도하세요."
+            ),
+        )
 
     records: List[PurchaseRecord] = []
     try:
         with sync_playwright() as pw:  # type: ignore[misc]
             try:
-                browser = pw.chromium.connect_over_cdp(f"http://localhost:{_COUPANG_DEBUG_PORT}")
+                # Chrome 은 127.0.0.1 에만 바인딩 → localhost 가 IPv6(::1)로 해석되면 실패. 명시.
+                browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{_COUPANG_DEBUG_PORT}")
             except Exception as exc:  # noqa: BLE001
                 return CrawlResult(
                     channel="coupang", records=[],
