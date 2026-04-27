@@ -861,7 +861,7 @@ class CardUsageTab(QWidget):
         h.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # 금액
         h.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # 카드
         h.setSectionResizeMode(5, QHeaderView.Fixed)              # 검토
-        self.table.setColumnWidth(5, 44)
+        self.table.setColumnWidth(5, 56)
         h.setSectionResizeMode(6, QHeaderView.Stretch)            # 메모
         h.setSectionsClickable(True)
         h.setSortIndicatorShown(True)
@@ -1562,21 +1562,20 @@ class CardUsageTab(QWidget):
                 self.table.setItem(r, self.COL_REVIEW, review_placeholder)
                 self.table.setItem(r, self.COL_MEMO, memo_item)
 
-                # 검토 버튼
-                review_btn = QPushButton("✓ 검토" if reviewed else "검토")
+                # 검토 버튼 — 정사각형 체크박스 스타일
+                review_btn = QPushButton("✓" if reviewed else "")
                 review_btn.setCursor(Qt.PointingHandCursor)
-                review_btn.setMinimumWidth(74)
-                review_btn.setMaximumWidth(82)
+                review_btn.setFixedSize(24, 24)
                 if reviewed:
                     review_btn.setStyleSheet(
                         "QPushButton { background: #16a34a; color: #ffffff; border: none; "
-                        "border-radius: 6px; padding: 4px 10px; font-size: 11px; font-weight: 600; }"
+                        "border-radius: 0px; padding: 0px; font-size: 14px; font-weight: 700; }"
                         "QPushButton:hover { background: #15803d; }"
                     )
                 else:
                     review_btn.setStyleSheet(
                         "QPushButton { background: #ffffff; color: #475569; "
-                        "border: 1px solid #cbd5e1; border-radius: 6px; padding: 4px 10px; "
+                        "border: 1px solid #cbd5e1; border-radius: 0px; padding: 0px; "
                         "font-size: 11px; font-weight: 500; }"
                         "QPushButton:hover { background: #f1f5f9; border-color: #94a3b8; }"
                     )
@@ -1584,7 +1583,13 @@ class CardUsageTab(QWidget):
                 review_btn.clicked.connect(
                     lambda _checked=False, k=key: self._on_review_btn_clicked(k)
                 )
-                self.table.setCellWidget(r, self.COL_REVIEW, review_btn)
+                # 셀 안에서 가운데 정렬되도록 컨테이너로 감싸기
+                review_wrap = QWidget()
+                wrap_layout = QHBoxLayout(review_wrap)
+                wrap_layout.setContentsMargins(0, 0, 0, 0)
+                wrap_layout.setSpacing(0)
+                wrap_layout.addWidget(review_btn, 0, Qt.AlignCenter)
+                self.table.setCellWidget(r, self.COL_REVIEW, review_wrap)
         finally:
             self._suspend_memo_signal = False
 
