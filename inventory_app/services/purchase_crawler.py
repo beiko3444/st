@@ -220,6 +220,8 @@ def crawl_channel(
     max_pages: int = 5,
     reset_session: bool = False,
     progress: Optional[CrawlerProgress] = None,
+    coupang_email: str = "",
+    coupang_password: str = "",
 ) -> CrawlResult:
     progress = progress or CrawlerProgress()
     channel = channel.lower().strip()
@@ -233,6 +235,8 @@ def crawl_channel(
             max_pages=max_pages,
             reset_session=reset_session,
             progress=progress,
+            email=coupang_email,
+            password=coupang_password,
         )
 
     if reset_session:
@@ -240,6 +244,7 @@ def crawl_channel(
 
     try:
         _ensure_playwright()
+        _kill_chrome(progress)
         with sync_playwright() as pw:  # type: ignore[misc]
             context = _launch_persistent_context(pw, channel, headless, progress)
             try:
@@ -354,26 +359,55 @@ def _setup_chrome_junction(progress: CrawlerProgress) -> bool:
 
 
 def _kill_chrome(progress: CrawlerProgress) -> None:
-    """Chrome 모든 인스턴스 종료.
-
-    Windows: 쿠팡 자동수집 전 필수 (NTFS junction 으로 사용자 프로필 공유하므로).
-    macOS: open -na 로 새 인스턴스 강제 생성하므로 불필요. 사용자 작업 보존.
-    Linux: 별도 user-data-dir 사용, 불필요.
-    """
+    """Chrome 모든 인스턴스 종료 후 재시작 준비."""
     import subprocess as _sp
     import sys
-    if sys.platform != "win32":
-        progress.on_log("(macOS/Linux: 사용자 Chrome 종료 안 함, 새 인스턴스 사용)")
-        return
     progress.on_log("Chrome 모든 인스턴스 종료 중...")
-    try:
-        _sp.run(
-            ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
-            capture_output=True, text=True, timeout=10,
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    time.sleep(2)
+    if sys.platform == "win32":
+        try:
+            _sp.run(
+                ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(2)
+        return
+
+    if sys.platform == "darwin":
+        # 1) 정상 종료 시도 (세션/탭 보존)
+        try:
+            _sp.run(
+                ["osascript", "-e", 'tell application "Google Chrome" to quit'],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        # 종료 대기 (최대 5초)
+        for _ in range(10):
+            try:
+                r = _sp.run(["pgrep", "-x", "Google Chrome"], capture_output=True, text=True, timeout=2)
+                if r.returncode != 0:
+                    break
+            except Exception:  # noqa: BLE001
+                break
+            time.sleep(0.5)
+        # 2) 강제 종료 (메인 + 헬퍼 프로세스)
+        for name in ("Google Chrome", "Google Chrome Helper", "Google Chrome Helper (Renderer)", "Google Chrome Helper (GPU)"):
+            try:
+                _sp.run(["pkill", "-9", "-f", name], capture_output=True, timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+        time.sleep(1.5)
+        return
+
+    # Linux
+    for name in ("chrome", "google-chrome", "chromium"):
+        try:
+            _sp.run(["pkill", "-9", "-f", name], capture_output=True, timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+    time.sleep(1.5)
 
 
 def _wait_for_debug_port(port: int, timeout_sec: int, progress: CrawlerProgress) -> bool:
@@ -455,11 +489,82 @@ def _start_chrome_with_debug(
         return None
 
 
+def _try_coupang_auto_login(page, email: str, password: str, progress: CrawlerProgress) -> bool:
+    """쿠팡 로그인 페이지에서 저장된 계정으로 자동 로그인 시도.
+
+    성공/시도 여부와 무관하게 captcha/2FA 가 떠도 사용자 수동 개입 가능.
+    """
+    if not email or not password:
+        return False
+    email_selectors = [
+        "#login-email-input",
+        "input[name='email']",
+        "input[type='email']",
+        "input[autocomplete='username']",
+    ]
+    password_selectors = [
+        "#login-password-input",
+        "input[name='password']",
+        "input[type='password']",
+    ]
+    submit_selectors = [
+        "button[type='submit']",
+        ".login__button-submit",
+        "button.login__button-submit",
+        "form button:has-text('로그인')",
+    ]
+
+    def _fill_first(selectors: List[str], value: str) -> bool:
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() == 0:
+                    continue
+                loc.wait_for(state="visible", timeout=3000)
+                loc.fill(value, timeout=3000)
+                return True
+            except Exception:
+                continue
+        return False
+
+    try:
+        if not _fill_first(email_selectors, email):
+            progress.on_log("자동로그인 실패: 이메일 입력란을 찾지 못함")
+            return False
+        if not _fill_first(password_selectors, password):
+            progress.on_log("자동로그인 실패: 비밀번호 입력란을 찾지 못함")
+            return False
+        for sel in submit_selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() == 0:
+                    continue
+                if not loc.is_visible(timeout=1000):
+                    continue
+                loc.click(timeout=3000)
+                progress.on_log("저장된 계정으로 자동 로그인 시도")
+                return True
+            except Exception:
+                continue
+        # fallback: Enter 키
+        try:
+            page.keyboard.press("Enter")
+            progress.on_log("저장된 계정으로 자동 로그인 시도 (Enter)")
+            return True
+        except Exception:
+            return False
+    except Exception as exc:  # noqa: BLE001
+        progress.on_log(f"자동로그인 예외: {exc}")
+        return False
+
+
 def _crawl_coupang_via_cdp(
     *,
     max_pages: int,
     reset_session: bool,
     progress: CrawlerProgress,
+    email: str = "",
+    password: str = "",
 ) -> CrawlResult:
     """쿠팡 전용 CDP attach 방식.
 
@@ -537,6 +642,7 @@ def _crawl_coupang_via_cdp(
             target_page = None
             deadline = time.time() + 480  # 8분
             notified_login = False
+            auto_login_attempted = False
             last_state = ""
             while time.time() < deadline:
                 if progress.cancelled():
@@ -575,8 +681,19 @@ def _crawl_coupang_via_cdp(
 
                 # 로그인 페이지인지
                 if "이메일 로그인" in content and "회원가입" in content:
+                    # 1) 저장된 계정으로 자동 입력 시도 (1회만)
+                    if not auto_login_attempted and email and password:
+                        auto_login_attempted = True
+                        if _try_coupang_auto_login(cp, email, password, progress):
+                            time.sleep(3)
+                            continue
                     if not notified_login:
-                        progress.on_login_required("쿠팡 로그인이 필요합니다. 브라우저 창에서 직접 로그인해주세요.")
+                        if email and password and auto_login_attempted:
+                            progress.on_login_required(
+                                "자동 로그인 시도 후에도 로그인 화면입니다. captcha/2단계 인증이 있으면 직접 완료해주세요."
+                            )
+                        else:
+                            progress.on_login_required("쿠팡 로그인이 필요합니다. 브라우저 창에서 직접 로그인해주세요.")
                         notified_login = True
                     time.sleep(3)
                     continue

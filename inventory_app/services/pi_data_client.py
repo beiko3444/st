@@ -280,4 +280,26 @@ class PiDataClient:
         self._request("PATCH", f"/card-usages/{use_key}", json_body=body)
 
 
+    # ── 쿠팡 자격증명 ─────────────────────────────────────────
+
+    def list_coupang_credentials(self) -> List[Dict[str, Any]]:
+        if not self.is_configured:
+            return []
+        try:
+            payload = self._request("GET", "/coupang-credentials")
+        except PiDataError:
+            return []
+        rows = payload.get("credentials") or []
+        return rows if isinstance(rows, list) else []
+
+    def save_coupang_credential(self, label: str, email: str, password_obf: str) -> None:
+        self._request(
+            "POST", "/coupang-credentials",
+            json_body={"label": label, "email": email, "password_obf": password_obf},
+        )
+
+    def delete_coupang_credential(self, label: str) -> None:
+        self._request("DELETE", "/coupang-credentials", params={"label": label})
+
+
 __all__ = ["PiDataClient", "PiDataError"]

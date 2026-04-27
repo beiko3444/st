@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Optional
 
 from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QBrush, QColor, QDesktopServices
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QTableWidget,
@@ -22,6 +23,12 @@ from PySide6.QtWidgets import (
 )
 
 from inventory_app.models import PurchaseRecord
+from inventory_app.services.coupang_credentials import (
+    CoupangAccount,
+    delete_account as delete_coupang_account,
+    list_accounts as list_coupang_accounts,
+    save_account as save_coupang_account,
+)
 from inventory_app.services.purchase_crawler import (
     CrawlerProgress,
     CrawlResult,
@@ -46,12 +53,23 @@ class _CrawlerWorker(QObject):
     login_required = Signal(str)
     finished = Signal(object)
 
-    def __init__(self, channel: str, *, headless: bool, max_pages: int, reset_session: bool) -> None:
+    def __init__(
+        self,
+        channel: str,
+        *,
+        headless: bool,
+        max_pages: int,
+        reset_session: bool,
+        coupang_email: str = "",
+        coupang_password: str = "",
+    ) -> None:
         super().__init__()
         self.channel = channel
         self.headless = headless
         self.max_pages = max_pages
         self.reset_session = reset_session
+        self.coupang_email = coupang_email
+        self.coupang_password = coupang_password
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -71,6 +89,8 @@ class _CrawlerWorker(QObject):
                 max_pages=self.max_pages,
                 reset_session=self.reset_session,
                 progress=progress,
+                coupang_email=self.coupang_email,
+                coupang_password=self.coupang_password,
             )
         except PlaywrightUnavailable as exc:
             result = CrawlResult(channel=self.channel, records=[], error=str(exc))
@@ -117,6 +137,7 @@ class PurchaseHistoryTab(QWidget):
                 pi_client = PiDataClient(monitor_url)
             except Exception:  # noqa: BLE001
                 pi_client = None
+        self._pi_client = pi_client
         self.store = PurchaseHistoryStore(pi_client=pi_client)
         self.parser = PurchaseHistoryParser()
         self._worker_thread: QThread | None = None
@@ -208,6 +229,63 @@ class PurchaseHistoryTab(QWidget):
         auto_row.addWidget(self.cancel_auto_btn)
         auto_row.addWidget(self.status, 1)
 
+        # 쿠팡 자동로그인용 다중 계정 row
+        cred_row = QHBoxLayout()
+        cred_row.addWidget(QLabel("저장 계정"))
+        self.account_combo = QComboBox()
+        self.account_combo.setMinimumWidth(180)
+        self.account_combo.setToolTip("계정 선택 후 「선택 계정으로 수집」을 누르면 자동 로그인 + 크롤링.")
+        self.account_combo.currentIndexChanged.connect(self._on_account_selected)
+        cred_row.addWidget(self.account_combo)
+
+        self.start_with_account_btn = QPushButton("▶ 선택 계정으로 수집")
+        self.start_with_account_btn.setToolTip(
+            "선택된 쿠팡 계정으로 자동 로그인 후 즉시 주문내역을 크롤링합니다."
+        )
+        self.start_with_account_btn.clicked.connect(self._start_with_selected_account)
+        cred_row.addWidget(self.start_with_account_btn)
+
+        self.delete_account_btn = QPushButton("선택 삭제")
+        self.delete_account_btn.clicked.connect(self._delete_selected_account)
+        cred_row.addWidget(self.delete_account_btn)
+
+        cred_row.addSpacing(12)
+        cred_row.addWidget(QLabel("계정명"))
+        self.account_label_edit = QLineEdit()
+        self.account_label_edit.setPlaceholderText("예: 메인계정")
+        self.account_label_edit.setMinimumWidth(120)
+        cred_row.addWidget(self.account_label_edit)
+
+        cred_row.addWidget(QLabel("쿠팡 ID"))
+        self.coupang_email_edit = QLineEdit()
+        self.coupang_email_edit.setPlaceholderText("이메일 주소")
+        self.coupang_email_edit.setMinimumWidth(180)
+        cred_row.addWidget(self.coupang_email_edit)
+
+        cred_row.addWidget(QLabel("비밀번호"))
+        self.coupang_password_edit = QLineEdit()
+        self.coupang_password_edit.setEchoMode(QLineEdit.Password)
+        self.coupang_password_edit.setPlaceholderText("비밀번호")
+        self.coupang_password_edit.setMinimumWidth(140)
+        cred_row.addWidget(self.coupang_password_edit)
+
+        self.show_pw_chk = QCheckBox("표시")
+        self.show_pw_chk.toggled.connect(
+            lambda checked: self.coupang_password_edit.setEchoMode(
+                QLineEdit.Normal if checked else QLineEdit.Password
+            )
+        )
+        cred_row.addWidget(self.show_pw_chk)
+
+        self.save_cred_btn = QPushButton("저장")
+        self.save_cred_btn.setToolTip("계정명/ID/비번을 입력하고 저장 → 라즈베리DB 에 영구 저장.")
+        self.save_cred_btn.clicked.connect(self._save_coupang_account)
+        cred_row.addWidget(self.save_cred_btn)
+        cred_row.addStretch(1)
+
+        # 저장된 계정 목록 로드
+        self._refresh_account_combo()
+
         self.table = QTableWidget(0, len(self.HEADERS))
         self.table.setHorizontalHeaderLabels(self.HEADERS)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -219,6 +297,7 @@ class PurchaseHistoryTab(QWidget):
 
         layout.addLayout(top)
         layout.addLayout(auto_row)
+        layout.addLayout(cred_row)
         layout.addWidget(self.table, 1)
         self.reload()
 
@@ -436,6 +515,104 @@ class PurchaseHistoryTab(QWidget):
         self.table.resizeColumnsToContents()
         self.table.setSortingEnabled(True)
 
+    # ---------- 쿠팡 다중 계정 ----------
+
+    def _refresh_account_combo(self) -> None:
+        try:
+            accounts = list_coupang_accounts(pi_client=self._pi_client)
+        except Exception:  # noqa: BLE001
+            accounts = []
+        self.account_combo.blockSignals(True)
+        self.account_combo.clear()
+        self.account_combo.addItem("(계정 없음)", None)
+        for a in accounts:
+            self.account_combo.addItem(f"{a.label}  ·  {a.email}", a.label)
+        self.account_combo.blockSignals(False)
+
+    def _selected_account(self) -> Optional["CoupangAccount"]:
+        label = self.account_combo.currentData()
+        if not label:
+            return None
+        try:
+            for a in list_coupang_accounts(pi_client=self._pi_client):
+                if a.label == label:
+                    return a
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _on_account_selected(self, _idx: int) -> None:
+        a = self._selected_account()
+        if a is None:
+            return
+        # 입력 필드를 선택된 계정 값으로 채움 (편집/덮어쓰기 편의)
+        self.account_label_edit.setText(a.label)
+        self.coupang_email_edit.setText(a.email)
+        self.coupang_password_edit.setText(a.password)
+
+    def _save_coupang_account(self) -> None:
+        label = self.account_label_edit.text().strip()
+        email = self.coupang_email_edit.text().strip()
+        pw = self.coupang_password_edit.text()
+        if not label:
+            QMessageBox.warning(self, "저장 실패", "계정명(별칭)을 입력하세요.")
+            return
+        if not email or not pw:
+            QMessageBox.warning(self, "저장 실패", "이메일과 비밀번호를 모두 입력하세요.")
+            return
+        partial_only = False
+        try:
+            save_coupang_account(label, email, pw, pi_client=self._pi_client)
+        except RuntimeError as exc:
+            # 로컬은 저장됨, Pi 만 실패
+            partial_only = True
+            self.status.setText(f"⚠ {exc}")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "저장 실패", str(exc))
+            return
+        self._refresh_account_combo()
+        idx = self.account_combo.findData(label)
+        if idx >= 0:
+            self.account_combo.setCurrentIndex(idx)
+        if not partial_only:
+            self.status.setText(f"✓ 계정 '{label}' 저장됨 (라즈베리DB)")
+
+    def _delete_selected_account(self) -> None:
+        a = self._selected_account()
+        if a is None:
+            QMessageBox.information(self, "삭제", "삭제할 계정을 먼저 선택하세요.")
+            return
+        ans = QMessageBox.question(
+            self, "계정 삭제", f"'{a.label}' 계정을 삭제할까요?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+        try:
+            delete_coupang_account(a.label, pi_client=self._pi_client)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "삭제 실패", str(exc))
+            return
+        self._refresh_account_combo()
+        self.account_label_edit.clear()
+        self.coupang_email_edit.clear()
+        self.coupang_password_edit.clear()
+        self.status.setText(f"✓ 계정 '{a.label}' 삭제됨")
+
+    def _start_with_selected_account(self) -> None:
+        a = self._selected_account()
+        if a is None:
+            QMessageBox.information(
+                self, "계정 선택 필요",
+                "저장된 계정이 없습니다. 계정명/ID/비번을 입력하고 저장 후 다시 시도하세요.",
+            )
+            return
+        # 입력 필드도 동기화 후 즉시 쿠팡 크롤링 시작
+        self.account_label_edit.setText(a.label)
+        self.coupang_email_edit.setText(a.email)
+        self.coupang_password_edit.setText(a.password)
+        self._start_auto_crawl("coupang")
+
     def _set_auto_busy(self, busy: bool) -> None:
         for btn in (
             self.auto_naver_btn,
@@ -446,6 +623,13 @@ class PurchaseHistoryTab(QWidget):
             self.open_coupang_btn,
             self.reload_btn,
             self.reset_session_chk,
+            self.account_combo,
+            self.account_label_edit,
+            self.coupang_email_edit,
+            self.coupang_password_edit,
+            self.save_cred_btn,
+            self.delete_account_btn,
+            self.start_with_account_btn,
         ):
             btn.setEnabled(not busy)
         self.cancel_auto_btn.setEnabled(busy)
@@ -460,6 +644,8 @@ class PurchaseHistoryTab(QWidget):
             headless=False,
             max_pages=10,
             reset_session=self.reset_session_chk.isChecked(),
+            coupang_email=self.coupang_email_edit.text().strip(),
+            coupang_password=self.coupang_password_edit.text(),
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)

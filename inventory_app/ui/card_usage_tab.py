@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
-from PySide6.QtCore import QDate, QObject, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QDate, QEvent, QObject, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDateEdit,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -338,6 +340,190 @@ class _UsageRow(QFrame):
         layout.addLayout(right, 0)
 
 
+class _CoupangMatchDetailDialog(QDialog):
+    """카드 사용내역에 매칭된 쿠팡 구매내역 상세 팝업."""
+
+    def __init__(
+        self,
+        usage: CardUsage,
+        group: Optional[PurchaseGroup],
+        items: List[Any],
+        order: Optional[PurchaseOrder],
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("쿠팡 매칭 상세")
+        self.resize(1100, 820)
+        self.setMinimumSize(720, 520)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        # 1) 카드 사용 정보
+        card_box = QFrame()
+        card_box.setStyleSheet(
+            "QFrame { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; }"
+        )
+        card_lay = QVBoxLayout(card_box)
+        card_lay.setContentsMargins(12, 10, 12, 10)
+        card_lay.setSpacing(4)
+
+        head_font = QFont(); head_font.setBold(True); head_font.setPointSize(11)
+        head = QLabel("💳 카드 사용 내역")
+        head.setFont(head_font)
+        head.setStyleSheet("color: #0f172a;")
+        card_lay.addWidget(head)
+
+        amt = int(usage.amount or 0)
+        amt_color = "#ef4444" if amt < 0 else "#0f172a"
+        store = (usage.store_name or "(가맹점명 미상)").strip()
+        info_html = (
+            f"<div style='font-size:12px; color:#334155;'>"
+            f"<b style='color:#0f172a; font-size:13px;'>{store}</b><br>"
+            f"<span style='color:#64748b;'>{_format_used_at_short(usage.used_at)}"
+            f" · {_mask_card_number(usage.card_num)}</span><br>"
+            f"<span style='color:{amt_color}; font-weight:600;'>{_fmt_money(amt)}</span>"
+            f"</div>"
+        )
+        info_label = QLabel(info_html)
+        info_label.setTextFormat(Qt.RichText)
+        info_label.setWordWrap(True)
+        card_lay.addWidget(info_label)
+        layout.addWidget(card_box)
+
+        # 2) 매칭된 주문 정보
+        if group is None:
+            none_lab = QLabel("⚠ 매칭된 쿠팡 구매내역이 없습니다.")
+            none_lab.setStyleSheet(
+                "QLabel { background: #fef3c7; border: 1px solid #fde68a; border-radius: 8px; "
+                "padding: 10px 12px; color: #92400e; font-size: 12px; }"
+            )
+            layout.addWidget(none_lab)
+        else:
+            order_box = QFrame()
+            order_box.setStyleSheet(
+                "QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; }"
+            )
+            order_lay = QVBoxLayout(order_box)
+            order_lay.setContentsMargins(12, 10, 12, 10)
+            order_lay.setSpacing(4)
+
+            head2 = QLabel("🔗 매칭된 쿠팡 주문")
+            head2.setFont(head_font)
+            head2.setStyleSheet("color: #0f172a;")
+            order_lay.addWidget(head2)
+
+            lines: List[str] = []
+            lines.append(f"<b style='color:#0f172a;'>{group.title}</b>")
+            sub_parts: List[str] = []
+            if group.order_date:
+                sub_parts.append(f"주문일 {group.order_date}")
+            if group.item_count:
+                sub_parts.append(f"품목 {group.item_count}건")
+            if order is not None:
+                if order.order_no:
+                    sub_parts.append(f"주문번호 {order.order_no}")
+                if order.status:
+                    sub_parts.append(f"상태 {order.status}")
+            if sub_parts:
+                lines.append(
+                    f"<span style='color:#64748b; font-size:11px;'>{' · '.join(sub_parts)}</span>"
+                )
+            tot_line = f"카드청구액 합계: <b style='color:#0f172a;'>{group.total_amount:,}원</b>"
+            if order is not None:
+                if order.payment_total is not None and order.payment_total != group.total_amount:
+                    tot_line += (
+                        f" <span style='color:#64748b; font-size:11px;'>"
+                        f"(결제총액 {int(order.payment_total):,}원"
+                    )
+                    if order.cash_used:
+                        tot_line += f" − 캐시 {int(order.cash_used):,}원"
+                    tot_line += ")</span>"
+            lines.append(f"<div style='margin-top:4px;'>{tot_line}</div>")
+
+            # 카드 금액과 일치 여부
+            diff = amt - int(group.total_amount or 0)
+            if diff == 0:
+                badge = (
+                    "<div style='margin-top:6px;'>"
+                    "<span style='background:#dcfce7; color:#166534; padding:2px 8px; "
+                    "border-radius:10px; font-size:11px; font-weight:600;'>"
+                    "✓ 금액 일치</span></div>"
+                )
+            else:
+                sign = "+" if diff > 0 else ""
+                badge = (
+                    "<div style='margin-top:6px;'>"
+                    f"<span style='background:#fef3c7; color:#92400e; padding:2px 8px; "
+                    f"border-radius:10px; font-size:11px; font-weight:600;'>"
+                    f"⚠ 차액 {sign}{diff:,}원</span></div>"
+                )
+            lines.append(badge)
+
+            order_label = QLabel("<br>".join(lines))
+            order_label.setTextFormat(Qt.RichText)
+            order_label.setWordWrap(True)
+            order_lay.addWidget(order_label)
+            layout.addWidget(order_box)
+
+        # 3) 품목 테이블
+        items_label = QLabel(f"📦 품목 ({len(items)}건)")
+        items_label.setFont(head_font)
+        items_label.setStyleSheet("color: #0f172a;")
+        layout.addWidget(items_label)
+
+        items_table = QTableWidget(0, 4)
+        items_table.setHorizontalHeaderLabels(["주문일", "주문번호", "상품/내역", "금액"])
+        items_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        items_table.setAlternatingRowColors(True)
+        items_table.verticalHeader().setVisible(False)
+        items_table.setShowGrid(False)
+        items_table.setStyleSheet(
+            "QTableWidget { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px;"
+            " gridline-color: #e2e8f0; }"
+            "QHeaderView::section { background: #f8fafc; border: none;"
+            " border-bottom: 1px solid #e2e8f0; padding: 6px; font-weight: 600; color: #475569; }"
+            "QTableWidget::item { padding: 6px 8px; border: none; }"
+        )
+        h = items_table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(2, QHeaderView.Stretch)
+        h.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        items_table.setRowCount(len(items))
+        for r, rec in enumerate(items):
+            ramt = int(getattr(rec, "amount", 0) or 0)
+            cancelled = ramt < 0
+            d_item = QTableWidgetItem(getattr(rec, "order_date", "") or "")
+            o_item = QTableWidgetItem(getattr(rec, "order_no", "") or "")
+            t_item = QTableWidgetItem((getattr(rec, "title", "") or "").strip())
+            t_item.setToolTip(getattr(rec, "title", "") or "")
+            a_item = QTableWidgetItem(_fmt_money(ramt))
+            a_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            af = QFont(); af.setBold(True); a_item.setFont(af)
+            if cancelled:
+                a_item.setForeground(QBrush(QColor("#ef4444")))
+                t_item.setForeground(QBrush(QColor("#ef4444")))
+            items_table.setItem(r, 0, d_item)
+            items_table.setItem(r, 1, o_item)
+            items_table.setItem(r, 2, t_item)
+            items_table.setItem(r, 3, a_item)
+        if not items:
+            items_table.setRowCount(1)
+            ph = QTableWidgetItem("(상세 품목 데이터가 없습니다 — 구매내역 동기화 필요)")
+            ph.setForeground(QBrush(QColor("#94a3b8")))
+            items_table.setSpan(0, 0, 1, 4)
+            items_table.setItem(0, 0, ph)
+        layout.addWidget(items_table, 1)
+
+        btn_row = QDialogButtonBox(QDialogButtonBox.Close)
+        btn_row.rejected.connect(self.reject)
+        btn_row.accepted.connect(self.accept)
+        layout.addWidget(btn_row)
+
+
 class _GaugeBar(QWidget):
     """카테고리 분할 가로 게이지 바.
 
@@ -447,10 +633,14 @@ class CardUsageTab(QWidget):
         self._config = config
         self.client = BarobillCardClient.from_app_config(config)
         self._all_items: List[CardUsage] = []
+        self._displayed_items: List[CardUsage] = []
         self._categories_index: Dict[str, str] = {}  # use_key → category code
         self._selected_category: Optional[str] = None
         self._last_synced_at: Optional[datetime] = None
-        self._view_mode: str = "table"   # "card" | "table" | "calendar"
+        self._view_mode: str = "table"   # "table" | "calendar"
+        self._suspend_memo_signal: bool = False
+        self._sort_col: int = 0   # 기본: 날짜
+        self._sort_asc: bool = False   # 기본: 내림차순
         self._review_mode: bool = False
         self._reviewed_keys: set[str] = set()  # 메모리상 검토 완료 마킹
         self._coupang_match_index: Dict[str, PurchaseGroup] = {}  # use_key/id → matched group
@@ -602,7 +792,7 @@ class CardUsageTab(QWidget):
         vg_layout = QHBoxLayout(view_group)
         vg_layout.setContentsMargins(2, 2, 2, 2)
         vg_layout.setSpacing(0)
-        for code, label in (("table", "테이블"), ("card", "카드"), ("calendar", "캘린더")):
+        for code, label in (("table", "테이블"), ("calendar", "캘린더")):
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setCursor(Qt.PointingHandCursor)
@@ -612,10 +802,13 @@ class CardUsageTab(QWidget):
         self._view_btns[self._view_mode].setChecked(True)
         self._refresh_view_mode_styles()
 
-        # 리뷰 모드 토글
+        # 리뷰 모드 토글 — ON 일 때 행을 더블클릭하면 검토 완료(녹색)로 표시
         self.review_btn = QPushButton("리뷰 모드 OFF")
         self.review_btn.setCheckable(True)
         self.review_btn.setCursor(Qt.PointingHandCursor)
+        self.review_btn.setToolTip(
+            "리뷰 모드 ON: 행을 더블클릭하면 검토 완료(녹색)로 표시됩니다."
+        )
         self.review_btn.clicked.connect(self._toggle_review_mode)
         self._refresh_review_btn_style()
 
@@ -636,31 +829,22 @@ class CardUsageTab(QWidget):
         list_header.addWidget(self.sort_btn)
         layout.addLayout(list_header)
 
-        # ===== 본문 (Stacked: 카드 / 테이블 / 캘린더) =====
+        # ===== 본문 (Stacked: 테이블 / 캘린더) =====
         self.body_stack = QStackedWidget()
 
-        # --- 카드 뷰 (기존 QListWidget) ---
-        self.list = QListWidget()
-        self.list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.list.setSpacing(6)
-        self.list.setStyleSheet(
-            "QListWidget { background: #f8fafc; border: none; }"
-            "QListWidget::item { background: transparent; padding: 0px; border: none; }"
-            "QListWidget::item:selected { background: rgba(15, 23, 42, 0.04); }"
-        )
-        self.body_stack.addWidget(self.list)  # idx 0 = card
-
         # --- 테이블 뷰 ---
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["날짜", "가맹점", "카테고리", "금액", "카드", "메모"])
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        # 컬럼 순서: 날짜, 카테고리, 가맹점, 금액, 카드, 검토, 메모
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["날짜", "카테고리", "가맹점", "금액", "카드", "검토", "메모"])
+        # 더블클릭은 매칭 상세 팝업/리뷰 토글에 사용 → 편집은 Enter/F2 로만 시작
+        self.table.setEditTriggers(QAbstractItemView.EditKeyPressed)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setTabKeyNavigation(False)
+        self.table.installEventFilter(self)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
-        # 셀 포커스 점선/박스 제거
-        self.table.setFocusPolicy(Qt.NoFocus)
         self.table.setStyleSheet(
             "QTableWidget { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px;"
             " gridline-color: #e2e8f0; outline: 0; }"
@@ -671,13 +855,25 @@ class CardUsageTab(QWidget):
             "QTableWidget::item:focus { background: #f1f5f9; color: #0f172a; }"
         )
         h = self.table.horizontalHeader()
-        h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(1, QHeaderView.Stretch)
-        h.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(5, QHeaderView.Stretch)
-        self.body_stack.addWidget(self.table)  # idx 1 = table
+        h.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # 날짜
+        h.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # 카테고리
+        h.setSectionResizeMode(2, QHeaderView.Stretch)            # 가맹점
+        h.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # 금액
+        h.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # 카드
+        h.setSectionResizeMode(5, QHeaderView.Fixed)              # 검토
+        self.table.setColumnWidth(5, 44)
+        h.setSectionResizeMode(6, QHeaderView.Stretch)            # 메모
+        h.setSectionsClickable(True)
+        h.setSortIndicatorShown(True)
+        h.setSortIndicator(self._sort_col, Qt.AscendingOrder if self._sort_asc else Qt.DescendingOrder)
+        h.sectionClicked.connect(self._on_header_clicked)
+        self.table.cellDoubleClicked.connect(self._on_table_double_clicked)
+        self.table.cellClicked.connect(self._on_table_cell_clicked)
+        self.table.cellChanged.connect(self._on_table_cell_changed)
+        # 금액 컬럼 호버 커서 변경
+        self.table.viewport().setMouseTracking(True)
+        self.table.viewport().installEventFilter(self)
+        self.body_stack.addWidget(self.table)  # idx 0 = table
 
         # --- 캘린더 뷰 ---
         cal_scroll = QScrollArea()
@@ -690,8 +886,8 @@ class CardUsageTab(QWidget):
         cal_scroll.setWidget(self._cal_inner)
         self.body_stack.addWidget(cal_scroll)  # idx 2 = calendar
 
-        # 초기 페이지: 테이블 (self._view_mode 와 동기화)
-        _initial_idx = {"card": 0, "table": 1, "calendar": 2}.get(self._view_mode, 1)
+        # 초기 페이지: 테이블
+        _initial_idx = {"table": 0, "calendar": 1}.get(self._view_mode, 0)
         self.body_stack.setCurrentIndex(_initial_idx)
         layout.addWidget(self.body_stack, 1)
 
@@ -948,13 +1144,13 @@ class CardUsageTab(QWidget):
     # ----- 뷰 모드 / 리뷰 모드 -----
 
     def _on_view_mode(self, code: str) -> None:
-        if code not in ("table", "card", "calendar"):
+        if code not in ("table", "calendar"):
             return
         self._view_mode = code
         for c, btn in self._view_btns.items():
             btn.setChecked(c == code)
         self._refresh_view_mode_styles()
-        idx = {"card": 0, "table": 1, "calendar": 2}[code]
+        idx = {"table": 0, "calendar": 1}[code]
         self.body_stack.setCurrentIndex(idx)
         self._render_list()
 
@@ -998,9 +1194,6 @@ class CardUsageTab(QWidget):
         if key and key in self._reviewed_keys:
             return True
         if usage.reviewed:
-            return True
-        # 메모가 비어있지 않으면 검토된 것으로 간주
-        if (usage.memo or "").strip():
             return True
         return False
 
@@ -1258,78 +1451,480 @@ class CardUsageTab(QWidget):
         if q:
             items = self._apply_search(items, q)
 
-        # 리뷰 모드 ON → 검토 안 된 항목만
-        if self._review_mode:
-            items = [it for it in items if not self._is_reviewed(it)]
+        # 리뷰 모드는 필터가 아니라 클릭 토글 동작 — 모든 항목 표시
+        # (검토 완료 항목은 녹색 배경으로 구분)
 
-        # 정렬
-        if self._sort_mode == "amount":
-            items.sort(key=lambda it: abs(int(it.amount or 0)), reverse=True)
+        # 정렬 (헤더 클릭에 따라 컬럼/방향 결정)
+        col = self._sort_col
+        if col == self.COL_DATE:
+            key_fn = lambda it: (it.used_at or "")
+        elif col == self.COL_CATEGORY:
+            key_fn = lambda it: self._categories_index.get(it.use_key or it.id or "", "OTHER")
+        elif col == self.COL_STORE:
+            key_fn = lambda it: (it.store_name or "")
+        elif col == self.COL_AMOUNT:
+            key_fn = lambda it: int(it.amount or 0)
+        elif col == self.COL_CARD:
+            key_fn = lambda it: (it.card_num or "")
+        elif col == self.COL_REVIEW:
+            key_fn = lambda it: (1 if self._is_reviewed(it) else 0)
+        elif col == self.COL_MEMO:
+            key_fn = lambda it: (it.memo or "")
         else:
-            items.sort(key=lambda it: (it.used_at or ""), reverse=True)
+            key_fn = lambda it: (it.used_at or "")
+        items.sort(key=key_fn, reverse=not self._sort_asc)
         return items
 
     def _render_list(self) -> None:
         items = self._filtered_sorted_items()
-        suffix = " · 미검토" if self._review_mode else ""
+        self._displayed_items = items
+        reviewed_n = sum(1 for it in items if self._is_reviewed(it))
+        suffix = f" · 검토 {reviewed_n}/{len(items)}"
         self.list_count_label.setText(f"거래내역 {len(items)}건{suffix}")
 
         if self._view_mode == "calendar":
             self._render_calendar(items)
-        elif self._view_mode == "table":
-            self._render_table(items)
         else:
-            self._render_card(items)
+            self._render_table(items)
 
-    def _render_card(self, items: List[CardUsage]) -> None:
-        self.list.clear()
-        # sizeHint 명시 고정 → frozen 환경에서 잘못된 sizeHint 반환 방지
-        ROW_HEIGHT = 96
-        for usage in items:
-            cat = self._categories_index.get(usage.use_key or usage.id or "", "OTHER")
-            row = _UsageRow(usage, cat)
-            li = QListWidgetItem()
-            li.setSizeHint(QSize(0, ROW_HEIGHT))
-            self.list.addItem(li)
-            self.list.setItemWidget(li, row)
+    # 컬럼 인덱스: 0=날짜, 1=카테고리, 2=가맹점, 3=금액, 4=카드, 5=검토, 6=메모
+    COL_DATE = 0
+    COL_CATEGORY = 1
+    COL_STORE = 2
+    COL_AMOUNT = 3
+    COL_CARD = 4
+    COL_REVIEW = 5
+    COL_MEMO = 6
 
     def _render_table(self, items: List[CardUsage]) -> None:
-        self.table.setRowCount(0)
-        self.table.setRowCount(len(items))
-        for r, usage in enumerate(items):
-            cat_code = self._categories_index.get(usage.use_key or usage.id or "", "OTHER")
-            cm = category_meta(cat_code)
-            amount_int = int(usage.amount or 0)
-            cancelled = amount_int < 0
+        self._suspend_memo_signal = True
+        try:
+            self.table.setRowCount(0)
+            self.table.setRowCount(len(items))
+            for r, usage in enumerate(items):
+                cat_code = self._categories_index.get(usage.use_key or usage.id or "", "OTHER")
+                cm = category_meta(cat_code)
+                amount_int = int(usage.amount or 0)
+                cancelled = amount_int < 0
+                reviewed = self._is_reviewed(usage)
+                matched = bool(getattr(usage, "coupang_purchase_id", None))
 
-            # 날짜
-            date_item = QTableWidgetItem(_format_used_at_short(usage.used_at))
-            date_item.setForeground(QBrush(QColor("#475569")))
-            # 가맹점
-            store_item = QTableWidgetItem((usage.store_name or "(가맹점명 미상)").strip())
-            store_item.setForeground(QBrush(QColor("#ef4444" if cancelled else "#0f172a")))
-            f = QFont(); f.setBold(True); store_item.setFont(f)
-            # 카테고리
-            cat_item = QTableWidgetItem(f"{cm.emoji} {cm.label}")
-            cat_item.setForeground(QBrush(QColor("#334155")))
-            # 금액
-            amt_item = QTableWidgetItem(_fmt_money(amount_int))
-            amt_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            af = QFont(); af.setBold(True); amt_item.setFont(af)
-            amt_item.setForeground(QBrush(QColor("#ef4444" if cancelled else "#0f172a")))
-            # 카드
-            card_item = QTableWidgetItem(_mask_card_number(usage.card_num))
-            card_item.setForeground(QBrush(QColor("#64748b")))
-            # 메모
-            memo_item = QTableWidgetItem(usage.memo or "")
-            memo_item.setForeground(QBrush(QColor("#475569")))
+                # 날짜
+                date_item = QTableWidgetItem(_format_used_at_short(usage.used_at))
+                date_item.setForeground(QBrush(QColor("#475569")))
+                # 카테고리
+                cat_item = QTableWidgetItem(f"{cm.emoji} {cm.label}")
+                cat_item.setForeground(QBrush(QColor("#334155")))
+                # 가맹점 (매칭된 건은 🔗 prefix)
+                store_text = (usage.store_name or "(가맹점명 미상)").strip()
+                if matched:
+                    store_text = f"🔗 {store_text}"
+                store_item = QTableWidgetItem(store_text)
+                store_item.setForeground(QBrush(QColor("#ef4444" if cancelled else "#0f172a")))
+                f = QFont(); f.setBold(True); store_item.setFont(f)
+                if matched:
+                    store_item.setToolTip("매칭된 쿠팡 구매내역 — 더블클릭으로 상세보기")
+                # 금액
+                amt_item = QTableWidgetItem(_fmt_money(amount_int))
+                amt_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                af = QFont(); af.setBold(True); amt_item.setFont(af)
+                amt_item.setForeground(QBrush(QColor("#ef4444" if cancelled else "#0f172a")))
+                # 카드
+                card_item = QTableWidgetItem(_mask_card_number(usage.card_num))
+                card_item.setForeground(QBrush(QColor("#64748b")))
+                # 메모 (편집 가능)
+                memo_item = QTableWidgetItem(usage.memo or "")
+                memo_item.setForeground(QBrush(QColor("#475569")))
+                memo_item.setFlags(memo_item.flags() | Qt.ItemIsEditable)
+                memo_item.setToolTip("더블클릭으로 메모 입력 · Enter 로 저장")
 
-            self.table.setItem(r, 0, date_item)
-            self.table.setItem(r, 1, store_item)
-            self.table.setItem(r, 2, cat_item)
-            self.table.setItem(r, 3, amt_item)
-            self.table.setItem(r, 4, card_item)
-            self.table.setItem(r, 5, memo_item)
+                # 비메모 셀은 편집 불가
+                for it in (date_item, cat_item, store_item, amt_item, card_item):
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+
+                # 검토 완료 시 녹색 배경
+                if reviewed:
+                    bg = QBrush(QColor("#dcfce7"))
+                    for it in (date_item, cat_item, store_item, amt_item, card_item, memo_item):
+                        it.setBackground(bg)
+
+                # 검토 버튼 (placeholder item — 배경/편집불가)
+                review_placeholder = QTableWidgetItem("")
+                review_placeholder.setFlags(Qt.ItemIsEnabled)
+                if reviewed:
+                    review_placeholder.setBackground(QBrush(QColor("#dcfce7")))
+
+                self.table.setItem(r, self.COL_DATE, date_item)
+                self.table.setItem(r, self.COL_CATEGORY, cat_item)
+                self.table.setItem(r, self.COL_STORE, store_item)
+                self.table.setItem(r, self.COL_AMOUNT, amt_item)
+                self.table.setItem(r, self.COL_CARD, card_item)
+                self.table.setItem(r, self.COL_REVIEW, review_placeholder)
+                self.table.setItem(r, self.COL_MEMO, memo_item)
+
+                # 검토 버튼
+                review_btn = QPushButton("✓ 검토" if reviewed else "검토")
+                review_btn.setCursor(Qt.PointingHandCursor)
+                review_btn.setMinimumWidth(74)
+                review_btn.setMaximumWidth(82)
+                if reviewed:
+                    review_btn.setStyleSheet(
+                        "QPushButton { background: #16a34a; color: #ffffff; border: none; "
+                        "border-radius: 6px; padding: 4px 10px; font-size: 11px; font-weight: 600; }"
+                        "QPushButton:hover { background: #15803d; }"
+                    )
+                else:
+                    review_btn.setStyleSheet(
+                        "QPushButton { background: #ffffff; color: #475569; "
+                        "border: 1px solid #cbd5e1; border-radius: 6px; padding: 4px 10px; "
+                        "font-size: 11px; font-weight: 500; }"
+                        "QPushButton:hover { background: #f1f5f9; border-color: #94a3b8; }"
+                    )
+                key = usage.use_key or usage.id or ""
+                review_btn.clicked.connect(
+                    lambda _checked=False, k=key: self._on_review_btn_clicked(k)
+                )
+                self.table.setCellWidget(r, self.COL_REVIEW, review_btn)
+        finally:
+            self._suspend_memo_signal = False
+
+    # ----- 더블클릭 / 편집 핸들러 -----
+
+    def eventFilter(self, obj, event):  # type: ignore[override]
+        if obj is self.table and event.type() == QEvent.KeyPress:
+            key = event.key()
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                # 편집 중이면 기본동작(커밋)에 맡김
+                if self.table.state() == QAbstractItemView.EditingState:
+                    return False
+                row = self.table.currentRow()
+                if 0 <= row < len(self._displayed_items):
+                    memo_item = self.table.item(row, self.COL_MEMO)
+                    if memo_item is not None:
+                        self.table.setCurrentCell(row, self.COL_MEMO)
+                        self.table.editItem(memo_item)
+                        return True
+        # 금액 컬럼 호버 시 손가락 커서로 변경 (매칭된 행만)
+        if obj is self.table.viewport() and event.type() == QEvent.MouseMove:
+            idx = self.table.indexAt(event.pos())
+            change_to = None
+            if idx.isValid() and idx.column() == self.COL_AMOUNT:
+                row = idx.row()
+                if 0 <= row < len(self._displayed_items):
+                    usage = self._displayed_items[row]
+                    if getattr(usage, "coupang_purchase_id", None):
+                        change_to = Qt.PointingHandCursor
+            if change_to is not None:
+                self.table.viewport().setCursor(change_to)
+            else:
+                self.table.viewport().unsetCursor()
+            return False
+        return super().eventFilter(obj, event)
+
+    def _on_table_cell_clicked(self, row: int, col: int) -> None:
+        """금액 셀 단일 클릭으로 매칭 상세 다이얼로그 열기."""
+        if col != self.COL_AMOUNT:
+            return
+        if row < 0 or row >= len(self._displayed_items):
+            return
+        usage = self._displayed_items[row]
+        if not getattr(usage, "coupang_purchase_id", None):
+            return
+        self._open_match_dialog(usage)
+
+    def _on_table_double_clicked(self, row: int, col: int) -> None:
+        if row < 0 or row >= len(self._displayed_items):
+            return
+        usage = self._displayed_items[row]
+
+        # 리뷰 모드 ON 이면 메모/검토 컬럼 외 더블클릭으로 검토 토글
+        if self._review_mode and col not in (self.COL_MEMO, self.COL_REVIEW):
+            self._toggle_reviewed(usage)
+            return
+
+        # 메모 / 검토 컬럼은 별도 처리 (편집 / 버튼)
+        if col in (self.COL_MEMO, self.COL_REVIEW):
+            return
+
+        # 그 외 → 매칭 상세 다이얼로그
+        self._open_match_dialog(usage)
+
+    def _on_table_cell_changed(self, row: int, col: int) -> None:
+        if self._suspend_memo_signal:
+            return
+        if col != self.COL_MEMO:
+            return
+        if row < 0 or row >= len(self._displayed_items):
+            return
+        item = self.table.item(row, col)
+        if item is None:
+            return
+        new_text = item.text().strip()
+        usage = self._displayed_items[row]
+        if (usage.memo or "") == new_text:
+            return
+        usage.memo = new_text
+        # 메모가 있으면 자동으로 검토 완료 처리
+        auto_reviewed: Optional[bool] = None
+        if new_text and not usage.reviewed:
+            usage.reviewed = True
+            key = usage.use_key or usage.id or ""
+            if key:
+                self._reviewed_keys.add(key)
+            auto_reviewed = True
+        self._save_usage_change(usage, memo=new_text, reviewed=auto_reviewed)
+        # 메모/검토 컬럼 기준 정렬일 때만 전체 재렌더, 그 외는 행만 갱신해 포커스/스크롤 유지
+        needs_full_render = self._sort_col in (self.COL_MEMO, self.COL_REVIEW)
+        if auto_reviewed and not needs_full_render:
+            self._update_row_visual(usage)
+        elif needs_full_render:
+            self._render_list()
+        # 편집 종료 후 같은 셀에 포커스/선택 유지
+        QTimer.singleShot(0, lambda r=row: self._restore_memo_focus(r))
+
+    def _save_usage_change(
+        self,
+        usage: CardUsage,
+        *,
+        memo: Optional[str] = None,
+        reviewed: Optional[bool] = None,
+    ) -> None:
+        """단건 변경을 Pi 에 즉시 저장 (best-effort)."""
+        if not self.pi.is_configured:
+            return
+        use_key = usage.use_key or usage.id
+        if not use_key:
+            return
+        try:
+            kwargs: Dict[str, Any] = {}
+            if memo is not None:
+                if memo == "":
+                    kwargs["clear_memo"] = True
+                else:
+                    kwargs["memo"] = memo
+            if reviewed is not None:
+                kwargs["reviewed"] = bool(reviewed)
+            if not kwargs:
+                return
+            self.pi.patch_card_usage(use_key, **kwargs)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _restore_memo_focus(self, row: int) -> None:
+        if row < 0 or row >= self.table.rowCount():
+            return
+        self.table.setCurrentCell(row, self.COL_MEMO)
+        self.table.setFocus()
+
+    def _on_header_clicked(self, col: int) -> None:
+        """컬럼 헤더 클릭 → 정렬 토글."""
+        if col == self._sort_col:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_col = col
+            # 날짜/금액은 기본 내림차순, 그 외는 오름차순
+            self._sort_asc = col not in (self.COL_DATE, self.COL_AMOUNT)
+        self.table.horizontalHeader().setSortIndicator(
+            col, Qt.AscendingOrder if self._sort_asc else Qt.DescendingOrder
+        )
+        self._render_list()
+
+    @staticmethod
+    def _style_review_btn(btn: QPushButton, reviewed: bool) -> None:
+        btn.setText("✓" if reviewed else "")
+        if reviewed:
+            btn.setStyleSheet(
+                "QPushButton { background: #16a34a; color: #ffffff; border: none; "
+                "border-radius: 4px; font-size: 12px; font-weight: 700; }"
+                "QPushButton:hover { background: #15803d; }"
+            )
+        else:
+            btn.setStyleSheet(
+                "QPushButton { background: #ffffff; color: transparent; "
+                "border: 1px solid #cbd5e1; border-radius: 4px; }"
+                "QPushButton:hover { background: #f1f5f9; border-color: #94a3b8; }"
+            )
+
+    def _make_review_btn(self, usage: CardUsage) -> QPushButton:
+        btn = QPushButton()
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setFocusPolicy(Qt.NoFocus)  # 클릭 시 포커스 이동에 따른 스크롤 방지
+        btn.setFixedSize(28, 22)
+        self._style_review_btn(btn, self._is_reviewed(usage))
+        key = usage.use_key or usage.id or ""
+        btn.clicked.connect(lambda _checked=False, k=key: self._on_review_btn_clicked(k))
+        return btn
+
+    def _update_row_visual(self, usage: CardUsage) -> None:
+        """단일 행만 갱신 (전체 재정렬/재렌더 없이) → 행 위치/포커스/스크롤 유지."""
+        target_key = usage.use_key or usage.id or ""
+        if not target_key:
+            return
+        row = -1
+        for i, u in enumerate(self._displayed_items):
+            if (u.use_key or u.id or "") == target_key:
+                row = i
+                break
+        if row < 0:
+            return
+
+        reviewed = self._is_reviewed(usage)
+        bg = QBrush(QColor("#dcfce7")) if reviewed else QBrush()
+
+        # 스크롤/포커스 보존
+        sb = self.table.verticalScrollBar()
+        scroll_pos = sb.value()
+
+        self._suspend_memo_signal = True
+        try:
+            for c in (
+                self.COL_DATE, self.COL_CATEGORY, self.COL_STORE,
+                self.COL_AMOUNT, self.COL_CARD, self.COL_MEMO,
+            ):
+                item = self.table.item(row, c)
+                if item is None:
+                    continue
+                if reviewed:
+                    item.setBackground(bg)
+                else:
+                    item.setData(Qt.BackgroundRole, None)
+            # 메모 텍스트 동기화
+            memo_item = self.table.item(row, self.COL_MEMO)
+            if memo_item is not None and memo_item.text() != (usage.memo or ""):
+                memo_item.setText(usage.memo or "")
+            # 검토 placeholder 배경
+            rp = self.table.item(row, self.COL_REVIEW)
+            if rp is not None:
+                if reviewed:
+                    rp.setBackground(bg)
+                else:
+                    rp.setData(Qt.BackgroundRole, None)
+            # 버튼 위젯은 재생성하지 않고 기존 위젯만 스타일 갱신 (포커스 이동 방지)
+            existing = self.table.cellWidget(row, self.COL_REVIEW)
+            if isinstance(existing, QPushButton):
+                self._style_review_btn(existing, reviewed)
+            else:
+                self.table.setCellWidget(row, self.COL_REVIEW, self._make_review_btn(usage))
+        finally:
+            self._suspend_memo_signal = False
+
+        # 스크롤 복원
+        sb.setValue(scroll_pos)
+
+        # 검토 카운트 라벨 갱신
+        reviewed_n = sum(1 for it in self._displayed_items if self._is_reviewed(it))
+        total_n = len(self._displayed_items)
+        self.list_count_label.setText(f"거래내역 {total_n}건 · 검토 {reviewed_n}/{total_n}")
+
+    def _on_review_btn_clicked(self, key: str) -> None:
+        if not key:
+            return
+        for it in self._all_items:
+            if (it.use_key or it.id) == key:
+                self._toggle_reviewed(it)
+                return
+
+    def _toggle_reviewed(self, usage: CardUsage) -> None:
+        # 메모 유무는 무시하고 reviewed 플래그 자체를 토글
+        new_state = not bool(usage.reviewed)
+        usage.reviewed = new_state
+        key = usage.use_key or usage.id or ""
+        if key:
+            if new_state:
+                self._reviewed_keys.add(key)
+            else:
+                self._reviewed_keys.discard(key)
+        self._save_usage_change(usage, reviewed=new_state)
+        # 정렬 컬럼이 검토일 때만 전체 재렌더, 그 외는 단일 행만 갱신해 위치/포커스 유지
+        if self._sort_col == self.COL_REVIEW:
+            self._render_list()
+        else:
+            self._update_row_visual(usage)
+
+    def _open_match_dialog(self, usage: CardUsage) -> None:
+        group = self._coupang_match_index.get(usage.use_key or usage.id or "")
+        items: List[Any] = []
+        order: Optional[PurchaseOrder] = None
+
+        if group is None and getattr(usage, "coupang_purchase_id", None):
+            # 매칭 인덱스가 비어있어도 group_key 로 재구성
+            order_no = self._extract_order_no(usage.coupang_purchase_id or "")
+            if order_no:
+                order, items = self._lookup_coupang_order(order_no)
+                if order is not None:
+                    group = PurchaseGroup(
+                        channel="coupang",
+                        order_date=order.order_date,
+                        title=(
+                            f"주문 {order.order_no}"
+                            + (f" · {order.item_count}건" if order.item_count else "")
+                            + (f" [{order.status}]" if order.status else "")
+                        ),
+                        total_amount=int(order.card_amount or order.payment_total or 0),
+                        item_count=order.item_count or len(items),
+                        items=[],
+                        group_key=usage.coupang_purchase_id or f"coupang|order|{order_no}",
+                    )
+
+        if group is not None:
+            order_no = self._extract_order_no(group.group_key)
+            if order_no:
+                ord_obj, recs = self._lookup_coupang_order(order_no)
+                if order is None:
+                    order = ord_obj
+                if recs:
+                    items = recs
+            if not items and group.items:
+                items = list(group.items)
+
+        dlg = _CoupangMatchDetailDialog(usage, group, items, order, parent=self)
+        dlg.exec()
+
+    @staticmethod
+    def _extract_order_no(group_key: str) -> str:
+        if not group_key:
+            return ""
+        parts = group_key.split("|")
+        if len(parts) >= 3 and parts[1] == "order":
+            return parts[-1]
+        return ""
+
+    def _lookup_coupang_order(self, order_no: str) -> tuple[Optional[PurchaseOrder], List[Any]]:
+        """주문번호로 PurchaseOrder + 품목 records 를 조회 (Pi 우선, 로컬 fallback)."""
+        order: Optional[PurchaseOrder] = None
+        items: List[Any] = []
+        # Pi
+        if self.pi.is_configured:
+            try:
+                orders = self.pi.list_purchase_orders(channel="coupang", limit=5000)
+                for o in orders:
+                    if (o.order_no or "") == order_no:
+                        order = o
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                recs = self.pi.list_purchase_records(channel="coupang", limit=5000)
+                items = [r for r in recs if (getattr(r, "order_no", "") or "") == order_no]
+            except Exception:  # noqa: BLE001
+                pass
+        # Local fallback
+        if order is None or not items:
+            try:
+                store = PurchaseHistoryStore()
+                if order is None:
+                    for o in store.load_orders(channel="coupang", limit=5000):
+                        if (o.order_no or "") == order_no:
+                            order = o
+                            break
+                if not items:
+                    items = [
+                        r for r in store.load_records(channel="coupang", limit=5000)
+                        if (getattr(r, "order_no", "") or "") == order_no
+                    ]
+            except Exception:  # noqa: BLE001
+                pass
+        return order, items
 
     def _render_calendar(self, items: List[CardUsage]) -> None:
         # 기존 캘린더 클리어

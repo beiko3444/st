@@ -222,6 +222,17 @@ class InventoryHistoryDB:
                 ON card_usages(used_at)
                 """
             )
+            # 쿠팡 자동로그인 자격증명 (label = 사용자 지정 별칭)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS coupang_credentials (
+                    label TEXT PRIMARY KEY,
+                    email TEXT NOT NULL,
+                    password_obf TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             conn.commit()
 
     def _load_last_data(self, conn: sqlite3.Connection, channel: str) -> dict[tuple, dict]:
@@ -1413,6 +1424,42 @@ class InventoryHistoryDB:
             if r.get("use_key") == use_key:
                 return r
         return None
+
+    # ---------------- 쿠팡 자격증명 ----------------
+
+    def list_coupang_credentials(self) -> List[dict]:
+        with self._guard, self._connection() as conn:
+            cur = conn.execute(
+                "SELECT label, email, password_obf, updated_at FROM coupang_credentials "
+                "ORDER BY updated_at DESC"
+            )
+            return [
+                {
+                    "label": r[0],
+                    "email": r[1],
+                    "password_obf": r[2],
+                    "updated_at": r[3],
+                }
+                for r in cur.fetchall()
+            ]
+
+    def upsert_coupang_credential(self, label: str, email: str, password_obf: str) -> None:
+        if not label or not email or not password_obf:
+            raise ValueError("label, email, password 모두 필요합니다.")
+        with self._guard, self._connection() as conn:
+            conn.execute(
+                "INSERT INTO coupang_credentials (label, email, password_obf, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(label) DO UPDATE SET email=excluded.email, "
+                "password_obf=excluded.password_obf, updated_at=excluded.updated_at",
+                (str(label), str(email), str(password_obf), datetime.now().isoformat()),
+            )
+            conn.commit()
+
+    def delete_coupang_credential(self, label: str) -> None:
+        with self._guard, self._connection() as conn:
+            conn.execute("DELETE FROM coupang_credentials WHERE label = ?", (str(label),))
+            conn.commit()
 
     @staticmethod
     def _opt_int(value) -> int | None:

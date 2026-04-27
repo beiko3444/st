@@ -215,6 +215,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
+        elif path == "/coupang-credentials":
+            try:
+                rows = db.list_coupang_credentials()
+                self._send_json({"credentials": rows})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -310,6 +317,21 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 changed = db.upsert_card_usages(items)
                 self._send_json({"changed": changed, "received": len(items)})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/coupang-credentials":
+            try:
+                body = self._read_json_body()
+                label = str(body.get("label") or "").strip()
+                email = str(body.get("email") or "").strip()
+                password_obf = str(body.get("password_obf") or "").strip()
+                if not label or not email or not password_obf:
+                    self._send_json({"error": "label, email, password_obf 필수"}, 400)
+                    return
+                db.upsert_coupang_credential(label, email, password_obf)
+                self._send_json({"ok": True})
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
             return
@@ -462,6 +484,18 @@ class Handler(BaseHTTPRequestHandler):
                     only_missing_order_no=missing_order_no,
                 )
                 self._send_json({"deleted": deleted})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/coupang-credentials":
+            try:
+                label = str((qs.get("label", [None])[0] or "")).strip()
+                if not label:
+                    self._send_json({"error": "label 필수"}, 400)
+                    return
+                db.delete_coupang_credential(label)
+                self._send_json({"ok": True})
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
             return
