@@ -12,8 +12,9 @@ REMOTE_DIR="${2:-/home/beiko/st}"
 echo "사용 대상: ${TARGET}"
 echo "원격 경로: ${REMOTE_DIR}"
 
+SSH_OPTS=(-o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new)
 echo "[1/4] 연결 확인: ${TARGET}"
-if ! ssh -o ConnectTimeout=8 "${TARGET}" "echo connected: \$(hostname)"; then
+if ! ssh "${SSH_OPTS[@]}" "${TARGET}" "echo connected: \$(hostname)"; then
   cat <<'EOF'
 연결 실패(인증 오류)입니다.
 - 보통 원인: 사용자명 또는 비밀번호 불일치

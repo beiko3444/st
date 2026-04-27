@@ -95,6 +95,20 @@ class PiDataClient:
         data = self._request("POST", "/purchase-records", json_body={"records": body_records})
         return int(data.get("inserted") or 0)
 
+    def delete_purchase_records(
+        self,
+        channel: Optional[str] = None,
+        only_missing_order_no: bool = False,
+    ) -> int:
+        """Pi 의 purchase_records 삭제. only_missing_order_no=True 면 order_no 가 NULL/빈문자열인 행만."""
+        params: Dict[str, Any] = {}
+        if channel:
+            params["channel"] = channel
+        if only_missing_order_no:
+            params["missing_order_no"] = "1"
+        data = self._request("DELETE", "/purchase-records", params=params)
+        return int(data.get("deleted") or 0)
+
     def list_purchase_records(self, channel: str = "all", limit: int = 2000) -> List[PurchaseRecord]:
         params = {"limit": int(limit)}
         if channel and channel != "all":
@@ -139,6 +153,8 @@ class PiDataClient:
                 "source_url": o.source_url,
                 "raw_text": o.raw_text,
                 "imported_at": o.imported_at.isoformat() if o.imported_at else datetime.now().isoformat(),
+                "cash_used": o.cash_used,
+                "card_amount": o.card_amount,
             })
         data = self._request("POST", "/purchase-orders", json_body={"orders": body_orders})
         return int(data.get("changed") or 0)
@@ -166,6 +182,8 @@ class PiDataClient:
                 source_url=row.get("source_url"),
                 raw_text=str(row.get("raw_text") or ""),
                 imported_at=imported_at,
+                cash_used=row.get("cash_used"),
+                card_amount=row.get("card_amount"),
             ))
         return out
 

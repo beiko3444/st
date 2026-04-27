@@ -3750,6 +3750,8 @@ class SalesDailyTab(QWidget):
 
 
 class MainWindow(QMainWindow):
+    _on_purchase_pi_done = Signal(bool, int, int, str)
+
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
         self.config = config
@@ -3876,6 +3878,7 @@ class MainWindow(QMainWindow):
         self.product_master_tab.masters_changed.connect(self._on_masters_changed)
         self.revenue_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.keyword_tab.sync_finished.connect(self._on_sub_sync_finished)
+        self._on_purchase_pi_done.connect(self._on_purchase_pi_finished, Qt.QueuedConnection)
         self._refresh_inventory_tab()
         QTimer.singleShot(0, self._load_initial_visible_channel_tab)
         # 자동 동기화는 사용자가 요청할 때만 (F5 또는 동기화 버튼).
@@ -4192,7 +4195,32 @@ class MainWindow(QMainWindow):
         if self.keyword_tab.sync_now():
             started_sources.add("키워드매출")
 
+        # Pi 에서 구매내역 다운로드 (백그라운드)
+        if self._start_purchase_pi_pull():
+            started_sources.add("구매내역")
+
         self._start_sync_session(started_sources)
+
+    def _start_purchase_pi_pull(self) -> bool:
+        """Pi 에서 구매내역+주문 다운로드 → 로컬 DB 저장. 백그라운드 스레드."""
+        try:
+            store = self.purchase_history_tab.store
+        except AttributeError:
+            return False
+        if store is None or store._pi is None or not getattr(store._pi, "is_configured", False):
+            return False
+
+        import threading
+
+        def _worker() -> None:
+            try:
+                rec_n, ord_n = store.pull_from_pi(limit=5000)
+                self._on_purchase_pi_done.emit(True, rec_n, ord_n, "")
+            except Exception as exc:  # noqa: BLE001
+                self._on_purchase_pi_done.emit(False, 0, 0, str(exc))
+
+        threading.Thread(target=_worker, daemon=True, name="purchase-pi-pull").start()
+        return True
 
     @Slot(str, bool)
     def _on_channel_sync_finished_for_masters(self, source: str, succeeded: bool) -> None:
@@ -4217,6 +4245,15 @@ class MainWindow(QMainWindow):
             except Exception:  # noqa: BLE001
                 pass
         self._refresh_inventory_tab()
+
+    @Slot(bool, int, int, str)
+    def _on_purchase_pi_finished(self, ok: bool, rec_n: int, ord_n: int, err: str) -> None:
+        # 구매내역 탭 새로고침
+        try:
+            self.purchase_history_tab.reload()
+        except Exception:  # noqa: BLE001
+            pass
+        self._on_sub_sync_finished("구매내역", ok)
 
     def _on_sub_sync_finished(self, source: str, succeeded: bool) -> None:
         if not self._sync_session_active:

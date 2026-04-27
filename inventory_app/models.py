@@ -73,6 +73,8 @@ class PurchaseOrder:
     source_url: Optional[str]           # 주문 상세 URL
     raw_text: str                       # 주문 상세 페이지 본문 (디버깅용)
     imported_at: datetime
+    cash_used: Optional[int] = None     # 쿠페이캐시/쿠폰/적립금 등 카드 외 차감 합계 (원)
+    card_amount: Optional[int] = None   # payment_total - cash_used (실 카드 청구액)
 
 
 @dataclass

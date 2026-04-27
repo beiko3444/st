@@ -788,22 +788,32 @@ class CardUsageTab(QWidget):
         groups: List[PurchaseGroup] = []
         if orders:
             # PurchaseOrder → PurchaseGroup 어댑터 (UI 코드 호환)
+            # 카드 매칭에는 card_amount(=payment_total - cash_used) 우선 사용.
+            # 캐시 미사용 주문은 card_amount 가 None 일 수 있어 payment_total fallback.
             for o in orders:
+                cash_used = int(o.cash_used or 0)
+                card_amt = o.card_amount if o.card_amount is not None else o.payment_total
+                if card_amt is None or card_amt <= 0:
+                    continue
+                title_extra = ""
+                if cash_used > 0:
+                    title_extra = f" · 캐시 {cash_used:,}원"
                 title = (
                     f"주문 {o.order_no}"
                     + (f" · {o.item_count}건" if o.item_count else "")
+                    + title_extra
                     + (f" [{o.status}]" if o.status else "")
                 )
                 groups.append(PurchaseGroup(
                     channel=o.channel,
                     order_date=o.order_date,
                     title=title,
-                    total_amount=int(o.payment_total or 0),
+                    total_amount=int(card_amt),
                     item_count=o.item_count,
                     items=[],
                     group_key=f"coupang|order|{o.order_no}",
                 ))
-            source_msg = f"주문 {len(orders)}개 (결제금 기준)"
+            source_msg = f"주문 {len(orders)}개 (카드청구액 기준, 캐시사용액 차감)"
         else:
             # ── 2순위 fallback: 품목 합산 ──
             recs: List = []

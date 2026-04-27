@@ -453,6 +453,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(e)}, 400)
             return
 
+        if path == "/purchase-records":
+            try:
+                channel = (qs.get("channel", [None])[0] or "").strip().lower() or None
+                missing_order_no = (qs.get("missing_order_no", ["0"])[0] in ("1", "true", "True"))
+                deleted = db.delete_purchase_records(
+                    channel=channel,
+                    only_missing_order_no=missing_order_no,
+                )
+                self._send_json({"deleted": deleted})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
         self._send_json({"error": "not found"}, 404)
 
 

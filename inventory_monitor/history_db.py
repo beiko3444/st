@@ -191,6 +191,12 @@ class InventoryHistoryDB:
                 ON purchase_orders(channel, order_date)
                 """
             )
+            # 캐시사용액/카드청구액 컬럼 마이그레이션
+            order_cols = {row[1] for row in conn.execute("PRAGMA table_info(purchase_orders)").fetchall()}
+            if "cash_used" not in order_cols:
+                conn.execute("ALTER TABLE purchase_orders ADD COLUMN cash_used INTEGER")
+            if "card_amount" not in order_cols:
+                conn.execute("ALTER TABLE purchase_orders ADD COLUMN card_amount INTEGER")
             # 카드사용내역
             conn.execute(
                 """
@@ -1137,6 +1143,8 @@ class InventoryHistoryDB:
                     o.get("source_url"),
                     o.get("raw_text") or "",
                     str(o.get("imported_at") or datetime.now().isoformat()),
+                    self._opt_int(o.get("cash_used")),
+                    self._opt_int(o.get("card_amount")),
                 )
             )
         if not rows:
@@ -1147,8 +1155,9 @@ class InventoryHistoryDB:
                 """
                 INSERT INTO purchase_orders (
                     channel, order_no, order_date, payment_total, item_count,
-                    status, payment_method, source_url, raw_text, imported_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, payment_method, source_url, raw_text, imported_at,
+                    cash_used, card_amount
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(channel, order_no) DO UPDATE SET
                     order_date     = excluded.order_date,
                     payment_total  = COALESCE(excluded.payment_total, purchase_orders.payment_total),
@@ -1157,7 +1166,9 @@ class InventoryHistoryDB:
                     payment_method = COALESCE(excluded.payment_method, purchase_orders.payment_method),
                     source_url     = excluded.source_url,
                     raw_text       = excluded.raw_text,
-                    imported_at    = excluded.imported_at
+                    imported_at    = excluded.imported_at,
+                    cash_used      = COALESCE(excluded.cash_used, purchase_orders.cash_used),
+                    card_amount    = COALESCE(excluded.card_amount, purchase_orders.card_amount)
                 """,
                 rows,
             )
@@ -1175,7 +1186,8 @@ class InventoryHistoryDB:
             cursor = conn.execute(
                 f"""
                 SELECT channel, order_no, order_date, payment_total, item_count,
-                       status, payment_method, source_url, raw_text, imported_at
+                       status, payment_method, source_url, raw_text, imported_at,
+                       cash_used, card_amount
                 FROM purchase_orders
                 {where}
                 ORDER BY COALESCE(order_date, imported_at) DESC
@@ -1186,6 +1198,7 @@ class InventoryHistoryDB:
             cols = [
                 "channel", "order_no", "order_date", "payment_total", "item_count",
                 "status", "payment_method", "source_url", "raw_text", "imported_at",
+                "cash_used", "card_amount",
             ]
             return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
@@ -1213,6 +1226,28 @@ class InventoryHistoryDB:
                 "payment_method", "source_url", "raw_text", "fingerprint", "imported_at",
             ]
             return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    def delete_purchase_records(
+        self,
+        channel: str | None = None,
+        *,
+        only_missing_order_no: bool = False,
+    ) -> int:
+        """purchase_records 삭제. only_missing_order_no=True 면 order_no 가 NULL/빈문자열인 행만."""
+        clauses: list[str] = []
+        params: list = []
+        if channel and channel != "all":
+            clauses.append("channel = ?")
+            params.append(channel)
+        if only_missing_order_no:
+            clauses.append("(order_no IS NULL OR order_no = '')")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._guard, self._connection() as conn:
+            cursor = conn.execute(
+                f"DELETE FROM purchase_records {where}", params
+            )
+            conn.commit()
+            return int(cursor.rowcount or 0)
 
     # ── 카드사용내역 ──
 

@@ -273,11 +273,30 @@ _COUPANG_ORDER_URL = "https://mc.coupang.com/ssr/desktop/order/list"
 
 
 def _find_chrome_path() -> Optional[str]:
-    candidates = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        str(Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "Application" / "chrome.exe"),
-    ]
+    import sys
+    candidates: list[str] = []
+    if sys.platform == "darwin":
+        candidates += [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            str(Path.home() / "Applications" / "Google Chrome.app" / "Contents" / "MacOS" / "Google Chrome"),
+            "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
+    elif sys.platform.startswith("linux"):
+        candidates += [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/snap/bin/chromium",
+        ]
+    else:  # win32
+        candidates += [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            str(Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "Application" / "chrome.exe"),
+        ]
     for c in candidates:
         if Path(c).exists():
             return c
@@ -285,6 +304,11 @@ def _find_chrome_path() -> Optional[str]:
 
 
 def _real_chrome_user_data() -> Path:
+    import sys
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+    if sys.platform.startswith("linux"):
+        return Path.home() / ".config" / "google-chrome"
     return Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "User Data"
 
 
@@ -293,28 +317,46 @@ def _coupang_junction_path() -> Path:
 
 
 def _setup_chrome_junction(progress: CrawlerProgress) -> bool:
-    """NTFS junction 으로 사용자 평상시 Chrome User Data 를 다른 경로로 보이게 함.
+    """사용자 평상시 Chrome User Data 를 다른 경로로 보이게 함.
+
+    Windows: NTFS junction (mklink /J)
+    macOS/Linux: symbolic link (os.symlink)
 
     이렇게 하면 Chrome 보안 정책 (default user-data-dir 에 디버깅 거부) 우회 가능.
     """
+    import sys
     junction = _coupang_junction_path()
     real = _real_chrome_user_data()
     if not real.exists():
         progress.on_log(f"사용자 Chrome User Data 폴더 없음: {real}")
         return False
-    if junction.exists():
+    if junction.exists() or junction.is_symlink():
         return True
     junction.parent.mkdir(parents=True, exist_ok=True)
-    import subprocess as _sp
-    cmd = ["cmd", "/c", "mklink", "/J", str(junction), str(real)]
-    progress.on_log(f"Junction 생성: {junction.name} → {real.name}")
-    try:
-        result = _sp.run(cmd, capture_output=True, text=True, timeout=10)
-        if result.returncode != 0:
-            progress.on_log(f"Junction 실패: {result.stderr.strip()}")
+
+    if sys.platform == "win32":
+        import subprocess as _sp
+        cmd = ["cmd", "/c", "mklink", "/J", str(junction), str(real)]
+        progress.on_log(f"Junction 생성: {junction.name} → {real.name}")
+        try:
+            result = _sp.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode != 0:
+                progress.on_log(f"Junction 실패: {result.stderr.strip()}")
+                return False
+        except Exception as exc:  # noqa: BLE001
+            progress.on_log(f"Junction 예외: {exc}")
             return False
+        return True
+
+    # macOS / Linux: 심볼릭 링크
+    import os as _os
+    progress.on_log(f"Symlink 생성: {junction} → {real}")
+    try:
+        _os.symlink(str(real), str(junction))
+    except FileExistsError:
+        return True
     except Exception as exc:  # noqa: BLE001
-        progress.on_log(f"Junction 예외: {exc}")
+        progress.on_log(f"Symlink 실패: {exc}")
         return False
     return True
 
@@ -322,12 +364,18 @@ def _setup_chrome_junction(progress: CrawlerProgress) -> bool:
 def _kill_chrome(progress: CrawlerProgress) -> None:
     """Chrome 모든 인스턴스 종료. 쿠팡 자동수집 전 필수."""
     import subprocess as _sp
+    import sys
     progress.on_log("Chrome 모든 인스턴스 종료 중...")
     try:
-        _sp.run(
-            ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
-            capture_output=True, text=True, timeout=10,
-        )
+        if sys.platform == "win32":
+            _sp.run(
+                ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
+                capture_output=True, text=True, timeout=10,
+            )
+        else:
+            # macOS / Linux: pkill
+            _sp.run(["pkill", "-f", "Google Chrome"], capture_output=True, text=True, timeout=10)
+            _sp.run(["pkill", "-f", "chrome"], capture_output=True, text=True, timeout=10)
     except Exception:  # noqa: BLE001
         pass
     time.sleep(2)
@@ -657,11 +705,14 @@ def _coupang_pagination_from_next_data(data: dict) -> dict:
         return {}
 
 
-def _compute_coupang_payment(order: dict) -> tuple[int, int]:
-    """주문에서 (payment_total, item_count) 계산.
+def _compute_coupang_payment(order: dict) -> tuple[int, int, int]:
+    """주문에서 (payment_total, item_count, cash_used) 계산.
 
     payment_total = sum( (quantity - cancelQuantity) * discountedUnitPrice ) + shippingFee
     item_count = 살아있는 상품 라인 수 (cancelQuantity == quantity 인 건 제외)
+    cash_used = 쿠페이캐시/쿠폰/적립금 등 카드 외 차감액 합계 (원)
+
+    카드 청구액 = payment_total - cash_used
     """
     items_total = 0
     item_count = 0
@@ -684,7 +735,54 @@ def _compute_coupang_payment(order: dict) -> tuple[int, int]:
     for br in order.get("bundleReceiptList", []) or []:
         shipping += int(br.get("shippingFee") or 0)
         shipping += int(br.get("remoteAreaShippingFee") or 0)
-    return items_total + shipping, item_count
+
+    # 캐시/쿠폰/적립금 등 카드 외 차감액 합계
+    cash_used = _extract_coupang_cash_used(order)
+    return items_total + shipping, item_count, cash_used
+
+
+def _extract_coupang_cash_used(order: dict) -> int:
+    """주문 JSON 에서 쿠페이캐시/쿠폰/적립금 사용액 합산.
+
+    쿠팡 NEXT_DATA 구조는 시점/실험에 따라 필드명이 달라, 후보 키를 광범위하게 검사.
+    배송비/할인/단가는 이미 discountedUnitPrice/shippingFee 에 반영되어 있으므로,
+    여기서는 '결제수단 외 차감 (현금성)' 만 합산해야 한다.
+    """
+    cash_keys = (
+        "cashAmount", "cashUsedAmount", "usedCashAmount",
+        "coupayCashAmount", "coupayCash", "coupayBalanceUsedAmount",
+        "coupayCashSpend", "cashSpend", "rewardCashAmount",
+        "savedAmount", "savedCashAmount", "rewardAmount",
+        "couponDiscountAmount", "couponAmount",
+    )
+    total = 0
+    # bundleReceiptList 안에 들어있는 경우
+    for br in order.get("bundleReceiptList", []) or []:
+        for k in cash_keys:
+            v = br.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                total += int(v)
+    # paymentSummary / paymentInfo / paymentDetailList 등 상위 필드
+    for top_key in ("paymentSummary", "paymentInfo", "payment", "paymentDetail"):
+        sub = order.get(top_key)
+        if isinstance(sub, dict):
+            for k in cash_keys:
+                v = sub.get(k)
+                if isinstance(v, (int, float)) and v > 0:
+                    total += int(v)
+    # paymentDetailList: [{"type":"COUPAY_CASH","amount":1000}, ...]
+    for top_key in ("paymentDetailList", "paymentList", "paymentMethodList"):
+        arr = order.get(top_key)
+        if isinstance(arr, list):
+            for entry in arr:
+                if not isinstance(entry, dict):
+                    continue
+                t = str(entry.get("type") or entry.get("paymentType") or entry.get("methodType") or "").upper()
+                if any(tag in t for tag in ("CASH", "COUPAY_CASH", "COUPON", "REWARD", "POINT", "MILEAGE")):
+                    amt = entry.get("amount") or entry.get("usedAmount") or 0
+                    if isinstance(amt, (int, float)) and amt > 0:
+                        total += int(amt)
+    return total
 
 
 def _coupang_order_status(order: dict) -> str:
@@ -914,8 +1012,11 @@ def _extract_coupang_orders_from_next_data(
             except Exception:  # noqa: BLE001
                 pass
 
-        payment_total, item_count = _compute_coupang_payment(o)
+        payment_total, item_count, cash_used = _compute_coupang_payment(o)
         status = _coupang_order_status(o)
+        card_amount: Optional[int] = None
+        if payment_total and payment_total > 0:
+            card_amount = max(0, payment_total - int(cash_used or 0))
 
         # 주문(결제) 단위 record
         title = str(o.get("title") or "")
@@ -930,6 +1031,8 @@ def _extract_coupang_orders_from_next_data(
             source_url=f"https://mc.coupang.com/ssr/desktop/order/detail?orderId={order_id}",
             raw_text=title[:500],
             imported_at=now,
+            cash_used=int(cash_used) if cash_used else None,
+            card_amount=card_amount,
         ))
 
         # 품목 단위 records (기존 호환성) — source_url 에 상품 페이지 URL 저장

@@ -255,6 +255,12 @@ class PurchaseHistoryStore:
                 ON purchase_orders(channel, order_date)
                 """
             )
+            # 캐시사용액/카드청구액 컬럼 마이그레이션 (없으면 추가)
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(purchase_orders)").fetchall()}
+            if "cash_used" not in cols:
+                conn.execute("ALTER TABLE purchase_orders ADD COLUMN cash_used INTEGER")
+            if "card_amount" not in cols:
+                conn.execute("ALTER TABLE purchase_orders ADD COLUMN card_amount INTEGER")
             conn.commit()
 
     @staticmethod
@@ -363,6 +369,8 @@ class PurchaseHistoryStore:
                     o.source_url,
                     o.raw_text,
                     o.imported_at.isoformat(),
+                    int(o.cash_used) if o.cash_used is not None else None,
+                    int(o.card_amount) if o.card_amount is not None else None,
                 )
             )
         if not rows:
@@ -373,8 +381,9 @@ class PurchaseHistoryStore:
                 """
                 INSERT INTO purchase_orders (
                     channel, order_no, order_date, payment_total, item_count,
-                    status, payment_method, source_url, raw_text, imported_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, payment_method, source_url, raw_text, imported_at,
+                    cash_used, card_amount
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(channel, order_no) DO UPDATE SET
                     order_date     = excluded.order_date,
                     payment_total  = COALESCE(excluded.payment_total, purchase_orders.payment_total),
@@ -383,7 +392,9 @@ class PurchaseHistoryStore:
                     payment_method = COALESCE(excluded.payment_method, purchase_orders.payment_method),
                     source_url     = excluded.source_url,
                     raw_text       = excluded.raw_text,
-                    imported_at    = excluded.imported_at
+                    imported_at    = excluded.imported_at,
+                    cash_used      = COALESCE(excluded.cash_used, purchase_orders.cash_used),
+                    card_amount    = COALESCE(excluded.card_amount, purchase_orders.card_amount)
                 """,
                 rows,
             )
@@ -408,7 +419,8 @@ class PurchaseHistoryStore:
             rows = conn.execute(
                 f"""
                 SELECT channel, order_no, order_date, payment_total, item_count,
-                       status, payment_method, source_url, raw_text, imported_at
+                       status, payment_method, source_url, raw_text, imported_at,
+                       cash_used, card_amount
                 FROM purchase_orders
                 {where}
                 ORDER BY COALESCE(order_date, imported_at) DESC
@@ -434,6 +446,8 @@ class PurchaseHistoryStore:
                     source_url=row[7],
                     raw_text=row[8] or "",
                     imported_at=imported_at,
+                    cash_used=row[10] if len(row) > 10 else None,
+                    card_amount=row[11] if len(row) > 11 else None,
                 )
             )
         return result
@@ -455,6 +469,96 @@ class PurchaseHistoryStore:
                 # Pi 실패 시 로컬 fallback
                 pass
         return self.load_records(channel=channel, limit=limit)
+
+    def pull_from_pi(self, limit: int = 5000) -> tuple[int, int]:
+        """Pi 에서 구매내역+주문을 다운로드해 로컬 DB 에 저장.
+
+        Returns: (records_inserted, orders_inserted_or_updated). Pi 미설정 시 (0,0).
+        write-through 무한루프를 피하려고 raw INSERT OR IGNORE 사용.
+        """
+        if self._pi is None or not getattr(self._pi, "is_configured", False):
+            return (0, 0)
+
+        # 1) records
+        try:
+            remote_records = self._pi.list_purchase_records(channel="all", limit=limit)
+        except Exception:  # noqa: BLE001
+            remote_records = []
+
+        rec_rows = []
+        for r in remote_records:
+            rec_rows.append((
+                r.channel,
+                r.order_date,
+                r.order_no,
+                r.title,
+                r.amount,
+                r.payment_method,
+                r.source_url,
+                r.raw_text,
+                self._fingerprint(r),
+                r.imported_at.isoformat() if r.imported_at else datetime.now().isoformat(),
+            ))
+
+        records_inserted = 0
+        if rec_rows:
+            with self._guard, self._connection() as conn:
+                before = conn.total_changes
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO purchase_records (
+                        channel, order_date, order_no, title, amount, payment_method,
+                        source_url, raw_text, fingerprint, imported_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rec_rows,
+                )
+                conn.commit()
+                records_inserted = conn.total_changes - before
+
+        # 2) orders
+        try:
+            remote_orders = self._pi.list_purchase_orders(channel="all", limit=limit)
+        except Exception:  # noqa: BLE001
+            remote_orders = []
+
+        order_rows = []
+        for o in remote_orders:
+            order_rows.append((
+                o.channel,
+                o.order_no,
+                o.order_date,
+                o.payment_total,
+                o.item_count,
+                o.status,
+                o.payment_method,
+                o.source_url,
+                o.raw_text,
+                o.imported_at.isoformat() if o.imported_at else datetime.now().isoformat(),
+                o.cash_used,
+                o.card_amount,
+            ))
+
+        orders_changed = 0
+        if order_rows:
+            with self._guard, self._connection() as conn:
+                before = conn.total_changes
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO purchase_orders (
+                        channel, order_no, order_date, payment_total, item_count,
+                        status, payment_method, source_url, raw_text, imported_at,
+                        cash_used, card_amount
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    order_rows,
+                )
+                conn.commit()
+                orders_changed = conn.total_changes - before
+
+        return (records_inserted, orders_changed)
 
     def load_records(self, channel: str = "all", limit: int = 1000) -> List[PurchaseRecord]:
         params: list[object] = []
