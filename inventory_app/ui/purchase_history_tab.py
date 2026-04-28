@@ -1039,6 +1039,11 @@ class PurchaseHistoryTab(QWidget):
             QMessageBox.warning(self, f"{channel_label} \uc790\ub3d9 \uc218\uc9d1 \uc2e4\ud328", str(result.error)[:1500])
             self.status.setText(f"{channel_label} \uc2e4\ud328: {result.error[:120]}")
             return
+        # login_only \ubaa8\ub4dc \ub4f1 records \uc5c6\uc774 \ub05d\ub09c \uacbd\uc6b0
+        if not result.records and not getattr(result, "orders", None):
+            self.status.setText(f"{channel_label} \uc791\uc5c5 \uc644\ub8cc (\uc218\uc9d1\ub41c \ub370\uc774\ud130 \uc5c6\uc74c)")
+            self.reload()
+            return
         try:
             added = self.store.save_records(result.records)
         except Exception as exc:  # noqa: BLE001
@@ -1053,9 +1058,15 @@ class PurchaseHistoryTab(QWidget):
                 order_msg = f" \u00b7 \uc8fc\ubb38 {len(orders_attr)}\uac1c (\uacb0\uc81c\uae08 {paid}\uac1c)"
             except Exception as exc:  # noqa: BLE001
                 order_msg = f" \u00b7 \uc8fc\ubb38 \uc800\uc7a5 \uc2e4\ud328: {exc}"
+        # Pi \uc5c5\ub85c\ub4dc \uc0c1\ud0dc (save_records/save_orders \uac00 write-through \ub85c Pi \uc5d0 \ub3d9\uc2dc \uc5c5\ub85c\ub4dc\ud568)
+        pi_msg = ""
+        if self._pi_client is not None and getattr(self._pi_client, "is_configured", False):
+            pi_msg = " \u00b7 \u2601 \ub77c\uc988\ubca0\ub9ac\ud30c\uc774 \uc790\ub3d9 \uc5c5\ub85c\ub4dc \uc644\ub8cc"
+        else:
+            pi_msg = " \u00b7 (Pi \ubbf8\uc124\uc815 \u2014 \ub85c\uceec\uc5d0\ub9cc \uc800\uc7a5)"
         self.status.setText(
-            f"{channel_label} \uc790\ub3d9 \uc218\uc9d1 \uc644\ub8cc: {len(result.records)}\uac74 \ucd94\ucd9c, "
-            f"{added}\uac74 \uc2e0\uaddc \uc800\uc7a5{order_msg}"
+            f"\u2713 {channel_label} \uc790\ub3d9 \uc218\uc9d1 \uc644\ub8cc: {len(result.records)}\uac74 \ucd94\ucd9c, "
+            f"{added}\uac74 \uc2e0\uaddc \uc800\uc7a5{order_msg}{pi_msg}"
         )
         self.reload()
 

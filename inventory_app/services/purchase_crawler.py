@@ -496,35 +496,89 @@ def _start_chrome_with_debug(
 
 
 def _try_coupang_auto_login(page, email: str, password: str, progress: CrawlerProgress) -> bool:
-    """쿠팡 로그인 폼이 이미 (Chrome 비밀번호 매니저로) 채워져 있다고 가정.
-    로그인 버튼만 클릭. captcha/2FA 가 뜨면 사용자가 마무리.
-    """
+    """저장된 쿠팡 ID/비번을 직접 입력하고 로그인 버튼까지 클릭."""
     if not email or not password:
         return False
+
+    email_selectors = [
+        "#login-email-input",
+        "input[name='email']",
+        "input[name='loginId']",
+        "input[type='email']",
+        "input[autocomplete='username']",
+        "input[placeholder*='이메일']",
+        "input[placeholder*='아이디']",
+    ]
+    password_selectors = [
+        "#login-password-input",
+        "input[name='password']",
+        "input[type='password']",
+        "input[autocomplete='current-password']",
+    ]
     submit_selectors = [
         "button[type='submit']",
-        ".login__button-submit",
         "button.login__button-submit",
+        ".login__button-submit",
         "form button:has-text('로그인')",
+        "button:has-text('로그인')",
+        "input[type='submit']",
     ]
-    # 폼이 채워질 시간을 주기 위한 잠깐 대기
-    time.sleep(1.2)
+
+    def _fill(selectors: List[str], value: str, label: str) -> bool:
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() == 0:
+                    continue
+                try:
+                    loc.wait_for(state="visible", timeout=2500)
+                except Exception:
+                    continue
+                # 기존 값 깨끗이 비우고 입력
+                try:
+                    loc.click(timeout=1500)
+                except Exception:
+                    pass
+                try:
+                    loc.fill("", timeout=1500)
+                except Exception:
+                    pass
+                loc.fill(value, timeout=3000)
+                progress.on_log(f"  · {label} 입력 ({sel})")
+                return True
+            except Exception:
+                continue
+        progress.on_log(f"자동로그인 실패: {label} 입력란 못 찾음")
+        return False
+
     try:
+        # 폼이 렌더링될 시간 잠깐 대기
+        time.sleep(0.8)
+        if not _fill(email_selectors, email, "ID"):
+            return False
+        if not _fill(password_selectors, password, "비밀번호"):
+            return False
+
+        time.sleep(0.3)
+        # 로그인 버튼 클릭
         for sel in submit_selectors:
             try:
                 loc = page.locator(sel).first
                 if loc.count() == 0:
                     continue
-                if not loc.is_visible(timeout=1000):
+                if not loc.is_visible(timeout=1500):
+                    continue
+                if not loc.is_enabled(timeout=1500):
                     continue
                 loc.click(timeout=3000)
-                progress.on_log("로그인 버튼 클릭")
+                progress.on_log(f"  · 로그인 버튼 클릭 ({sel})")
                 return True
             except Exception:
                 continue
+        # Fallback: Enter
         try:
             page.keyboard.press("Enter")
-            progress.on_log("로그인 (Enter)")
+            progress.on_log("  · 로그인 (Enter 키)")
             return True
         except Exception:
             return False
@@ -803,42 +857,58 @@ def _crawl_coupang_via_cdp(
                 f"주문 추출 완료: 총 {len(orders)}개 (결제금 확정 {paid_count}개)"
             )
 
-            # 보충 패스: payment_method / cash_used 는 NEXT_DATA 에 없으므로
-            # 디테일 페이지를 방문해 추출. 시간 절약을 위해 최대 30개로 제한.
+            # 디테일 페이지 보충 패스 — 결제수단/쿠팡캐시 추출
+            # 쿠팡 리스트의 "주문 상세보기" 는 <a> 가 아닌 <span> + JS 핸들러라 DOM 에서
+            # href 를 못 가져옴. 따라서 우리가 직접 source_url(`?orderId=...`)을 사용한다.
+            # 일부 orderId 는 "주문정보가 존재하지 않습니다" 팝업이 뜨므로, 디테일 크롤러가
+            # 그 팝업을 자동으로 닫고 해당 주문은 건너뛴다.
             need_detail = [
                 o for o in orders
-                if (o.payment_method is None or (o.cash_used in (None, 0)))
-                and o.source_url
+                if o.source_url and (o.payment_method is None or o.cash_used in (None, 0))
             ][:30]
             if need_detail:
-                progress.on_log(f"디테일 페이지 보충 {len(need_detail)}개 조회 시작...")
-                detail_orders = _crawl_coupang_order_details(
-                    target_page,
-                    [o.source_url for o in need_detail],
-                    progress,
-                    max_details=len(need_detail),
+                progress.on_log(
+                    f"디테일 보충 {len(need_detail)}개 조회 시작 (백그라운드 탭, 에러 팝업 자동 처리)..."
                 )
-                detail_by_no = {o.order_no: o for o in detail_orders if o.order_no}
-                merged = 0
-                for o in orders:
-                    d = detail_by_no.get(o.order_no)
-                    if d is None:
-                        continue
-                    if o.payment_method is None and d.payment_method:
-                        o.payment_method = d.payment_method
-                        merged += 1
-                    if (o.cash_used in (None, 0)) and d.cash_used:
-                        o.cash_used = d.cash_used
-                        # card_amount 재계산
-                        if o.payment_total is not None:
-                            o.card_amount = max(0, int(o.payment_total) - int(d.cash_used))
-                        merged += 1
-                progress.on_log(f"보충 완료: {merged}개 필드 갱신")
-                # records 에도 payment_method 전파
-                pm_by_order = {o.order_no: o.payment_method for o in orders if o.payment_method}
-                for rec in records:
-                    if rec.payment_method is None and rec.order_no in pm_by_order:
-                        rec.payment_method = pm_by_order[rec.order_no]
+                detail_page = None
+                try:
+                    detail_page = ctx.new_page()
+                except Exception as exc:  # noqa: BLE001
+                    progress.on_log(f"  보충용 탭 생성 실패: {exc}. 보충 패스 생략.")
+                if detail_page is not None:
+                    try:
+                        detail_orders = _crawl_coupang_order_details(
+                            detail_page,
+                            [o.source_url for o in need_detail],
+                            progress,
+                            max_details=len(need_detail),
+                        )
+                    finally:
+                        try:
+                            detail_page.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    detail_by_no = {o.order_no: o for o in detail_orders if o.order_no}
+                    merged = 0
+                    for o in orders:
+                        d = detail_by_no.get(o.order_no)
+                        if d is None:
+                            continue
+                        if o.payment_method is None and d.payment_method:
+                            o.payment_method = d.payment_method
+                            merged += 1
+                        if (o.cash_used in (None, 0)) and d.cash_used:
+                            o.cash_used = d.cash_used
+                            if o.payment_total is not None:
+                                o.card_amount = max(0, int(o.payment_total) - int(d.cash_used))
+                            merged += 1
+                    progress.on_log(
+                        f"보충 완료: {merged}개 필드 갱신 (성공 {len(detail_orders)}/{len(need_detail)})"
+                    )
+                    pm_by_order = {o.order_no: o.payment_method for o in orders if o.payment_method}
+                    for rec in records:
+                        if rec.payment_method is None and rec.order_no in pm_by_order:
+                            rec.payment_method = pm_by_order[rec.order_no]
 
     except Exception as exc:  # noqa: BLE001
         progress.on_log(f"오류: {exc}")
@@ -1053,31 +1123,75 @@ def _coupang_order_status(order: dict) -> str:
 
 
 def _parse_coupang_order_detail(text: str) -> dict:
-    """주문 상세 페이지 본문 텍스트에서 order_no / payment_total / status / 캐시차감 추출."""
+    """주문 상세 페이지 본문 텍스트에서 order_no / payment_total / status / 캐시차감 / 결제수단 추출.
+
+    실제 쿠팡 주문상세 페이지(2026-04 기준) 텍스트 예:
+      ...
+      결제 정보
+      결제수단
+      롯데카드 / 일시불
+      쿠팡캐시      3,114 원
+      총 상품가격           168,170 원
+      할인금액              -1,970 원
+      배송비                0 원
+      롯데카드 / 일시불     163,086 원
+      쿠팡캐시              3,114 원
+      총 결제금액           166,200 원
+    """
     info: dict = {}
-    m = _COUPANG_ORDER_NO_RE.search(text or "")
+    if not text:
+        return info
+
+    # 주문번호
+    m = _COUPANG_ORDER_NO_RE.search(text)
     if m:
         info["order_no"] = m.group(1)
-    m = _COUPANG_PAYMENT_TOTAL_RE.search(text or "")
-    if m:
+
+    # 결제수단:
+    # 1) "[가-힣]+카드 / 일시불" 또는 "[가-힣]+카드 / N개월" — 롯데/신한/삼성/현대/KB국민카드 등 모두 커버
+    # 2) 일반 키워드 (쿠페이/간편결제/계좌이체 등) fallback
+    pm_match = re.search(
+        r"([가-힣A-Z][가-힣A-Z]{0,7}\s*카드)\s*/\s*(일시불|\d+\s*개월)",
+        text,
+    )
+    if pm_match:
+        method_name = re.sub(r"\s+", "", pm_match.group(1))
+        plan = re.sub(r"\s+", "", pm_match.group(2))
+        info["payment_method"] = f"{method_name} / {plan}"
+    else:
+        m = _COUPANG_PAYMENT_METHOD_RE.search(text)
+        if m:
+            method = m.group(1)
+            last4 = m.group(2)
+            info["payment_method"] = f"{method} {last4}".strip() if last4 else method
+
+    # 총 결제금액 (우선) / 결제 금액 (구버전)
+    pt_match = re.search(r"총\s*결제\s*금액\s*[:\s]*([0-9][0-9,]+)\s*원", text)
+    if not pt_match:
+        pt_match = _COUPANG_PAYMENT_TOTAL_RE.search(text)
+    if pt_match:
         try:
-            info["payment_total"] = int(m.group(1).replace(",", ""))
+            info["payment_total"] = int(pt_match.group(1).replace(",", ""))
         except ValueError:
             pass
-    m = _COUPANG_PAYMENT_METHOD_RE.search(text or "")
-    if m:
-        method = m.group(1)
-        last4 = m.group(2)
-        info["payment_method"] = f"{method} {last4}".strip() if last4 else method
-    # 캐시/포인트/쿠폰 등 차감 합산
-    cash_total = 0
-    for cm in _COUPANG_CASH_RE.finditer(text or ""):
-        try:
-            cash_total += int(cm.group(2).replace(",", ""))
-        except (ValueError, IndexError):
-            pass
+
+    # 캐시/포인트/적립금 차감 — 키워드별 '최대' 금액 1개씩만 사용해 중복 매칭 방지.
+    # (텍스트가 "쿠팡캐시 3,114원" 을 두 번 표시하면 합치면 안 됨 — 같은 한 건이므로 max)
+    # 할인금액(쿠폰 외)은 카드 외 차감이 아니라 상품가격 인하라 제외.
+    cash_keywords = ("쿠팡캐시", "쿠페이캐시", "적립금", "포인트", "마일리지", "쿠폰\\s*할인", "즉시\\s*할인")
+    cash_per_keyword: dict[str, int] = {}
+    for kw_pat in cash_keywords:
+        for cm in re.finditer(rf"{kw_pat}\s*[:\s]*[-−]?\s*([0-9][0-9,]+)\s*원", text):
+            try:
+                amt = int(cm.group(1).replace(",", ""))
+            except ValueError:
+                continue
+            key = re.sub(r"\\s\*", "", kw_pat)
+            cash_per_keyword[key] = max(cash_per_keyword.get(key, 0), amt)
+    cash_total = sum(cash_per_keyword.values())
     if cash_total > 0:
         info["cash_used"] = cash_total
+
     # 주문일 (yyyy. M. d 주문)
     md = _COUPANG_DATE_RE.search(text or "")
     if md:
@@ -1090,6 +1204,108 @@ def _parse_coupang_order_detail(text: str) -> dict:
     return info
 
 
+_CASH_KEYWORDS = ("cash", "coupay", "point", "reward", "saving", "saved", "coupon", "mileage")
+_CARD_KEYWORDS = ("creditcard", "checkcard", "credit", "debit")
+
+
+def _walk_for_payment_info(obj, depth: int = 0) -> dict:
+    """디테일 페이지 NEXT_DATA 어디든 돌면서 결제수단/캐시류 합산.
+
+    쿠팡 NEXT_DATA 구조가 시기별로 달라 키 이름을 광범위하게 추측.
+    반환: {payment_method?, cash_used: int, payment_total?}
+    """
+    result = {"cash_used": 0}
+    if depth > 8:
+        return result
+
+    def _merge(other: dict) -> None:
+        if other.get("payment_method") and not result.get("payment_method"):
+            result["payment_method"] = other["payment_method"]
+        if other.get("payment_total") and not result.get("payment_total"):
+            result["payment_total"] = other["payment_total"]
+        result["cash_used"] = result.get("cash_used", 0) + int(other.get("cash_used") or 0)
+
+    if isinstance(obj, dict):
+        # 결제수단 표시 후보
+        for key in ("paymentMethodName", "paymentMethod", "methodName", "paymentName", "cardName", "cardCompany", "displayPaymentName"):
+            v = obj.get(key)
+            if isinstance(v, str) and v.strip() and not result.get("payment_method"):
+                # 카드번호 마지막 4자리 후보
+                last4 = ""
+                for kk in ("cardNumber", "cardNo", "lastNumber", "lastDigits", "maskedCardNumber"):
+                    val = obj.get(kk)
+                    if isinstance(val, str):
+                        m = re.search(r"(\d{4})\D*$", val)
+                        if m:
+                            last4 = m.group(1)
+                            break
+                result["payment_method"] = (v.strip() + (f" {last4}" if last4 else "")).strip()
+        # 결제 총액 후보
+        for key in ("totalPaymentAmount", "totalPaidAmount", "totalAmount", "paymentAmount", "finalPaymentAmount"):
+            v = obj.get(key)
+            if isinstance(v, (int, float)) and v > 0 and not result.get("payment_total"):
+                result["payment_total"] = int(v)
+                break
+        # 캐시/포인트류 합산: 키 이름에 cash/point/coupon/saving 등 포함 + amount 형 값
+        for key, val in obj.items():
+            kl = str(key).lower()
+            if any(kw in kl for kw in _CASH_KEYWORDS) and isinstance(val, (int, float)) and val > 0 and val < 100_000_000:
+                result["cash_used"] += int(val)
+            # 'type'/'methodType' 이 CASH/POINT/COUPON 인 항목의 amount 도 합산
+        # paymentDetailList 형식: [{type:'COUPAY_CASH', amount: 1000}, ...]
+        type_field = obj.get("type") or obj.get("paymentType") or obj.get("methodType")
+        amount_field = obj.get("amount") or obj.get("usedAmount") or obj.get("value")
+        if isinstance(type_field, str) and isinstance(amount_field, (int, float)) and amount_field > 0:
+            tu = type_field.upper()
+            if any(kw in tu for kw in ("CASH", "POINT", "COUPON", "REWARD", "MILEAGE", "SAVING")):
+                result["cash_used"] += int(amount_field)
+            elif any(kw in tu for kw in ("CARD", "CREDIT", "DEBIT")) and not result.get("payment_method"):
+                result["payment_method"] = type_field
+
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                _merge(_walk_for_payment_info(v, depth + 1))
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, (dict, list)):
+                _merge(_walk_for_payment_info(item, depth + 1))
+    return result
+
+
+def _extract_coupang_detail_urls_from_list(page, progress: CrawlerProgress) -> List[str]:
+    """리스트 페이지 DOM 에서 "주문 상세보기" 링크의 실제 href 추출.
+
+    우리가 직접 URL 을 만들면 (`?orderId=`) 쿠팡측이 거부할 때가 있어
+    "주문정보가 존재하지 않습니다" 팝업이 뜨는 경우가 있음. 따라서 실제 페이지에
+    렌더된 링크 href 를 그대로 사용한다.
+    """
+    try:
+        urls = page.evaluate(
+            """
+            () => {
+                const out = [];
+                const anchors = document.querySelectorAll('a');
+                for (const a of anchors) {
+                    const txt = (a.textContent || '').trim();
+                    const href = a.href || '';
+                    if (!href) continue;
+                    // "주문 상세보기" 링크 또는 detail 경로를 포함한 href
+                    if (txt.includes('주문 상세보기') || /\\/order\\/detail/.test(href)) {
+                        out.push(href);
+                    }
+                }
+                return Array.from(new Set(out));
+            }
+            """
+        ) or []
+        urls = [str(u) for u in urls if u]
+        progress.on_log(f"  DOM 에서 detail 링크 {len(urls)}개 발견")
+        return urls
+    except Exception as exc:  # noqa: BLE001
+        progress.on_log(f"  detail 링크 추출 실패: {exc}")
+        return []
+
+
 def _crawl_coupang_order_details(
     page,
     detail_urls: List[str],
@@ -1097,14 +1313,19 @@ def _crawl_coupang_order_details(
     *,
     max_details: int = 60,
 ) -> List[PurchaseOrder]:
-    """각 주문 상세 페이지를 방문해 order_no + payment_total 수집.
+    """각 주문 상세 페이지를 방문해 order_no + payment_total + payment_method + cash_used 수집.
 
-    리스트 페이지에서 모은 href 들을 순회하며 같은 탭에서 navigate.
-    완료 후 다시 list 로 돌아갈 수 있게 history.back() 시도.
+    1순위: 디테일 페이지의 __NEXT_DATA__ 를 deep-walk 해서 추출 (가장 정확)
+    2순위: 본문 텍스트 정규식
     """
     out: List[PurchaseOrder] = []
     now = datetime.now()
     seen: set[str] = set()
+    # 쿠팡이 띄우는 alert/confirm 다이얼로그 자동 처리 — "주문정보가 존재하지 않습니다" 등
+    try:
+        page.on("dialog", lambda d: d.dismiss())
+    except Exception:  # noqa: BLE001
+        pass
     for idx, url in enumerate(detail_urls[:max_details]):
         if progress.cancelled():
             break
@@ -1113,16 +1334,55 @@ def _crawl_coupang_order_details(
         seen.add(url)
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-            time.sleep(0.4)
+            time.sleep(0.5)
             try:
                 page.wait_for_load_state("networkidle", timeout=4_000)
             except Exception:
                 pass
+            # 페이지에 떠 있는 모달 팝업 자동 닫기 — "주문정보가 존재하지 않습니다" 의 [확인]/[X] 버튼
+            try:
+                page.evaluate(
+                    """
+                    () => {
+                        // class 기반 모달 close 버튼들 시도
+                        const labels = ['확인', '닫기'];
+                        const buttons = Array.from(document.querySelectorAll('button, a'));
+                        for (const b of buttons) {
+                            const t = (b.textContent || '').trim();
+                            if (labels.includes(t)) {
+                                try { b.click(); } catch (e) {}
+                            }
+                        }
+                    }
+                    """
+                )
+            except Exception:
+                pass
+            # NEXT_DATA 우선 추출
+            nd = _extract_coupang_next_data(page)
+            nd_info = _walk_for_payment_info(nd) if nd else {}
             try:
                 body = page.evaluate("() => document.body.innerText") or ""
             except Exception:
                 body = ""
+            # 에러 페이지("주문정보가 존재하지 않습니다") 즉시 감지하고 스킵
+            if "주문정보가 존재하지" in body or "주문 정보가 존재하지" in body:
+                progress.on_log(f"  detail {idx + 1}/{max_details}: 주문정보 없음 페이지 → 스킵")
+                continue
             info = _parse_coupang_order_detail(body)
+            # NEXT_DATA 결과를 텍스트 정규식 결과 위에 우선 적용
+            if nd_info.get("payment_method") and not info.get("payment_method"):
+                info["payment_method"] = nd_info["payment_method"]
+            if nd_info.get("cash_used") and not info.get("cash_used"):
+                info["cash_used"] = nd_info["cash_used"]
+            if nd_info.get("payment_total") and not info.get("payment_total"):
+                info["payment_total"] = nd_info["payment_total"]
+            # 진단 로그 — 어떤 소스에서 무엇이 잡혔는지
+            progress.on_log(
+                f"  detail {idx + 1}/{max_details}: NEXT_DATA pm={nd_info.get('payment_method')} "
+                f"cash={nd_info.get('cash_used')} pt={nd_info.get('payment_total')} | "
+                f"text pm={info.get('payment_method')} cash={info.get('cash_used')}"
+            )
             order_no = info.get("order_no")
             if not order_no:
                 # 진단: URL 의 orderId 와 본문 첫 200자 / 에러 키워드 포함 여부
@@ -1214,27 +1474,83 @@ def _scroll_to_bottom(page, progress: CrawlerProgress, max_iter: int = 3) -> Non
 
 
 def _navigate_coupang_to_page(page, page_no: int, progress: CrawlerProgress) -> bool:
-    """쿠팡 주문페이지 N번째로 이동.
+    """쿠팡 주문페이지에서 "다음" 버튼을 직접 클릭해 다음 페이지로 이동.
 
-    쿠팡 URL 패턴: `mc.coupang.com/ssr/desktop/order/list?pageIndex=N`
+    실제 페이지네이션 UI 버튼을 누름으로써 URL 직접 점프(?pageIndex=N) 대신
+    사용자가 보는 자연스러운 흐름을 유지한다. 버튼을 못 찾을 때만 URL 폴백.
 
-    매핑 (쿠팡은 0-base):
-    - page_no=1: default URL (첫 페이지에서 이미 처리)
-    - page_no=2: ?pageIndex=1
-    - page_no=3: ?pageIndex=2
-    - page_no=N: ?pageIndex=N-1
+    page_no: 이동하려는 다음 앱-페이지 번호 (1-base, 첫 페이지는 따로 처리되므로 page_no >= 2).
     """
+    cur_url = ""
+    try:
+        cur_url = page.url or ""
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 1) "다음" 버튼 셀렉터 후보들 — 쿠팡 UI 변경에 견디게 다중 후보
+    next_button_selectors = [
+        "button[aria-label='다음']",
+        "button[aria-label='Next']",
+        "a[aria-label='다음']",
+        "a[aria-label='Next']",
+        "button.pagination__next",
+        "a.pagination__next",
+        ".pagination__next",
+        "button:has-text('다음')",
+        "a:has-text('다음')",
+        # 페이지 번호 버튼 직접 클릭 — page_no 텍스트
+        f"button:has-text('{page_no}')",
+        f"a:has-text('{page_no}')",
+    ]
+
+    for sel in next_button_selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() == 0:
+                continue
+            try:
+                if not loc.is_visible(timeout=1500):
+                    continue
+                if not loc.is_enabled(timeout=1000):
+                    continue
+            except Exception:
+                continue
+            try:
+                loc.scroll_into_view_if_needed(timeout=2000)
+            except Exception:
+                pass
+            loc.click(timeout=3000)
+            # 다음 페이지 로드 기다림 — URL 변경 또는 networkidle
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=10_000)
+            except Exception:
+                pass
+            try:
+                page.wait_for_load_state("networkidle", timeout=4_000)
+            except Exception:
+                pass
+            time.sleep(1.2)
+            new_url = ""
+            try:
+                new_url = page.url or ""
+            except Exception:
+                pass
+            progress.on_log(f"  '다음' 버튼 클릭으로 페이지 {page_no} 이동 ({sel})")
+            return True
+        except Exception:
+            continue
+
+    # 2) 폴백: URL 직접 이동 (버튼을 못 찾았을 때만)
     base = "https://mc.coupang.com/ssr/desktop/order/list"
     page_index = max(0, page_no - 1)
     new_url = f"{base}?pageIndex={page_index}"
     try:
         page.goto(new_url, wait_until="domcontentloaded", timeout=20_000)
-        # 쿠팡 서버 부담 + 봇 감지 회피용 페이지 간 대기 (1.8초)
-        time.sleep(1.8)
-        progress.on_log(f"  pageIndex={page_index} (앱 페이지 {page_no}) 이동")
+        time.sleep(1.5)
+        progress.on_log(f"  '다음' 버튼 못 찾음 → URL 폴백 pageIndex={page_index} (앱 페이지 {page_no})")
         return True
     except Exception as exc:  # noqa: BLE001
-        progress.on_log(f"  pageIndex={page_index} 이동 실패: {exc}")
+        progress.on_log(f"  페이지 {page_no} 이동 실패: {exc}")
         return False
 
 
