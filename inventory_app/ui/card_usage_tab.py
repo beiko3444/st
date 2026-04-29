@@ -6,14 +6,15 @@ beico-app 의 카드사용내역 화면 디자인을 참고 (사용자 요청 �
 from __future__ import annotations
 
 import calendar
+import json
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from PySide6.QtCore import QDate, QEvent, QObject, QPointF, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
+from PySide6.QtCore import QDate, QEvent, QMimeData, QObject, QPointF, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QDrag, QFont, QKeySequence, QPainter, QPen, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -51,6 +52,7 @@ from inventory_app.services.barobill_card_client import (
     BarobillError,
 )
 from inventory_app.services.card_category import (
+    CategoryMeta,
     DEFAULT_CATEGORIES,
     category_meta,
     classify_category,
@@ -285,6 +287,15 @@ class _FlowWrap(QWidget):
         w.show()
         self._relayout()
 
+    def set_order(self, widgets: list[QWidget]) -> None:
+        """이미 추가된 위젯들의 표시 순서를 바꾼다."""
+        known = [w for w in widgets if w in self._items]
+        rest = [w for w in self._items if w not in known]
+        self._items = known + rest
+        for w in self._items:
+            w.raise_()
+        self._relayout()
+
     def _relayout(self) -> None:
         x = 0
         y = 0
@@ -315,28 +326,40 @@ class _FlowWrap(QWidget):
 class _CategoryChip(QPushButton):
     """카테고리 칩 (선택 시 체크 상태)."""
 
+    moved = Signal(str, str)
+    edit_requested = Signal(str)
+
     def __init__(self, code: str, label_text: str, emoji: str, bg_color: str = "#f1f5f9") -> None:
         super().__init__(f"{emoji} {label_text}")
         self.code = code
+        self.label_text = label_text
+        self.emoji = emoji
+        self.shortcut_label = ""
+        self._press_pos = None
         self.setCheckable(True)
+        self.setAcceptDrops(True)
+        self.setContextMenuPolicy(Qt.DefaultContextMenu)
         self.setCursor(Qt.PointingHandCursor)
         self._bg = bg_color
         self._refresh_style()
 
+    def set_display(self, label_text: str, emoji: str, bg_color: Optional[str] = None) -> None:
+        self.label_text = label_text
+        self.emoji = emoji
+        if bg_color:
+            self._bg = bg_color
+        self.set_amount(0)
+
+    def set_shortcut_label(self, shortcut_label: str) -> None:
+        self.shortcut_label = shortcut_label
+        self.set_amount(0)
+
     def set_amount(self, amount: int) -> None:
-        meta = self.text().split(" ", 1)[0]
-        # 보존된 emoji + " " + label + " amount"
-        # 실제 라벨은 self.code 로 다시 만들어야 — 하지만 init 에서 emoji+label 만 있고 amount 안 넣었음
-        # 여기서 amount 만 추가 표시
-        # 단순화: 텍스트 마지막에 amount 추가
-        # 매번 재설정
-        # NOTE: text 형식: "🛒 쇼핑 1,727,043원"
-        from inventory_app.services.card_category import category_meta as _cm
-        c = _cm(self.code)
+        prefix = f"{self.shortcut_label} " if self.shortcut_label else ""
         if amount > 0:
-            self.setText(f"{c.emoji} {c.label} {amount:,}원")
+            self.setText(f"{prefix}{self.emoji} {self.label_text} {amount:,}원")
         else:
-            self.setText(f"{c.emoji} {c.label}")
+            self.setText(f"{prefix}{self.emoji} {self.label_text}")
         self._refresh_style()
 
     def _refresh_style(self) -> None:
@@ -355,6 +378,128 @@ class _CategoryChip(QPushButton):
     def nextCheckState(self) -> None:  # type: ignore[override]
         super().nextCheckState()
         self._refresh_style()
+
+    def mousePressEvent(self, event):  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            self._press_pos = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event):  # type: ignore[override]
+        self.edit_requested.emit(self.code)
+        event.accept()
+
+    def mouseMoveEvent(self, event):  # type: ignore[override]
+        if not (event.buttons() & Qt.LeftButton) or self._press_pos is None:
+            super().mouseMoveEvent(event)
+            return
+        if (event.position().toPoint() - self._press_pos).manhattanLength() < QApplication.startDragDistance():
+            super().mouseMoveEvent(event)
+            return
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData("application/x-smartinventory-card-category", self.code.encode("utf-8"))
+        drag.setMimeData(mime)
+        drag.exec(Qt.MoveAction)
+
+    def dragEnterEvent(self, event):  # type: ignore[override]
+        if event.mimeData().hasFormat("application/x-smartinventory-card-category"):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event):  # type: ignore[override]
+        if not event.mimeData().hasFormat("application/x-smartinventory-card-category"):
+            super().dropEvent(event)
+            return
+        source = bytes(event.mimeData().data("application/x-smartinventory-card-category")).decode("utf-8")
+        if source and source != self.code:
+            self.moved.emit(source, self.code)
+            event.acceptProposedAction()
+
+
+_CATEGORY_ICON_CHOICES: list[tuple[str, str]] = [
+    ("☕", "카페"), ("🍽️", "음식"), ("🥖", "베이커리"), ("🚆", "교통"),
+    ("🛒", "쇼핑"), ("🛍️", "편의점"), ("⛽", "주유"), ("💳", "금융"),
+    ("📱", "통신"), ("🖨️", "사무"), ("🏥", "의료"), ("📚", "교육"),
+    ("🎬", "문화"), ("📦", "기타"), ("🧾", "영수증"), ("💰", "지출"),
+    ("🏪", "매장"), ("🍔", "패스트푸드"), ("🍕", "피자"), ("🍜", "면/분식"),
+    ("🥗", "건강식"), ("🛻", "배송"), ("🚕", "택시"), ("🚗", "차량"),
+    ("🏠", "생활"), ("🧴", "생활용품"), ("💊", "약"), ("🦷", "치과"),
+    ("🎮", "게임"), ("🏋️", "운동"), ("✈️", "여행"), ("🎁", "선물"),
+]
+
+
+class _CategoryEditDialog(QDialog):
+    """카테고리 표시명/아이콘 편집."""
+
+    def __init__(self, meta: CategoryMeta, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("카테고리 수정")
+        self.setMinimumWidth(420)
+        self._selected_emoji = meta.emoji
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        title = QLabel(f"{meta.emoji} {meta.label}")
+        f = QFont(); f.setBold(True); f.setPointSize(13)
+        title.setFont(f)
+        title.setStyleSheet("color: #0f172a;")
+        layout.addWidget(title)
+
+        name_label = QLabel("카테고리명")
+        name_label.setStyleSheet("color: #475569; font-size: 11px; font-weight: 600;")
+        layout.addWidget(name_label)
+
+        self.name_edit = QLineEdit(meta.label)
+        self.name_edit.setPlaceholderText("표시할 카테고리명")
+        self.name_edit.setStyleSheet(
+            "QLineEdit { border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px 10px; "
+            "font-size: 13px; color: #0f172a; background: #ffffff; }"
+            "QLineEdit:focus { border-color: #0f766e; }"
+        )
+        layout.addWidget(self.name_edit)
+
+        icon_label = QLabel("아이콘 선택")
+        icon_label.setStyleSheet("color: #475569; font-size: 11px; font-weight: 600;")
+        layout.addWidget(icon_label)
+
+        self.icon_list = QListWidget()
+        self.icon_list.setViewMode(QListWidget.IconMode)
+        self.icon_list.setMovement(QListWidget.Static)
+        self.icon_list.setResizeMode(QListWidget.Adjust)
+        self.icon_list.setGridSize(QSize(92, 40))
+        self.icon_list.setSpacing(6)
+        self.icon_list.setFixedHeight(172)
+        self.icon_list.setStyleSheet(
+            "QListWidget { border: 1px solid #e2e8f0; border-radius: 8px; background: #f8fafc; padding: 6px; }"
+            "QListWidget::item { border-radius: 8px; padding: 6px; color: #334155; }"
+            "QListWidget::item:selected { background: #0f766e; color: #ffffff; }"
+        )
+        for emoji, label in _CATEGORY_ICON_CHOICES:
+            item = QListWidgetItem(f"{emoji} {label}")
+            item.setData(Qt.UserRole, emoji)
+            self.icon_list.addItem(item)
+            if emoji == meta.emoji:
+                self.icon_list.setCurrentItem(item)
+        if self.icon_list.currentItem() is None and self.icon_list.count() > 0:
+            self.icon_list.setCurrentRow(0)
+        self.icon_list.currentItemChanged.connect(self._on_icon_changed)
+        layout.addWidget(self.icon_list)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_icon_changed(self, current: Optional[QListWidgetItem], _previous: Optional[QListWidgetItem]) -> None:
+        if current is not None:
+            self._selected_emoji = str(current.data(Qt.UserRole) or self._selected_emoji)
+
+    def values(self) -> tuple[str, str]:
+        label = self.name_edit.text().strip()
+        return label, self._selected_emoji
 
 
 class _UsageRow(QFrame):
@@ -858,6 +1003,9 @@ class _MonthYearPicker(QWidget):
 
 
 class CardUsageTab(QWidget):
+    _CAT_ORDER_PREF_KEY = "card_usage.category_order"
+    _CAT_CUSTOM_PREF_KEY = "card_usage.category_customizations"
+
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
         self._config = config
@@ -882,6 +1030,9 @@ class CardUsageTab(QWidget):
         self._cal_view_month: Optional[int] = None
         # Pi 데이터 API: 카드내역과 구매내역 모두 라즈베리에 저장
         self.pi = PiDataClient(getattr(config, "monitor_url", None))
+        self._category_customizations: Dict[str, Dict[str, str]] = self._load_category_customizations()
+        self._category_order: List[str] = self._load_category_order()
+        self._category_shortcuts: List[QShortcut] = []
 
         # ===== 헤더 =====
         layout = QVBoxLayout(self)
@@ -949,12 +1100,14 @@ class CardUsageTab(QWidget):
 
         # ===== 카테고리 칩 (가로 공간 부족 시 자동 줄바꿈) =====
         self.category_chips: Dict[str, _CategoryChip] = {}
-        chip_wrap = _FlowWrap(h_spacing=8, v_spacing=6)
-        for meta in DEFAULT_CATEGORIES:
+        self.category_chip_wrap = _FlowWrap(h_spacing=8, v_spacing=6)
+        for meta in self._ordered_category_metas():
             chip = _CategoryChip(meta.code, meta.label, meta.emoji, meta.bg_color)
             chip.clicked.connect(lambda _checked, c=meta.code: self._on_chip_clicked(c))
+            chip.moved.connect(self._on_category_chip_moved)
+            chip.edit_requested.connect(self._edit_category)
             self.category_chips[meta.code] = chip
-            chip_wrap.add_widget(chip)
+            self.category_chip_wrap.add_widget(chip)
         self.clear_filter_btn = QPushButton("✕ 필터 해제")
         self.clear_filter_btn.setCursor(Qt.PointingHandCursor)
         self.clear_filter_btn.setStyleSheet(
@@ -963,8 +1116,10 @@ class CardUsageTab(QWidget):
             "QPushButton:hover { color: #0f172a; }"
         )
         self.clear_filter_btn.clicked.connect(self._on_clear_filter)
-        chip_wrap.add_widget(self.clear_filter_btn)
-        layout.addWidget(chip_wrap)
+        self.category_chip_wrap.add_widget(self.clear_filter_btn)
+        layout.addWidget(self.category_chip_wrap)
+        self._refresh_category_shortcut_labels()
+        self._install_category_shortcuts()
 
         # ===== 필터 영역 =====
         filter_row = QHBoxLayout()
@@ -1141,6 +1296,210 @@ class CardUsageTab(QWidget):
         QTimer.singleShot(0, self._load_from_pi_cache)
 
     # ----- helpers -----
+
+    @staticmethod
+    def _default_category_order() -> List[str]:
+        return [meta.code for meta in DEFAULT_CATEGORIES]
+
+    @staticmethod
+    def _local_ui_prefs_path() -> Path:
+        return Path.home() / ".smartinventory" / "ui_prefs.json"
+
+    def _read_local_ui_prefs(self) -> Dict[str, Any]:
+        path = self._local_ui_prefs_path()
+        try:
+            if not path.exists():
+                return {}
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _write_local_ui_pref(self, key: str, value: Any) -> None:
+        path = self._local_ui_prefs_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = self._read_local_ui_prefs()
+            data[key] = value
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _load_category_customizations(self) -> Dict[str, Dict[str, str]]:
+        raw: Any = None
+        try:
+            raw = self.pi.get_ui_pref(self._CAT_CUSTOM_PREF_KEY)
+        except Exception:  # noqa: BLE001
+            raw = None
+        if not isinstance(raw, dict):
+            raw = self._read_local_ui_prefs().get(self._CAT_CUSTOM_PREF_KEY)
+        if not isinstance(raw, dict):
+            return {}
+        valid = set(self._default_category_order())
+        result: Dict[str, Dict[str, str]] = {}
+        for code, cfg in raw.items():
+            if str(code) not in valid or not isinstance(cfg, dict):
+                continue
+            label = str(cfg.get("label") or "").strip()
+            emoji = str(cfg.get("emoji") or "").strip()
+            entry: Dict[str, str] = {}
+            if label:
+                entry["label"] = label[:24]
+            if emoji:
+                entry["emoji"] = emoji[:8]
+            if entry:
+                result[str(code)] = entry
+        return result
+
+    def _save_category_customizations(self) -> None:
+        payload = {code: dict(cfg) for code, cfg in self._category_customizations.items() if cfg}
+        self._write_local_ui_pref(self._CAT_CUSTOM_PREF_KEY, payload)
+        try:
+            self.pi.set_ui_pref(self._CAT_CUSTOM_PREF_KEY, payload)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _category_meta(self, code: str) -> CategoryMeta:
+        base = category_meta(code)
+        custom = self._category_customizations.get(base.code, {})
+        return CategoryMeta(
+            base.code,
+            custom.get("label") or base.label,
+            custom.get("emoji") or base.emoji,
+            base.bg_color,
+        )
+
+    def _load_category_order(self) -> List[str]:
+        default = self._default_category_order()
+        order: list[str] = []
+        try:
+            remote = self.pi.get_ui_pref(self._CAT_ORDER_PREF_KEY)
+            if isinstance(remote, list):
+                order = [str(x) for x in remote]
+        except Exception:  # noqa: BLE001
+            order = []
+        if not order:
+            local = self._read_local_ui_prefs().get(self._CAT_ORDER_PREF_KEY)
+            if isinstance(local, list):
+                order = [str(x) for x in local]
+        valid = set(default)
+        normalized = [code for code in order if code in valid]
+        for code in default:
+            if code not in normalized:
+                normalized.append(code)
+        return normalized
+
+    def _ordered_category_metas(self):
+        valid = {meta.code for meta in DEFAULT_CATEGORIES}
+        return [self._category_meta(code) for code in self._category_order if code in valid]
+
+    def _save_category_order(self) -> None:
+        self._write_local_ui_pref(self._CAT_ORDER_PREF_KEY, list(self._category_order))
+        try:
+            self.pi.set_ui_pref(self._CAT_ORDER_PREF_KEY, list(self._category_order))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _apply_category_chip_order(self) -> None:
+        widgets: list[QWidget] = [
+            self.category_chips[code]
+            for code in self._category_order
+            if code in self.category_chips
+        ]
+        widgets.append(self.clear_filter_btn)
+        self.category_chip_wrap.set_order(widgets)
+        self._refresh_category_shortcut_labels()
+
+    def _refresh_category_shortcut_labels(self) -> None:
+        sums: Dict[str, int] = {}
+        for it in self._all_items:
+            if self._is_excluded(it):
+                continue
+            cat = self._categories_index.get(it.use_key or it.id or "", "OTHER")
+            sums[cat] = sums.get(cat, 0) + max(0, int(it.amount or 0))
+        for idx, code in enumerate(self._category_order):
+            chip = self.category_chips.get(code)
+            if chip is None:
+                continue
+            meta = self._category_meta(code)
+            chip.set_display(meta.label, meta.emoji, meta.bg_color)
+            chip.set_shortcut_label(f"F{idx + 1}" if idx < 12 else "")
+            chip.set_amount(sums.get(code, 0))
+
+    def _install_category_shortcuts(self) -> None:
+        for idx in range(12):
+            shortcut = QShortcut(QKeySequence(f"F{idx + 1}"), self)
+            shortcut.activated.connect(lambda i=idx: self._on_category_shortcut(i))
+            self._category_shortcuts.append(shortcut)
+
+    def _selected_usage_for_shortcut(self) -> Optional[CardUsage]:
+        row = self.table.currentRow()
+        if 0 <= row < len(self._displayed_items):
+            return self._displayed_items[row]
+        return None
+
+    def _on_category_shortcut(self, index: int) -> None:
+        if index < 0 or index >= len(self._category_order):
+            return
+        focus = QApplication.focusWidget()
+        if self.table.state() == QAbstractItemView.EditingState or isinstance(focus, (QLineEdit, QComboBox)):
+            return
+        code = self._category_order[index]
+        usage = self._selected_usage_for_shortcut()
+        if usage is not None and self.body_stack.currentIndex() == 0:
+            self._change_category(usage, code)
+            meta = self._category_meta(code)
+            self.status_banner.setText(f"{meta.emoji} {meta.label} 카테고리로 변경했습니다. ({self._shortcut_name(index)})")
+            self.status_banner.setStyleSheet(
+                "QLabel { background: #ecfdf5; border: 1px solid #bbf7d0; border-radius: 6px; "
+                "padding: 6px 10px; color: #047857; font-size: 11px; }"
+            )
+            self.status_banner.setVisible(True)
+            return
+        self._select_category_filter(code)
+
+    @staticmethod
+    def _shortcut_name(index: int) -> str:
+        return f"F{index + 1}"
+
+    def _on_category_chip_moved(self, source_code: str, target_code: str) -> None:
+        if source_code not in self._category_order or target_code not in self._category_order:
+            return
+        self._category_order.remove(source_code)
+        target_idx = self._category_order.index(target_code)
+        self._category_order.insert(target_idx, source_code)
+        self._apply_category_chip_order()
+        self._save_category_order()
+        self._refresh_chip_amounts()
+
+    def _edit_category(self, code: str) -> None:
+        meta = self._category_meta(code)
+        dialog = _CategoryEditDialog(meta, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        label, emoji = dialog.values()
+        if not label:
+            QMessageBox.warning(self, "카테고리명 필요", "카테고리명을 입력하세요.")
+            return
+        base = category_meta(code)
+        custom: Dict[str, str] = {}
+        if label != base.label:
+            custom["label"] = label
+        if emoji != base.emoji:
+            custom["emoji"] = emoji
+        if custom:
+            self._category_customizations[code] = custom
+        else:
+            self._category_customizations.pop(code, None)
+        self._save_category_customizations()
+        self._refresh_chip_amounts()
+        self._render_list()
+        self.status_banner.setText(f"{emoji} {label} 카테고리 이름/아이콘을 저장했습니다.")
+        self.status_banner.setStyleSheet(
+            "QLabel { background: #ecfdf5; border: 1px solid #bbf7d0; border-radius: 6px; "
+            "padding: 6px 10px; color: #047857; font-size: 11px; }"
+        )
+        self.status_banner.setVisible(True)
 
     @staticmethod
     def _this_month_range() -> tuple[date, date]:
@@ -1358,6 +1717,9 @@ class CardUsageTab(QWidget):
         return (matched, candidates, ambiguous, source_msg)
 
     def _on_chip_clicked(self, code: str) -> None:
+        self._select_category_filter(code)
+
+    def _select_category_filter(self, code: str) -> None:
         # 토글
         if self._selected_category == code:
             self._selected_category = None
@@ -1758,7 +2120,13 @@ class CardUsageTab(QWidget):
                 continue
             cat = self._categories_index.get(it.use_key or it.id or "", "OTHER")
             sums[cat] = sums.get(cat, 0) + max(0, int(it.amount or 0))
-        for code, chip in self.category_chips.items():
+        for idx, code in enumerate(self._category_order):
+            chip = self.category_chips.get(code)
+            if chip is None:
+                continue
+            meta = self._category_meta(code)
+            chip.set_display(meta.label, meta.emoji, meta.bg_color)
+            chip.set_shortcut_label(f"F{idx + 1}" if idx < 12 else "")
             chip.set_amount(sums.get(code, 0))
 
     # ----- 리스트 렌더 (디스패처) -----
@@ -1871,7 +2239,7 @@ class CardUsageTab(QWidget):
             self.table.setRowCount(len(items))
             for r, usage in enumerate(items):
                 cat_code = self._categories_index.get(usage.use_key or usage.id or "", "OTHER")
-                cm = category_meta(cat_code)
+                cm = self._category_meta(cat_code)
                 amount_int = int(usage.amount or 0)
                 cancelled = amount_int < 0
                 reviewed = self._is_reviewed(usage)
@@ -2058,8 +2426,9 @@ class CardUsageTab(QWidget):
         menu = QMenu(self.table)
         # 카테고리 변경 (서브메뉴)
         cat_menu = menu.addMenu("🏷 카테고리 변경")
-        for meta in DEFAULT_CATEGORIES:
-            label = f"{meta.emoji} {meta.label}"
+        for idx, meta in enumerate(self._ordered_category_metas()):
+            shortcut = f"F{idx + 1} · " if idx < 12 else ""
+            label = f"{shortcut}{meta.emoji} {meta.label}"
             if meta.code == cur_code:
                 label = f"● {label}"
             a = cat_menu.addAction(label)
