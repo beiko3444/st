@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from datetime import date as _date, datetime as _dt
 from pathlib import Path
 from typing import Any, List, Optional
 
-from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QBrush, QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QTableWidget,
@@ -290,6 +292,61 @@ class _NumberItem(QTableWidgetItem):
         return super().__lt__(other)
 
 
+class _DateGaugeCell(QWidget):
+    """일자 + 반품가능일 게이지 (쿠팡: 30일 정책).
+
+    상단: 일자 텍스트
+    하단: 가로 게이지 (남은 일수 / 30) + 'D-N' 라벨
+    """
+
+    RETURN_DAYS = 30
+
+    def __init__(self, date_text: str, days_left: int | None, *, dim: bool = False) -> None:
+        super().__init__()
+        v = QVBoxLayout(self)
+        v.setContentsMargins(4, 2, 4, 2)
+        v.setSpacing(1)
+        date_lbl = QLabel(date_text)
+        date_lbl.setStyleSheet(
+            "font-size: 12px; color: %s;" % ("#9ca3af" if dim else "#0f172a")
+        )
+        v.addWidget(date_lbl)
+        if days_left is not None:
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(3)
+            bar = QProgressBar()
+            bar.setMaximum(self.RETURN_DAYS)
+            bar.setMinimum(0)
+            bar.setValue(max(0, min(self.RETURN_DAYS, days_left)))
+            bar.setTextVisible(False)
+            bar.setFixedHeight(4)
+            if days_left <= 0:
+                color = "#9ca3af"  # 만료 — 회색
+            elif days_left <= 5:
+                color = "#ef4444"  # 임박 — 빨강
+            elif days_left <= 14:
+                color = "#f59e0b"  # 주의 — 주황
+            else:
+                color = "#10b981"  # 여유 — 녹색
+            bar.setStyleSheet(
+                "QProgressBar { border: none; background: #e5e7eb; border-radius: 2px; }"
+                f"QProgressBar::chunk {{ background: {color}; border-radius: 2px; }}"
+            )
+            row.addWidget(bar, 1)
+            txt = "만료" if days_left <= 0 else f"D-{days_left}"
+            d_lbl = QLabel(txt)
+            d_lbl.setStyleSheet(f"font-size: 9px; color: {color}; font-weight: 600;")
+            row.addWidget(d_lbl, 0)
+            v.addLayout(row)
+            self.setToolTip(
+                f"쿠팡 반품 가능 마감일까지 D-{max(0, days_left)} "
+                f"(주문 {self.RETURN_DAYS}일 정책)"
+                if days_left > 0
+                else "쿠팡 반품 가능 기간(30일) 만료"
+            )
+
+
 class _CrawlerWorker(QObject):
     log = Signal(str)
     login_required = Signal(str)
@@ -465,6 +522,23 @@ class PurchaseHistoryTab(QWidget):
         top.addWidget(self.pi_sync_btn)
         top.addStretch(1)
 
+        # \u2500\u2500 \ud1b5\ud569 \uac80\uc0c9 \ubc14 \u2500\u2500
+        search_row = QHBoxLayout()
+        search_row.setSpacing(6)
+        search_row.addWidget(QLabel("\ud83d\udd0d \ud1b5\ud569\uac80\uc0c9"))
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText(
+            "\uc0c1\ud488\uba85 / \uc8fc\ubb38\ubc88\ud638 / \uacb0\uc81c\uc218\ub2e8 / \uacc4\uc815 / \ucc44\ub110 / \uc77c\uc790 (\uacf5\ubc31 = AND)"
+        )
+        self.search_edit.setClearButtonEnabled(True)
+        # \uc785\ub825 \uc989\uc2dc \ud544\ud130 (debounce \uc5c6\uc774\ub3c4 200ms \uc815\ub3c4 \ub2e8\uc21c \ucc98\ub9ac)
+        self._search_debounce = QTimer(self)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(150)
+        self._search_debounce.timeout.connect(self.reload)
+        self.search_edit.textChanged.connect(lambda _t: self._search_debounce.start())
+        search_row.addWidget(self.search_edit, 1)
+
         auto_row = QHBoxLayout()
         self.auto_naver_btn = QPushButton("\ub124\uc774\ubc84 \uc790\ub3d9 \uc218\uc9d1")
         self.auto_naver_btn.setToolTip(
@@ -571,6 +645,7 @@ class PurchaseHistoryTab(QWidget):
         self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
 
         layout.addLayout(top)
+        layout.addLayout(search_row)
         layout.addLayout(auto_row)
         layout.addLayout(cred_row)
         layout.addWidget(self.table, 1)
@@ -733,14 +808,44 @@ class PurchaseHistoryTab(QWidget):
     def reload(self) -> None:
         channel = self._selected_channel()
         rows = self.store.load_records(channel=channel)
+        # \ud1b5\ud569 \uac80\uc0c9 \ud544\ud130 (\uc788\uc744 \ub54c\ub9cc)
+        q = ""
+        if hasattr(self, "search_edit"):
+            q = (self.search_edit.text() or "").strip()
+        if q:
+            rows = self._apply_search(rows, q)
         self._render(rows)
         gross = sum(int(row.amount or 0) for row in rows if not self._is_cancelled(row))
         cancelled = sum(int(row.amount or 0) for row in rows if self._is_cancelled(row))
         net = gross - cancelled
+        suffix = f" \u00b7 \uac80\uc0c9 '{q}'" if q else ""
         if cancelled > 0:
-            self.status.setText(f"{len(rows):,}\uac74 | \uacb0\uc81c {gross:,}\uc6d0 - \ucde8\uc18c {cancelled:,}\uc6d0 = {net:,}\uc6d0")
+            self.status.setText(
+                f"{len(rows):,}\uac74 | \uacb0\uc81c {gross:,}\uc6d0 - \ucde8\uc18c {cancelled:,}\uc6d0 = {net:,}\uc6d0{suffix}"
+            )
         else:
-            self.status.setText(f"{len(rows):,}\uac74 | {net:,}\uc6d0")
+            self.status.setText(f"{len(rows):,}\uac74 | {net:,}\uc6d0{suffix}")
+
+    def _apply_search(self, rows: List[PurchaseRecord], query: str) -> List[PurchaseRecord]:
+        """\uacf5\ubc31 = AND, \uac01 \ud1a0\ud070\uc740 \ubaa8\ub4e0 \uac80\uc0c9 \uac00\ub2a5 \ud544\ub4dc\ub97c OR \ub85c \ub9e4\uce6d."""
+        tokens = [t for t in query.split() if t]
+        if not tokens:
+            return rows
+        out: List[PurchaseRecord] = []
+        for r in rows:
+            channel_label = self.CHANNEL_LABELS.get(r.channel, r.channel)
+            haystack = " ".join([
+                r.order_date or "",
+                r.order_no or "",
+                r.title or "",
+                r.payment_method or "",
+                getattr(r, "account_label", None) or "",
+                channel_label,
+                str(r.amount or ""),
+            ]).lower()
+            if all(tok.lower() in haystack for tok in tokens):
+                out.append(r)
+        return out
 
     def _on_cell_double_clicked(self, row: int, col: int) -> None:
         """주문번호(2) → 결제 상세 / 상품(3) → 상품페이지."""
@@ -909,6 +1014,16 @@ class PurchaseHistoryTab(QWidget):
                 getattr(record, "account_label", None) or "-",
                 record.imported_at.strftime("%Y-%m-%d %H:%M"),
             ]
+            # 일자 컬럼: 쿠팡 + 미취소 건은 30일 반품 게이지 cellWidget 추가
+            gauge_widget: Optional[_DateGaugeCell] = None
+            if record.channel == "coupang" and not cancelled and record.order_date:
+                try:
+                    od = _dt.strptime(record.order_date, "%Y-%m-%d").date()
+                    days_passed = (_date.today() - od).days
+                    days_left = _DateGaugeCell.RETURN_DAYS - days_passed
+                    gauge_widget = _DateGaugeCell(record.order_date, days_left)
+                except Exception:  # noqa: BLE001
+                    gauge_widget = None
             for col_idx, value in enumerate(values):
                 if col_idx == 4:
                     text = f"{signed_amount:,}\uc6d0" if value else "-"
@@ -937,6 +1052,10 @@ class PurchaseHistoryTab(QWidget):
                     else:
                         item.setToolTip(record.raw_text[:1000] if record.raw_text else "")
                 self.table.setItem(row_idx, col_idx, item)
+            # 게이지 위젯 (있을 때만) — 일자(0번) 컬럼에 덮어씀, 정렬용 setItem 은 유지됨
+            if gauge_widget is not None:
+                self.table.setCellWidget(row_idx, 0, gauge_widget)
+                self.table.setRowHeight(row_idx, 36)
         self.table.resizeColumnsToContents()
         # 합계 행이 정렬에 섞이지 않도록 사용자 정렬 비활성화
         self.table.setSortingEnabled(False)

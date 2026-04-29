@@ -9,6 +9,7 @@ import calendar
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import QDate, QEvent, QObject, QPointF, QSize, Qt, QThread, QTimer, Signal
@@ -29,6 +30,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -625,7 +627,9 @@ class _GaugeBar(QWidget):
 
 
 class _CalendarDayCell(QFrame):
-    """캘린더 한 칸 (일자, 총액, 게이지, 퍼센트)."""
+    """캘린더 한 칸 (일자, 총액, 게이지, 퍼센트). 클릭 시 day_clicked(day) emit."""
+
+    day_clicked = Signal(int)
 
     def __init__(
         self,
@@ -636,6 +640,8 @@ class _CalendarDayCell(QFrame):
         is_placeholder: bool = False,
     ) -> None:
         super().__init__()
+        self._day = day
+        self._is_placeholder = is_placeholder
         self.setObjectName("calCell")
         if is_placeholder:
             self.setStyleSheet(
@@ -644,7 +650,9 @@ class _CalendarDayCell(QFrame):
         else:
             self.setStyleSheet(
                 "#calCell { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; }"
+                "#calCell:hover { background: #f8fafc; border-color: #94a3b8; }"
             )
+            self.setCursor(Qt.PointingHandCursor)
         self.setMinimumHeight(110)
         v = QVBoxLayout(self)
         v.setContentsMargins(10, 8, 10, 8)
@@ -680,6 +688,13 @@ class _CalendarDayCell(QFrame):
         pct.setStyleSheet("color: #94a3b8; font-size: 10px;")
         v.addWidget(pct)
 
+    def mousePressEvent(self, event):  # type: ignore[override]
+        if not self._is_placeholder and event.button() == Qt.LeftButton and self._day > 0:
+            self.day_clicked.emit(int(self._day))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
 
 # ---------------------------------------------------------------------------
 # 메인 탭
@@ -702,7 +717,10 @@ class CardUsageTab(QWidget):
         self._sort_asc: bool = False   # 기본: 내림차순
         self._review_mode: bool = False
         self._reviewed_keys: set[str] = set()  # 메모리상 검토 완료 마킹
+        self._excluded_keys: set[str] = self._load_excluded_keys()  # 사용자 수동 제외 (집계 제외)
         self._coupang_match_index: Dict[str, PurchaseGroup] = {}  # use_key/id → matched group
+        # 캘린더 셀 클릭 → 테이블에서 해당 일자 단일 필터
+        self._jump_to_date: Optional[date] = None
         # Pi 데이터 API: 카드내역과 구매내역 모두 라즈베리에 저장
         self.pi = PiDataClient(getattr(config, "monitor_url", None))
 
@@ -906,10 +924,12 @@ class CardUsageTab(QWidget):
         self.table.setShowGrid(False)
         self.table.setStyleSheet(
             "QTableWidget { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px;"
-            " gridline-color: #e2e8f0; outline: 0; }"
+            " gridline-color: #eef2f7; outline: 0; }"
             "QHeaderView::section { background: #f8fafc; border: none;"
+            " border-right: 1px solid #eef2f7;"
             " border-bottom: 1px solid #e2e8f0; padding: 8px; font-weight: 600; color: #475569; }"
-            "QTableWidget::item { padding: 6px 8px; border: none; }"
+            "QTableWidget::item { padding: 6px 8px; border: none;"
+            " border-right: 1px solid #f1f5f9; }"
             "QTableWidget::item:selected { background: #f1f5f9; color: #0f172a; }"
             "QTableWidget::item:focus { background: #f1f5f9; color: #0f172a; }"
         )
@@ -930,6 +950,9 @@ class CardUsageTab(QWidget):
         self.table.cellDoubleClicked.connect(self._on_table_double_clicked)
         self.table.cellClicked.connect(self._on_table_cell_clicked)
         self.table.cellChanged.connect(self._on_table_cell_changed)
+        # 우클릭 컨텍스트 메뉴 (제외하기 등)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_context_menu)
         # 금액 컬럼 호버 커서 변경
         self.table.viewport().setMouseTracking(True)
         self.table.viewport().installEventFilter(self)
@@ -1042,10 +1065,11 @@ class CardUsageTab(QWidget):
         orders = [o for o in orders if o.payment_total is not None and o.payment_total > 0]
 
         groups: List[PurchaseGroup] = []
+        # 주문별 후보 금액 매핑 — 매칭 시 card_amount 와 payment_total 둘 다 시도해서
+        # 어느 한쪽이든 카드내역과 일치하면 매칭. 과거 cash_used 오집계로 card_amount
+        # 가 잘못 저장된 주문도 payment_total 로 매칭됨.
+        amounts_by_group_key: Dict[str, set[int]] = {}
         if orders:
-            # PurchaseOrder → PurchaseGroup 어댑터 (UI 코드 호환)
-            # 카드 매칭에는 card_amount(=payment_total - cash_used) 우선 사용.
-            # 캐시 미사용 주문은 card_amount 가 None 일 수 있어 payment_total fallback.
             for o in orders:
                 cash_used = int(o.cash_used or 0)
                 card_amt = o.card_amount if o.card_amount is not None else o.payment_total
@@ -1060,6 +1084,12 @@ class CardUsageTab(QWidget):
                     + title_extra
                     + (f" [{o.status}]" if o.status else "")
                 )
+                gk = f"coupang|order|{o.order_no}"
+                # 후보 금액 — 표시는 card_amt 로, 매칭은 둘 다 시도
+                cand: set[int] = {int(card_amt)}
+                if o.payment_total and int(o.payment_total) > 0:
+                    cand.add(int(o.payment_total))
+                amounts_by_group_key[gk] = cand
                 groups.append(PurchaseGroup(
                     channel=o.channel,
                     order_date=o.order_date,
@@ -1067,9 +1097,9 @@ class CardUsageTab(QWidget):
                     total_amount=int(card_amt),
                     item_count=o.item_count,
                     items=[],
-                    group_key=f"coupang|order|{o.order_no}",
+                    group_key=gk,
                 ))
-            source_msg = f"주문 {len(orders)}개 (카드청구액 기준, 캐시사용액 차감)"
+            source_msg = f"주문 {len(orders)}개 (카드청구액/총결제 둘 다 시도)"
         else:
             # ── 2순위 fallback: 품목 합산 ──
             recs: List = []
@@ -1122,14 +1152,20 @@ class CardUsageTab(QWidget):
             if udt is None:
                 continue
             ud = udt.date()
-            # ±3일 내 같은 금액 그룹 찾기
+            # ±3일 내 같은 금액 그룹 찾기.
+            # purchase_orders 경로: card_amount 와 payment_total 둘 다 시도 (cash_used
+            # 오집계 대비). 품목 fallback 경로: total_amount 만 비교.
             window: List[PurchaseGroup] = []
             for delta in range(-3, 4):
                 d = ud + timedelta(days=delta)
                 for g in by_date.get(d, []):
                     if g.group_key in used_groups:
                         continue
-                    if g.total_amount == amt:
+                    cand = amounts_by_group_key.get(g.group_key)
+                    if cand is not None:
+                        if amt in cand:
+                            window.append(g)
+                    elif g.total_amount == amt:
                         window.append(g)
             if not window:
                 continue
@@ -1209,7 +1245,34 @@ class CardUsageTab(QWidget):
         self._refresh_view_mode_styles()
         idx = {"table": 0, "calendar": 1}[code]
         self.body_stack.setCurrentIndex(idx)
+        # 캘린더 모드로 돌아가면 점프 필터 해제 (전체 재표시)
+        if code == "calendar":
+            self._jump_to_date = None
         self._render_list()
+
+    def _on_calendar_day_clicked(self, year: int, month: int, day: int) -> None:
+        """캘린더 셀 클릭 → 테이블 뷰로 전환 + 해당 일자만 표시."""
+        try:
+            target = date(year, month, day)
+        except Exception:  # noqa: BLE001
+            return
+        self._jump_to_date = target
+        # 테이블 뷰로 전환
+        self._view_mode = "table"
+        for c, btn in self._view_btns.items():
+            btn.setChecked(c == "table")
+        self._refresh_view_mode_styles()
+        self.body_stack.setCurrentIndex(0)
+        self._render_list()
+        # 상태 배너로 알림 + 해제 안내
+        self.status_banner.setText(
+            f"📅 {target.isoformat()} 일자 카드내역만 표시 중 — 다시 캘린더를 누르거나 검색을 비우면 해제"
+        )
+        self.status_banner.setStyleSheet(
+            "background: #e0f2fe; color: #075985; border: 1px solid #7dd3fc;"
+            " border-radius: 6px; padding: 6px 10px; font-size: 12px;"
+        )
+        self.status_banner.setVisible(True)
 
     def _refresh_view_mode_styles(self) -> None:
         for code, btn in self._view_btns.items():
@@ -1253,6 +1316,52 @@ class CardUsageTab(QWidget):
         if usage.reviewed:
             return True
         return False
+
+    # ----- 사용자 수동 제외 (집계 제외) -----
+
+    @staticmethod
+    def _excluded_keys_path() -> Path:
+        from pathlib import Path as _P
+        d = _P.home() / ".smartinventory"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / "card_usage_excluded.json"
+
+    def _load_excluded_keys(self) -> set[str]:
+        try:
+            import json as _j
+            p = self._excluded_keys_path()
+            if not p.exists():
+                return set()
+            data = _j.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return {str(x) for x in data if x}
+        except Exception:  # noqa: BLE001
+            pass
+        return set()
+
+    def _save_excluded_keys(self) -> None:
+        try:
+            import json as _j
+            self._excluded_keys_path().write_text(
+                _j.dumps(sorted(self._excluded_keys), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _is_excluded(self, usage: CardUsage) -> bool:
+        key = usage.use_key or usage.id or ""
+        return bool(key) and key in self._excluded_keys
+
+    def _set_excluded(self, usage: CardUsage, excluded: bool) -> None:
+        key = usage.use_key or usage.id or ""
+        if not key:
+            return
+        if excluded:
+            self._excluded_keys.add(key)
+        else:
+            self._excluded_keys.discard(key)
+        self._save_excluded_keys()
 
     # ----- 데이터 가져오기 -----
 
@@ -1452,7 +1561,8 @@ class CardUsageTab(QWidget):
         self.card_combo.blockSignals(False)
 
     def _refresh_summary_cards(self) -> None:
-        items = self._all_items
+        # 사용자 수동 제외건은 집계에서 빼기
+        items = [it for it in self._all_items if not self._is_excluded(it)]
         # 이번 달
         today = date.today()
         first = today.replace(day=1)
@@ -1486,6 +1596,8 @@ class CardUsageTab(QWidget):
     def _refresh_chip_amounts(self) -> None:
         sums: Dict[str, int] = {}
         for it in self._all_items:
+            if self._is_excluded(it):
+                continue
             cat = self._categories_index.get(it.use_key or it.id or "", "OTHER")
             sums[cat] = sums.get(cat, 0) + max(0, int(it.amount or 0))
         for code, chip in self.category_chips.items():
@@ -1495,6 +1607,16 @@ class CardUsageTab(QWidget):
 
     def _filtered_sorted_items(self) -> List[CardUsage]:
         items = list(self._all_items)
+
+        # 캘린더에서 일자 클릭으로 점프한 경우: 해당 일자만 표시
+        if self._jump_to_date is not None:
+            target = self._jump_to_date
+            day_items: List[CardUsage] = []
+            for it in items:
+                d = _parse_used_at(it.used_at)
+                if d is not None and d.date() == target:
+                    day_items.append(it)
+            items = day_items
 
         # 카테고리 필터
         if self._selected_category:
@@ -1621,19 +1743,18 @@ class CardUsageTab(QWidget):
                 # 카드
                 card_item = QTableWidgetItem(_mask_card_number(usage.card_num))
                 card_item.setForeground(QBrush(QColor("#64748b")))
-                # 쿠팡매칭 (읽기 전용 — 더블클릭으로 상세보기)
+                # 쿠팡매칭 (읽기 전용 — 아이콘만 표시. 더블클릭으로 상세보기)
                 if matched:
                     key = usage.use_key or usage.id or ""
                     chosen_group = self._coupang_match_index.get(key)
-                    if chosen_group is not None:
-                        coupang_text = f"🔗 {chosen_group.title}"
-                    else:
-                        coupang_text = "🔗 매칭됨"
-                    coupang_tooltip = "매칭된 쿠팡 구매내역 — 더블클릭으로 상세보기"
+                    coupang_text = "🔗"
+                    title_for_tip = chosen_group.title if chosen_group is not None else "매칭됨"
+                    coupang_tooltip = f"{title_for_tip} — 더블클릭으로 상세보기"
                 else:
                     coupang_text = ""
                     coupang_tooltip = ""
                 coupang_item = QTableWidgetItem(coupang_text)
+                coupang_item.setTextAlignment(Qt.AlignCenter)
                 coupang_item.setForeground(QBrush(QColor("#0f172a" if matched else "#94a3b8")))
                 if coupang_tooltip:
                     coupang_item.setToolTip(coupang_tooltip)
@@ -1661,6 +1782,19 @@ class CardUsageTab(QWidget):
                         )
                     else:
                         store_item.setToolTip("결제+취소가 짝지어 0원 처리")
+
+                # 사용자 수동 제외 행: 취소선 + 회색 + tooltip
+                excluded = self._is_excluded(usage)
+                if excluded:
+                    strike_color = QBrush(QColor("#94a3b8"))
+                    for it in (date_item, cat_item, store_item, amt_item, card_item, coupang_item, memo_item):
+                        it.setForeground(strike_color)
+                        sf = QFont(it.font())
+                        sf.setStrikeOut(True)
+                        it.setFont(sf)
+                    store_item.setToolTip(
+                        (store_item.toolTip() or "") + "\n🚫 제외됨 (집계 안 함) · 우클릭으로 해제"
+                    )
 
                 # 검토 완료 시 녹색 배경
                 if reviewed:
@@ -1743,6 +1877,30 @@ class CardUsageTab(QWidget):
             return
         self._open_match_dialog(usage)
 
+    def _on_table_context_menu(self, pos) -> None:
+        """우클릭 → 제외 토글 메뉴."""
+        idx = self.table.indexAt(pos)
+        if not idx.isValid():
+            return
+        row = idx.row()
+        if row < 0 or row >= len(self._displayed_items):
+            return
+        usage = self._displayed_items[row]
+        is_excl = self._is_excluded(usage)
+        menu = QMenu(self.table)
+        action_text = "✓ 제외 해제" if is_excl else "🚫 제외하기 (집계 제외)"
+        act = menu.addAction(action_text)
+        act.triggered.connect(lambda _checked=False, u=usage: self._toggle_excluded(u))
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _toggle_excluded(self, usage: CardUsage) -> None:
+        new_state = not self._is_excluded(usage)
+        self._set_excluded(usage, new_state)
+        # 집계/표시 모두 갱신
+        self._render_list()
+        self._refresh_summary_cards()
+        self._refresh_chip_amounts()
+
     def _on_table_double_clicked(self, row: int, col: int) -> None:
         if row < 0 or row >= len(self._displayed_items):
             return
@@ -1753,8 +1911,14 @@ class CardUsageTab(QWidget):
             self._toggle_reviewed(usage)
             return
 
-        # 메모 / 검토 컬럼은 별도 처리 (편집 / 버튼)
-        if col in (self.COL_MEMO, self.COL_REVIEW):
+        # 메모 컬럼: 더블클릭으로 즉시 편집 시작
+        if col == self.COL_MEMO:
+            item = self.table.item(row, self.COL_MEMO)
+            if item is not None:
+                self.table.editItem(item)
+            return
+        # 검토 컬럼: 위젯 자체 처리 (체크박스)
+        if col == self.COL_REVIEW:
             return
 
         # 그 외 → 매칭 상세 다이얼로그
@@ -2135,6 +2299,9 @@ class CardUsageTab(QWidget):
                 segs.append((self._cat_color(code), sub))
             pct = (amt / max_total) if max_total > 0 else 0.0
             cell = _CalendarDayCell(day, amt, segs, pct, is_placeholder=False)
+            cell.day_clicked.connect(
+                lambda d, y=year, m=month: self._on_calendar_day_clicked(y, m, d)
+            )
             grid.addWidget(cell, row, col)
             col += 1
             if col >= 7:
