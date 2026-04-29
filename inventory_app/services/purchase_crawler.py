@@ -1358,9 +1358,15 @@ def _crawl_coupang_order_details(
     1순위: 디테일 페이지의 __NEXT_DATA__ 를 deep-walk 해서 추출 (가장 정확)
     2순위: 본문 텍스트 정규식
     """
+    import random as _random
     out: List[PurchaseOrder] = []
     now = datetime.now()
     seen: set[str] = set()
+    blocked_signals = (
+        "Access Denied", "edgesuite", "Reference",
+        "Akamai", "캡차", "captcha", "Captcha",
+        "비정상적인 접근", "잠시 후 다시", "Forbidden",
+    )
 
     def _attach_dialog_handler(p) -> None:
         # 쿠팡이 띄우는 alert/confirm 다이얼로그 자동 처리 — "주문정보가 존재하지 않습니다" 등
@@ -1371,7 +1377,8 @@ def _crawl_coupang_order_details(
 
     _attach_dialog_handler(page)
     total = min(len(detail_urls), max_details)
-    progress.on_log(f"  디테일 루프 진입: 총 {total}건 처리 예정")
+    progress.on_log(f"  디테일 루프 진입: 총 {total}건 처리 예정 (anti-bot 완화: 건당 1.2~3.0s sleep)")
+    consecutive_failures = 0  # 연속 실패 카운터 — 임계값 넘으면 anti-bot 으로 간주하고 중단
     for idx, url in enumerate(detail_urls[:max_details]):
         if progress.cancelled():
             progress.on_log(f"  사용자 취소 감지 → 디테일 루프 중단 ({idx}/{total})")
@@ -1442,8 +1449,18 @@ def _crawl_coupang_order_details(
                 body = ""
             # 에러 페이지("주문정보가 존재하지 않습니다") 즉시 감지하고 스킵
             if "주문정보가 존재하지" in body or "주문 정보가 존재하지" in body:
-                progress.on_log(f"  detail {idx + 1}/{max_details}: 주문정보 없음 페이지 → 스킵")
+                progress.on_log(f"  detail {idx + 1}/{total}: 주문정보 없음 페이지 → 스킵")
                 continue
+            # Anti-bot/차단 페이지 감지 — 만나면 즉시 중단 (계속 시도하면 IP 블락 위험)
+            for sig in blocked_signals:
+                if sig in body:
+                    progress.on_log(
+                        f"  detail {idx + 1}/{total}: ⚠ 차단 페이지 감지(키워드 '{sig}') → 디테일 루프 중단"
+                    )
+                    progress.on_log(
+                        "  → 사용자 측 조치 필요: Chrome 으로 mc.coupang.com 접속해서 captcha/재로그인 수행 후 재시도."
+                    )
+                    return out
             # 디버그 덤프: 모든 방문 주문을 저장 (overwrite OK) — 진단/공유용
             try:
                 # URL 의 orderId 추출 — path 형태(/order/12345) 또는 query 형태(?orderId=12345) 모두 지원
@@ -1508,12 +1525,23 @@ def _crawl_coupang_order_details(
             out.append(order)
             pt = order.payment_total
             progress.on_log(
-                f"  detail {idx + 1}/{min(len(detail_urls), max_details)}: "
+                f"  detail {idx + 1}/{total}: "
                 f"주문 {order_no} · {pt:,}원" if pt is not None
-                else f"  detail {idx + 1}/{min(len(detail_urls), max_details)}: 주문 {order_no} · 결제금 미상"
+                else f"  detail {idx + 1}/{total}: 주문 {order_no} · 결제금 미상"
             )
+            consecutive_failures = 0  # 성공 → 카운터 리셋
         except Exception as exc:  # noqa: BLE001
-            progress.on_log(f"  detail {idx + 1} 실패: {exc}")
+            progress.on_log(f"  detail {idx + 1}/{total} 실패: {exc}")
+            consecutive_failures += 1
+            if consecutive_failures >= 3:
+                progress.on_log(
+                    f"  연속 {consecutive_failures}회 실패 → Chrome/네트워크 문제 가능성. 디테일 루프 중단."
+                )
+                return out
+        # Anti-bot 완화 — 사람처럼 1.2~3.0초 무작위 대기
+        if idx + 1 < total and not progress.cancelled():
+            delay = 1.2 + _random.random() * 1.8
+            time.sleep(delay)
     return out
 
 
