@@ -698,8 +698,31 @@ class _CoupangMatchDetailDialog(QDialog):
                 lines.append(
                     f"<span style='color:#64748b; font-size:11px;'>{' · '.join(sub_parts)}</span>"
                 )
-            tot_line = f"카드청구액 합계: <b style='color:#0f172a;'>{group.total_amount:,}원</b>"
-            if order is not None:
+            # 카드청구액 합계 — 품목 중 취소완료/주문취소 표제는 음수로 처리해 제외.
+            # 기존 group.total_amount 는 atomic 으로 합쳐진 단일 값이라 이미 정확하지만,
+            # 품목 단에서 취소건이 섞여 있으면 sum 이 실제 카드 청구과 어긋날 수 있어 재계산.
+            cancel_tokens = ("[취소완료]", "[주문취소]", "[결제취소]", "[구매취소]", "[반품완료]")
+            def _item_signed(rec) -> int:
+                t = (getattr(rec, "title", "") or "").strip()
+                a = int(getattr(rec, "amount", 0) or 0)
+                if any(tok in t for tok in cancel_tokens):
+                    return -abs(a)
+                return a
+            items_signed_total = sum(_item_signed(it) for it in items) if items else None
+            display_total = (
+                items_signed_total if items_signed_total is not None
+                else int(group.total_amount or 0)
+            )
+            color_total = "#ef4444" if display_total < 0 else "#0f172a"
+            tot_line = (
+                f"카드청구액 합계: <b style='color:{color_total};'>{display_total:,}원</b>"
+            )
+            if items_signed_total is not None and items_signed_total != int(group.total_amount or 0):
+                tot_line += (
+                    f" <span style='color:#94a3b8; font-size:11px;'>"
+                    f"(원장 {int(group.total_amount or 0):,}원, 취소품목 제외 후 {display_total:,}원)</span>"
+                )
+            elif order is not None:
                 if order.payment_total is not None and order.payment_total != group.total_amount:
                     tot_line += (
                         f" <span style='color:#64748b; font-size:11px;'>"
@@ -710,8 +733,12 @@ class _CoupangMatchDetailDialog(QDialog):
                     tot_line += ")</span>"
             lines.append(f"<div style='margin-top:4px;'>{tot_line}</div>")
 
-            # 카드 금액과 일치 여부
-            diff = amt - int(group.total_amount or 0)
+            # 카드 금액과 일치 여부 — 취소완료 품목 제외한 signed total 기준으로 비교
+            ref_total = (
+                items_signed_total if items_signed_total is not None
+                else int(group.total_amount or 0)
+            )
+            diff = amt - int(ref_total)
             if diff == 0:
                 badge = (
                     "<div style='margin-top:6px;'>"
@@ -761,12 +788,20 @@ class _CoupangMatchDetailDialog(QDialog):
         h.setSectionResizeMode(2, QHeaderView.Stretch)
         h.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         items_table.setRowCount(len(items))
+        # 표시 단계에서도 취소품목은 음수로 강제 (원장 amount 가 양수라도)
+        cancel_tokens_disp = ("[취소완료]", "[주문취소]", "[결제취소]", "[구매취소]", "[반품완료]")
         for r, rec in enumerate(items):
-            ramt = int(getattr(rec, "amount", 0) or 0)
+            raw_amt = int(getattr(rec, "amount", 0) or 0)
+            title_text = (getattr(rec, "title", "") or "").strip()
+            is_cancel_item = any(tok in title_text for tok in cancel_tokens_disp)
+            if is_cancel_item:
+                ramt = -abs(raw_amt)
+            else:
+                ramt = raw_amt
             cancelled = ramt < 0
             d_item = QTableWidgetItem(getattr(rec, "order_date", "") or "")
             o_item = QTableWidgetItem(getattr(rec, "order_no", "") or "")
-            t_item = QTableWidgetItem((getattr(rec, "title", "") or "").strip())
+            t_item = QTableWidgetItem(title_text)
             t_item.setToolTip(getattr(rec, "title", "") or "")
             a_item = QTableWidgetItem(_fmt_money(ramt))
             a_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -774,6 +809,8 @@ class _CoupangMatchDetailDialog(QDialog):
             if cancelled:
                 a_item.setForeground(QBrush(QColor("#ef4444")))
                 t_item.setForeground(QBrush(QColor("#ef4444")))
+                if is_cancel_item:
+                    a_item.setToolTip("취소완료 품목 — 카드청구액 합계 계산에서 제외(상쇄)")
             items_table.setItem(r, 0, d_item)
             items_table.setItem(r, 1, o_item)
             items_table.setItem(r, 2, t_item)
@@ -1147,6 +1184,14 @@ class CardUsageTab(QWidget):
         )
         self.refresh_btn.clicked.connect(self._on_refresh)
         self.store_filter.returnPressed.connect(self._on_search_changed)
+
+        # 기간 변경 → 자동 조회 (연/월 콤보 둘 다 바뀔 수 있어 250ms debounce)
+        self._range_debounce = QTimer(self)
+        self._range_debounce.setSingleShot(True)
+        self._range_debounce.setInterval(250)
+        self._range_debounce.timeout.connect(self._on_refresh)
+        self.start_edit.dateChanged.connect(lambda _d: self._range_debounce.start())
+        self.end_edit.dateChanged.connect(lambda _d: self._range_debounce.start())
 
         filter_row.addWidget(QLabel("기간"))
         filter_row.addWidget(self.start_edit)
@@ -1918,6 +1963,10 @@ class CardUsageTab(QWidget):
             )
             for it in items
         }
+        # Pi 가 가진 reviewed 플래그를 in-memory keyset 에도 동기화
+        self._reviewed_keys = {
+            (it.use_key or it.id or "") for it in items if bool(getattr(it, "reviewed", False))
+        }
 
         self._all_items = items
         self._last_synced_at = datetime.now()
@@ -1994,13 +2043,6 @@ class CardUsageTab(QWidget):
 
         self._refresh_card_combo(target_cards)
 
-        self._categories_index = {
-            (it.use_key or it.id or ""): classify_category(
-                it.store_name, (it.raw or {}).get("UseStoreBizType")
-            )
-            for it in logs
-        }
-
         # Pi 업로드 (best-effort): 사용자 편집(메모/카테고리/검토)은 Pi 측 COALESCE 로 보존
         pi_changed = -2  # -2: 미시도, -1: 실패, >=0: 변경 row 수
         if self.pi.is_configured and logs:
@@ -2029,6 +2071,23 @@ class CardUsageTab(QWidget):
                         logs = merged
                 except Exception:  # noqa: BLE001
                     pass
+
+        # categories_index 는 Pi 머지 이후에 재빌드 — Pi 가 가진 사용자 저장 카테고리(it.category)
+        # 가 우선, 없으면 가맹점/업종 기반 자동 분류 fallback. 머지 이전에 빌드하면 사용자
+        # 카테고리가 사라지는 버그 발생.
+        self._categories_index = {
+            (it.use_key or it.id or ""): (
+                it.category
+                or classify_category(
+                    it.store_name, (it.raw or {}).get("UseStoreBizType") if it.raw else None
+                )
+            )
+            for it in logs
+        }
+        # reviewed_keys 도 Pi 데이터로 동기화
+        self._reviewed_keys = {
+            (it.use_key or it.id or "") for it in logs if bool(getattr(it, "reviewed", False))
+        }
 
         self._all_items = logs
         self._last_synced_at = datetime.now()
@@ -2294,14 +2353,14 @@ class CardUsageTab(QWidget):
                 for it in (date_item, cat_item, store_item, amt_item, card_item, coupang_item):
                     it.setFlags(it.flags() & ~Qt.ItemIsEditable)
 
-                # 결제+취소 짝이 맞아 0원 처리된 행: 취소선 + 회색 (볼드 해제)
+                # 결제+취소 짝이 맞아 0원 처리된 행: 취소선 + 빨강 (볼드 해제)
                 if offset_canceled:
-                    strike_color = QBrush(QColor("#94a3b8"))
+                    excl_color = QBrush(QColor("#ef4444"))
                     for it in (date_item, cat_item, store_item, amt_item, card_item, coupang_item, memo_item):
-                        it.setForeground(strike_color)
+                        it.setForeground(excl_color)
                         sf = QFont(it.font())
                         sf.setStrikeOut(True)
-                        sf.setBold(False)  # 빨간볼드 해제 — 회색 일반 가중치
+                        sf.setBold(False)
                         it.setFont(sf)
                     if matched:
                         store_item.setToolTip(
@@ -2310,12 +2369,12 @@ class CardUsageTab(QWidget):
                     else:
                         store_item.setToolTip("결제+취소가 짝지어 0원 처리")
 
-                # 사용자 수동 제외 행: 취소선 + 회색 (볼드 해제) + tooltip
+                # 사용자 수동 제외 행: 취소선 + 빨강 (볼드 해제) + tooltip
                 excluded = self._is_excluded(usage)
                 if excluded:
-                    strike_color = QBrush(QColor("#94a3b8"))
+                    excl_color = QBrush(QColor("#ef4444"))
                     for it in (date_item, cat_item, store_item, amt_item, card_item, coupang_item, memo_item):
-                        it.setForeground(strike_color)
+                        it.setForeground(excl_color)
                         sf = QFont(it.font())
                         sf.setStrikeOut(True)
                         sf.setBold(False)
@@ -2530,28 +2589,54 @@ class CardUsageTab(QWidget):
         reviewed: Optional[bool] = None,
         category: Optional[str] = None,
     ) -> None:
-        """단건 변경을 Pi 에 즉시 저장 (best-effort)."""
+        """단건 변경을 Pi 에 즉시 저장 (best-effort).
+
+        실패는 status_banner 에 노출 — 조용한 실패가 사용자 혼란 야기하던 문제 해소.
+        """
         if not self.pi.is_configured:
+            try:
+                self.status_banner.setText(
+                    "⚠ Pi 미설정 — 카테고리/검토/메모 변경이 라즈베리에 저장되지 않습니다 "
+                    "(credentials.json 의 monitor.url 설정 필요)"
+                )
+                self.status_banner.setStyleSheet(
+                    "QLabel { background: #fef3c7; border: 1px solid #fcd34d; border-radius: 6px; "
+                    "padding: 6px 10px; color: #92400e; font-size: 11px; }"
+                )
+                self.status_banner.setVisible(True)
+            except Exception:  # noqa: BLE001
+                pass
             return
         use_key = usage.use_key or usage.id
         if not use_key:
             return
+        kwargs: Dict[str, Any] = {}
+        if memo is not None:
+            if memo == "":
+                kwargs["clear_memo"] = True
+            else:
+                kwargs["memo"] = memo
+        if reviewed is not None:
+            kwargs["reviewed"] = bool(reviewed)
+        if category is not None:
+            kwargs["category"] = category
+        if not kwargs:
+            return
         try:
-            kwargs: Dict[str, Any] = {}
-            if memo is not None:
-                if memo == "":
-                    kwargs["clear_memo"] = True
-                else:
-                    kwargs["memo"] = memo
-            if reviewed is not None:
-                kwargs["reviewed"] = bool(reviewed)
-            if category is not None:
-                kwargs["category"] = category
-            if not kwargs:
-                return
             self.pi.patch_card_usage(use_key, **kwargs)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            try:
+                fields = ", ".join(kwargs.keys())
+                self.status_banner.setText(
+                    f"⚠ 라즈베리 저장 실패 ({fields}): {type(exc).__name__}: {exc}"
+                )
+                self.status_banner.setStyleSheet(
+                    "QLabel { background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; "
+                    "padding: 6px 10px; color: #991b1b; font-size: 11px; }"
+                )
+                self.status_banner.setVisible(True)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _restore_memo_focus(self, row: int) -> None:
         if row < 0 or row >= self.table.rowCount():
