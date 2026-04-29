@@ -222,6 +222,23 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
+        elif path == "/ui-prefs":
+            key = qs.get("key", [None])[0]
+            try:
+                if not key:
+                    self._send_json({"error": "key required"}, 400)
+                else:
+                    raw = db.get_ui_pref(key)
+                    value = None
+                    if raw is not None:
+                        try:
+                            value = json.loads(raw)
+                        except Exception:
+                            value = raw
+                    self._send_json({"key": key, "value": value})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
         elif path == "/sms-messages":
             start_date = qs.get("start_date", [None])[0]
             end_date = qs.get("end_date", [None])[0]
@@ -352,6 +369,25 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": "label, email, password_obf 필수"}, 400)
                     return
                 db.upsert_coupang_credential(label, email, password_obf)
+                self._send_json({"ok": True})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/ui-prefs":
+            try:
+                body = self._read_json_body()
+                key = str(body.get("key") or "").strip()
+                if not key:
+                    self._send_json({"error": "key required"}, 400)
+                    return
+                value = body.get("value")
+                # 숫자/객체/리스트는 JSON 문자열로 직렬화해서 저장
+                if isinstance(value, (dict, list, int, float, bool)) or value is None:
+                    raw = json.dumps(value, ensure_ascii=False)
+                else:
+                    raw = str(value)
+                db.set_ui_pref(key, raw)
                 self._send_json({"ok": True})
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
@@ -516,9 +552,13 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 channel = (qs.get("channel", [None])[0] or "").strip().lower() or None
                 missing_order_no = (qs.get("missing_order_no", ["0"])[0] in ("1", "true", "True"))
+                order_no_like = (qs.get("order_no_like", [None])[0] or "").strip() or None
+                title_like = (qs.get("title_like", [None])[0] or "").strip() or None
                 deleted = db.delete_purchase_records(
                     channel=channel,
                     only_missing_order_no=missing_order_no,
+                    order_no_like=order_no_like,
+                    title_like=title_like,
                 )
                 self._send_json({"deleted": deleted})
             except Exception as e:

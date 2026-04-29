@@ -305,5 +305,24 @@ class PiDataClient:
     def delete_coupang_credential(self, label: str) -> None:
         self._request("DELETE", "/coupang-credentials", params={"label": label})
 
+    # ── UI 환경설정 (컬럼 너비 등) ─────────────────────────────
+
+    def get_ui_pref(self, key: str) -> Any:
+        if not self.is_configured or not key:
+            return None
+        try:
+            payload = self._request("GET", "/ui-prefs", params={"key": key})
+        except PiDataError:
+            return None
+        return payload.get("value")
+
+    def set_ui_pref(self, key: str, value: Any) -> None:
+        if not self.is_configured or not key:
+            return
+        try:
+            self._request("POST", "/ui-prefs", json_body={"key": key, "value": value})
+        except PiDataError:
+            pass
+
 
 __all__ = ["PiDataClient", "PiDataError"]

@@ -1899,6 +1899,14 @@ class CardUsageTab(QWidget):
                         self.table.setCurrentCell(row, self.COL_MEMO)
                         self.table.editItem(memo_item)
                         return True
+            if key == Qt.Key_Space:
+                # 편집 중이면 공백 입력은 그대로 통과
+                if self.table.state() == QAbstractItemView.EditingState:
+                    return False
+                row = self.table.currentRow()
+                if 0 <= row < len(self._displayed_items):
+                    self._toggle_reviewed(self._displayed_items[row])
+                    return True
         # 금액/쿠팡매칭 컬럼 호버 시 손가락 커서로 변경 (매칭된 행만)
         if obj is self.table.viewport() and event.type() == QEvent.MouseMove:
             idx = self.table.indexAt(event.pos())

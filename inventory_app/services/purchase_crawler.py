@@ -1939,6 +1939,30 @@ def _extract_coupang_orders_from_next_data(
         if payment_total and payment_total > 0:
             card_amount = max(0, payment_total - int(cash_used or 0))
 
+        # 반품/취소된 주문은 정상 주문상세에서 사라지므로 cancel-return-exchange 페이지로 보낸다.
+        # deliveryGroupList[*].deliveryCancelBundleList[*] 에 receiptId/receiptType 가 들어있음.
+        receipt_id: Optional[int] = None
+        receipt_type: Optional[str] = None
+        for _dg in o.get("deliveryGroupList", []) or []:
+            for _b in _dg.get("deliveryCancelBundleList", []) or []:
+                rid = _b.get("receiptId")
+                if rid:
+                    receipt_id = int(rid)
+                    receipt_type = str(_b.get("receiptType") or "RETURN")
+                    break
+            if receipt_id:
+                break
+
+        if receipt_id:
+            order_url = (
+                f"https://mc.coupang.com/ssr/desktop/cancel-return-exchange/detail"
+                f"?orderId={order_id}&receiptId={receipt_id}&receiptType={receipt_type}"
+            )
+        else:
+            # 정상 주문 — query-string 형태 (?orderId=). path 형태(/order/{order_id}) 는
+            # 일부 주문에서 "주문정보가 존재하지 않습니다" 로 거부됨.
+            order_url = f"https://mc.coupang.com/ssr/desktop/order/detail?orderId={order_id}"
+
         # 주문(결제) 단위 record
         title = str(o.get("title") or "")
         orders_out.append(PurchaseOrder(
@@ -1949,8 +1973,7 @@ def _extract_coupang_orders_from_next_data(
             item_count=item_count,
             status=status,
             payment_method=None,  # NEXT_DATA 에는 안 들어있음
-            # 실제 쿠팡 주문상세 URL 패턴: /ssr/desktop/order/{orderId} (path 형태)
-            source_url=f"https://mc.coupang.com/ssr/desktop/order/{order_id}",
+            source_url=order_url,
             raw_text=title[:500],
             imported_at=now,
             cash_used=int(cash_used) if cash_used else None,

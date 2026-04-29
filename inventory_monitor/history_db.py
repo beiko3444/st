@@ -259,6 +259,16 @@ class InventoryHistoryDB:
                 ON sms_messages(received_at)
                 """
             )
+            # UI 환경설정 (컬럼 너비 등) — 단순 key-value 저장소
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ui_prefs (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_sms_sender_received
@@ -1279,8 +1289,14 @@ class InventoryHistoryDB:
         channel: str | None = None,
         *,
         only_missing_order_no: bool = False,
+        order_no_like: str | None = None,
+        title_like: str | None = None,
     ) -> int:
-        """purchase_records 삭제. only_missing_order_no=True 면 order_no 가 NULL/빈문자열인 행만."""
+        """purchase_records 삭제. 필터:
+        - channel: 채널 한정 (생략 / 'all' 이면 전체)
+        - only_missing_order_no: order_no 가 NULL/빈문자열인 행만
+        - order_no_like / title_like: SQL LIKE 패턴 (예: 'ZZZ_%', '[TEST]%')
+        """
         clauses: list[str] = []
         params: list = []
         if channel and channel != "all":
@@ -1288,11 +1304,29 @@ class InventoryHistoryDB:
             params.append(channel)
         if only_missing_order_no:
             clauses.append("(order_no IS NULL OR order_no = '')")
+        if order_no_like:
+            clauses.append("order_no LIKE ?")
+            params.append(order_no_like)
+        if title_like:
+            clauses.append("title LIKE ?")
+            params.append(title_like)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         with self._guard, self._connection() as conn:
             cursor = conn.execute(
                 f"DELETE FROM purchase_records {where}", params
             )
+            # purchase_orders 도 동일 패턴으로 정리 (스키마에 동일 컬럼 존재)
+            if order_no_like:
+                conn.execute(
+                    "DELETE FROM purchase_orders WHERE order_no LIKE ?",
+                    (order_no_like,),
+                )
+            if title_like:
+                # purchase_orders 는 title 컬럼이 없어 raw_text 로 대체
+                conn.execute(
+                    "DELETE FROM purchase_orders WHERE raw_text LIKE ?",
+                    (title_like,),
+                )
             conn.commit()
             return int(cursor.rowcount or 0)
 
@@ -1495,6 +1529,28 @@ class InventoryHistoryDB:
     def delete_coupang_credential(self, label: str) -> None:
         with self._guard, self._connection() as conn:
             conn.execute("DELETE FROM coupang_credentials WHERE label = ?", (str(label),))
+            conn.commit()
+
+    # ── UI 환경설정 ──
+
+    def get_ui_pref(self, key: str) -> Optional[str]:
+        if not key:
+            return None
+        with self._guard, self._connection() as conn:
+            cur = conn.execute("SELECT value FROM ui_prefs WHERE key = ?", (str(key),))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def set_ui_pref(self, key: str, value: str) -> None:
+        if not key:
+            raise ValueError("key 필요")
+        with self._guard, self._connection() as conn:
+            conn.execute(
+                "INSERT INTO ui_prefs (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                "updated_at=excluded.updated_at",
+                (str(key), str(value), datetime.now().isoformat()),
+            )
             conn.commit()
 
     # ── SMS 수신 내역 ──

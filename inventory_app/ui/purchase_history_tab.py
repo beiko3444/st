@@ -644,6 +644,17 @@ class PurchaseHistoryTab(QWidget):
         # 상품명/내역 셀 더블클릭 → 상품 페이지로 이동
         self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
 
+        # 컬럼 너비 저장/복원 (Pi DB 의 ui_prefs)
+        self._col_save_timer = QTimer(self)
+        self._col_save_timer.setSingleShot(True)
+        self._col_save_timer.setInterval(500)
+        self._col_save_timer.timeout.connect(self._save_column_widths)
+        self._col_widths_restoring = False
+        self.table.horizontalHeader().sectionResized.connect(
+            lambda *_: (None if self._col_widths_restoring else self._col_save_timer.start())
+        )
+        QTimer.singleShot(0, self._restore_column_widths)
+
         layout.addLayout(top)
         layout.addLayout(search_row)
         layout.addLayout(auto_row)
@@ -657,6 +668,36 @@ class PurchaseHistoryTab(QWidget):
     def _selected_import_channel(self) -> str:
         channel = self._selected_channel()
         return channel if channel in {"naver", "coupang"} else "naver"
+
+    # ── 컬럼 너비 영속화 (Pi DB) ──────────────────────────────
+
+    _COL_PREF_KEY = "purchase_history.column_widths"
+
+    def _save_column_widths(self) -> None:
+        if self._pi_client is None or not getattr(self._pi_client, "is_configured", False):
+            return
+        widths = [self.table.columnWidth(c) for c in range(self.table.columnCount())]
+        try:
+            self._pi_client.set_ui_pref(self._COL_PREF_KEY, widths)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _restore_column_widths(self) -> None:
+        if self._pi_client is None or not getattr(self._pi_client, "is_configured", False):
+            return
+        try:
+            widths = self._pi_client.get_ui_pref(self._COL_PREF_KEY)
+        except Exception:  # noqa: BLE001
+            return
+        if not isinstance(widths, list):
+            return
+        self._col_widths_restoring = True
+        try:
+            for c, w in enumerate(widths):
+                if c < self.table.columnCount() and isinstance(w, int) and w > 0:
+                    self.table.setColumnWidth(c, w)
+        finally:
+            self._col_widths_restoring = False
 
     def _open_order_page(self, channel: str) -> None:
         # 쿠팡: 선택된 계정이 있으면 자동로그인 후 주문 페이지 진입까지 자동화
@@ -1038,7 +1079,10 @@ class PurchaseHistoryTab(QWidget):
                         font.setBold(True)
                         item.setFont(font)
                 else:
-                    item = QTableWidgetItem(str(value))
+                    # 일자 컬럼은 게이지 위젯이 덮을 때 텍스트가 비치지 않도록 비워두고,
+                    # UserRole 에 정렬용 원본 값만 보존한다.
+                    display = "" if (col_idx == 0 and gauge_widget is not None) else str(value)
+                    item = QTableWidgetItem(display)
                     item.setData(Qt.UserRole, str(value))
                     if cancelled:
                         item.setForeground(red_brush if col_idx == 3 else gray_brush)
