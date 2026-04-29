@@ -1281,12 +1281,15 @@ def _extract_coupang_cash_used(order: dict) -> int:
         "savedAmount", "savedCashAmount", "rewardAmount",
         "couponDiscountAmount", "couponAmount",
     )
+    # 100원 미만은 적립률/메타필드 false positive (예: 값=5 가 캐시로 오집계되던 사례).
+    # 실제 쿠페이캐시 차감은 항상 100원 이상.
+    _MIN = 100
     total = 0
     # bundleReceiptList 안에 들어있는 경우
     for br in order.get("bundleReceiptList", []) or []:
         for k in cash_keys:
             v = br.get(k)
-            if isinstance(v, (int, float)) and v > 0:
+            if isinstance(v, (int, float)) and v >= _MIN:
                 total += int(v)
     # paymentSummary / paymentInfo / paymentDetailList 등 상위 필드
     for top_key in ("paymentSummary", "paymentInfo", "payment", "paymentDetail"):
@@ -1294,7 +1297,7 @@ def _extract_coupang_cash_used(order: dict) -> int:
         if isinstance(sub, dict):
             for k in cash_keys:
                 v = sub.get(k)
-                if isinstance(v, (int, float)) and v > 0:
+                if isinstance(v, (int, float)) and v >= _MIN:
                     total += int(v)
     # paymentDetailList: [{"type":"COUPAY_CASH","amount":1000}, ...]
     for top_key in ("paymentDetailList", "paymentList", "paymentMethodList"):
@@ -1306,7 +1309,7 @@ def _extract_coupang_cash_used(order: dict) -> int:
                 t = str(entry.get("type") or entry.get("paymentType") or entry.get("methodType") or "").upper()
                 if any(tag in t for tag in ("CASH", "COUPAY_CASH", "COUPON", "REWARD", "POINT", "MILEAGE")):
                     amt = entry.get("amount") or entry.get("usedAmount") or 0
-                    if isinstance(amt, (int, float)) and amt > 0:
+                    if isinstance(amt, (int, float)) and amt >= _MIN:
                         total += int(amt)
     return total
 
@@ -1408,7 +1411,8 @@ def _parse_coupang_order_detail(text: str) -> dict:
                 amt = int(cm.group(1).replace(",", ""))
             except ValueError:
                 continue
-            if amt > 100_000_000 or amt <= 0:
+            # 100원 미만은 false positive (적립률/메타필드) — 실제 차감은 항상 100원 이상
+            if amt > 100_000_000 or amt < 100:
                 continue
             # 같은 키워드의 여러 매칭 중 최대값 사용 (중복 표시 방지)
             key = re.sub(r"\s+", "", kw_pat)
@@ -1976,7 +1980,8 @@ def _extract_coupang_orders_from_next_data(
             source_url=order_url,
             raw_text=title[:500],
             imported_at=now,
-            cash_used=int(cash_used) if cash_used else None,
+            # NEXT_DATA 는 권위 있음 → 0 도 명시적으로 기록 (DB 의 과거 false-positive 값 덮어쓰기 위함)
+            cash_used=int(cash_used or 0),
             card_amount=card_amount,
         ))
 
