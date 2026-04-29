@@ -669,26 +669,59 @@ class PurchaseHistoryTab(QWidget):
         channel = self._selected_channel()
         return channel if channel in {"naver", "coupang"} else "naver"
 
-    # ── 컬럼 너비 영속화 (Pi DB) ──────────────────────────────
+    # ── 컬럼 너비 영속화 ──────────────────────────────────────
+    # 우선순위: Pi DB (배포되어 있으면) → 로컬 파일 (~/.smartinventory/ui_prefs.json)
 
     _COL_PREF_KEY = "purchase_history.column_widths"
 
-    def _save_column_widths(self) -> None:
-        if self._pi_client is None or not getattr(self._pi_client, "is_configured", False):
-            return
-        widths = [self.table.columnWidth(c) for c in range(self.table.columnCount())]
+    @staticmethod
+    def _ui_prefs_path() -> Path:
+        return Path.home() / ".smartinventory" / "ui_prefs.json"
+
+    def _read_local_prefs(self) -> dict:
+        path = self._ui_prefs_path()
+        if not path.exists():
+            return {}
         try:
-            self._pi_client.set_ui_pref(self._COL_PREF_KEY, widths)
+            import json as _json
+            data = _json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _write_local_prefs(self, data: dict) -> None:
+        path = self._ui_prefs_path()
+        try:
+            import json as _json
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_json.dumps(data, ensure_ascii=False), encoding="utf-8")
         except Exception:  # noqa: BLE001
             pass
 
+    def _save_column_widths(self) -> None:
+        widths = [self.table.columnWidth(c) for c in range(self.table.columnCount())]
+        # 로컬 파일에 즉시 저장 (Pi 배포 여부와 무관하게 동작)
+        prefs = self._read_local_prefs()
+        prefs[self._COL_PREF_KEY] = widths
+        self._write_local_prefs(prefs)
+        # Pi 도 같이 업데이트 (배포되어 있을 때만 성공, 아니면 silent)
+        if self._pi_client is not None and getattr(self._pi_client, "is_configured", False):
+            try:
+                self._pi_client.set_ui_pref(self._COL_PREF_KEY, widths)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _restore_column_widths(self) -> None:
-        if self._pi_client is None or not getattr(self._pi_client, "is_configured", False):
-            return
-        try:
-            widths = self._pi_client.get_ui_pref(self._COL_PREF_KEY)
-        except Exception:  # noqa: BLE001
-            return
+        widths: Any = None
+        # Pi 우선 (배포되어 있으면 최신값)
+        if self._pi_client is not None and getattr(self._pi_client, "is_configured", False):
+            try:
+                widths = self._pi_client.get_ui_pref(self._COL_PREF_KEY)
+            except Exception:  # noqa: BLE001
+                widths = None
+        # Pi 가 없거나 값이 없으면 로컬
+        if not isinstance(widths, list):
+            widths = self._read_local_prefs().get(self._COL_PREF_KEY)
         if not isinstance(widths, list):
             return
         self._col_widths_restoring = True
