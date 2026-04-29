@@ -24,6 +24,7 @@ from PySide6.QtCharts import (
     QBarSet,
     QChart,
     QChartView,
+    QLineSeries,
     QStackedBarSeries,
     QValueAxis,
 )
@@ -801,8 +802,54 @@ class MasterDetailDialog(QDialog):
         y_axis.setRange(0, max(1, int(max_qty * 1.15)))
         y_axis.setLabelsFont(small_font)
         y_axis.setTickCount(5)
+        y_axis.setTitleText("일별 판매수량")
+        y_axis.setTitleFont(small_font)
         self.chart.addAxis(y_axis, Qt.AlignLeft)
         bar_series.attachAxis(y_axis)
+
+        # ── 재고 차감 직선 그래프 ──
+        # 오늘의 총재고 S 기준으로, 과거 30일을 거꾸로 누적해 일별 "남은 재고" 계산.
+        # day_30 (오늘) = S, day_29 = S + sales_30, day_28 = S + sales_30 + sales_29, ...
+        current_stock_val = master_row.total_stock
+        line_series = QLineSeries()
+        line_series.setName("남은 재고")
+        from PySide6.QtGui import QColor as _QColor
+        line_pen = QPen(_QColor("#1d4ed8"))
+        line_pen.setWidth(2)
+        line_series.setPen(line_pen)
+        line_series.setPointsVisible(True)
+        # 오늘부터 거꾸로 채워넣기
+        remaining_by_day: list[int] = [0] * len(all_days)
+        if current_stock_val is not None:
+            remaining = int(current_stock_val)
+            # 마지막 날(today) = current stock
+            remaining_by_day[-1] = remaining
+            for i in range(len(all_days) - 2, -1, -1):
+                # day i 의 남은재고 = day i+1 의 남은재고 + day i+1 일자 판매량
+                next_key = all_days[i + 1].isoformat()
+                sold_next = int(day_naver.get(next_key, 0)) + int(day_coupang.get(next_key, 0))
+                remaining = remaining + sold_next
+                remaining_by_day[i] = remaining
+            for i, val in enumerate(remaining_by_day):
+                line_series.append(float(i), float(val))
+            self.chart.addSeries(line_series)
+            line_series.attachAxis(x_axis)
+            stock_y_axis = QValueAxis()
+            stock_y_axis.setLabelFormat("%d")
+            stock_max = max(remaining_by_day) if remaining_by_day else 1
+            stock_y_axis.setRange(0, max(1, int(stock_max * 1.1)))
+            stock_y_axis.setLabelsFont(small_font)
+            stock_y_axis.setTickCount(5)
+            stock_y_axis.setTitleText("남은 재고")
+            stock_y_axis.setTitleFont(small_font)
+            stock_y_axis.setLabelsColor(_QColor("#1d4ed8"))
+            self.chart.addAxis(stock_y_axis, Qt.AlignRight)
+            line_series.attachAxis(stock_y_axis)
+        else:
+            # 재고 정보 없음 — 라인 시리즈 비활성
+            pass
+        # hover 데이터에 남은재고/요일/차감수량 포함시키기 위해 보관
+        self._stock_remaining_by_day = remaining_by_day
 
         # 차트 디자인 정리
         self.chart.setTitle("")
@@ -825,6 +872,9 @@ class MasterDetailDialog(QDialog):
                 "coupang_rev": int(day_coupang_rev.get(key, 0)),
             })
 
+        # 한국식 요일 매핑
+        _WEEKDAY_KO = ["월", "화", "수", "목", "금", "토", "일"]
+
         def _on_hover(status: bool, index: int, barset) -> None:
             if not status or index < 0 or index >= len(self._chart_day_data):
                 return  # 사라지지 않게 유지 — 다음 막대 hover 시 갱신
@@ -835,14 +885,37 @@ class MasterDetailDialog(QDialog):
             n_rev = row["naver_rev"]
             c_rev = row["coupang_rev"]
             total = n_rev + c_rev
+            depleted = n_qty + c_qty
+            weekday_ko = _WEEKDAY_KO[d.weekday()]
+            remaining_txt = ""
+            try:
+                rem = self._stock_remaining_by_day[index]
+                remaining_txt = (
+                    f" &nbsp;·&nbsp; <span style='color:#1d4ed8'>● 남은재고</span> "
+                    f"<b>{rem:,}</b>"
+                )
+            except Exception:  # noqa: BLE001
+                pass
             self.chart_hover_label.setText(
-                f"<b>{d.strftime('%Y-%m-%d (%a)')}</b> &nbsp; "
+                f"<b>{d.strftime('%Y-%m-%d')} ({weekday_ko})</b> &nbsp; "
                 f"<span style='color:#03C75A'>● 네이버</span> {n_qty}건 · ₩{n_rev:,} &nbsp; "
                 f"<span style='color:#F50028'>● 쿠팡</span> {c_qty}건 · ₩{c_rev:,} &nbsp; "
-                f"<b>합계 {n_qty + c_qty}건 · ₩{total:,}</b>"
+                f"<b>차감 {depleted}건 · 합계 ₩{total:,}</b>"
+                f"{remaining_txt}"
             )
 
         bar_series.hovered.connect(_on_hover)
+
+        # 라인 시리즈도 hover 대응 — 점 위에 마우스 갈 때 동일한 정보 표시
+        try:
+            def _on_line_hover(point, state: bool) -> None:
+                if not state:
+                    return
+                idx = int(round(point.x()))
+                _on_hover(True, idx, None)
+            line_series.hovered.connect(_on_line_hover)
+        except Exception:  # noqa: BLE001
+            pass
 
         # 만원 단위 변환
         if total_revenue >= 10000:

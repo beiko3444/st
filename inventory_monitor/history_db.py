@@ -238,6 +238,33 @@ class InventoryHistoryDB:
                 )
                 """
             )
+            # 안드로이드에서 포워딩한 SMS 수신 내역
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sms_messages (
+                    msg_key TEXT PRIMARY KEY,
+                    sender TEXT,
+                    body TEXT,
+                    received_at TEXT NOT NULL,
+                    received_at_ms INTEGER,
+                    device_id TEXT,
+                    raw_json TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_sms_received_at
+                ON sms_messages(received_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_sms_sender_received
+                ON sms_messages(sender, received_at)
+                """
+            )
             conn.commit()
 
     def _load_last_data(self, conn: sqlite3.Connection, channel: str) -> dict[tuple, dict]:
@@ -1469,6 +1496,124 @@ class InventoryHistoryDB:
         with self._guard, self._connection() as conn:
             conn.execute("DELETE FROM coupang_credentials WHERE label = ?", (str(label),))
             conn.commit()
+
+    # ── SMS 수신 내역 ──
+
+    def upsert_sms_messages(self, items: List[dict]) -> int:
+        """msg_key PRIMARY KEY 로 멱등 UPSERT. 신규/갱신 row 수 반환."""
+        rows: list[tuple] = []
+        now = datetime.now().isoformat()
+        for it in items:
+            sender = (it.get("sender") or "").strip()
+            received_at = (it.get("received_at") or "").strip()
+            received_at_ms = self._opt_int(it.get("received_at_ms"))
+            body = it.get("body") or ""
+            msg_key = (it.get("msg_key") or "").strip()
+            if not msg_key:
+                # sender + 수신시각(ms) 우선, 없으면 ISO 문자열 사용
+                ts_part = str(received_at_ms) if received_at_ms is not None else received_at
+                if not (sender or ts_part):
+                    continue
+                msg_key = f"sms|{sender}|{ts_part}"
+            if not received_at:
+                continue
+            raw = it.get("raw")
+            if isinstance(raw, dict):
+                import json as _json
+                raw_json = _json.dumps(raw, ensure_ascii=False)
+            elif isinstance(raw, str):
+                raw_json = raw
+            else:
+                raw_json = None
+            rows.append(
+                (
+                    msg_key,
+                    sender,
+                    body,
+                    received_at,
+                    received_at_ms,
+                    it.get("device_id"),
+                    raw_json,
+                    now,
+                )
+            )
+        if not rows:
+            return 0
+        with self._guard, self._connection() as conn:
+            before = conn.total_changes
+            conn.executemany(
+                """
+                INSERT INTO sms_messages
+                    (msg_key, sender, body, received_at, received_at_ms,
+                     device_id, raw_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(msg_key) DO UPDATE SET
+                    sender         = excluded.sender,
+                    body           = excluded.body,
+                    received_at    = excluded.received_at,
+                    received_at_ms = excluded.received_at_ms,
+                    device_id      = COALESCE(excluded.device_id, sms_messages.device_id),
+                    raw_json       = COALESCE(excluded.raw_json, sms_messages.raw_json)
+                """,
+                rows,
+            )
+            conn.commit()
+            return conn.total_changes - before
+
+    def list_sms_messages(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        sender: str | None = None,
+        contains: str | None = None,
+        limit: int = 1000,
+    ) -> List[dict]:
+        clauses: list[str] = []
+        params: list = []
+        if start_date:
+            clauses.append("received_at >= ?")
+            params.append(f"{start_date}T00:00:00")
+        if end_date:
+            clauses.append("received_at <= ?")
+            params.append(f"{end_date}T23:59:59")
+        if sender:
+            clauses.append("sender = ?")
+            params.append(sender)
+        if contains:
+            clauses.append("body LIKE ?")
+            params.append(f"%{contains}%")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(max(1, int(limit)))
+        with self._guard, self._connection() as conn:
+            cursor = conn.execute(
+                f"""
+                SELECT msg_key, sender, body, received_at, received_at_ms,
+                       device_id, raw_json, created_at
+                FROM sms_messages
+                {where}
+                ORDER BY received_at DESC, msg_key DESC
+                LIMIT ?
+                """,
+                params,
+            )
+            cols = [
+                "msg_key", "sender", "body", "received_at", "received_at_ms",
+                "device_id", "raw_json", "created_at",
+            ]
+            out: list[dict] = []
+            import json as _json
+            for row in cursor.fetchall():
+                d = dict(zip(cols, row))
+                if d.get("raw_json"):
+                    try:
+                        d["raw"] = _json.loads(d["raw_json"])
+                    except Exception:  # noqa: BLE001
+                        d["raw"] = None
+                else:
+                    d["raw"] = None
+                d.pop("raw_json", None)
+                out.append(d)
+            return out
 
     @staticmethod
     def _opt_int(value) -> int | None:

@@ -50,6 +50,7 @@ class SmsReceiver : BroadcastReceiver() {
                 .putString("sender", sender)
                 .putString("body", body)
                 .putString("received_at", iso)
+                .putLong("received_at_ms", tsMs)
                 .build()
 
             val constraints = Constraints.Builder()

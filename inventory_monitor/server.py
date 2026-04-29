@@ -222,6 +222,27 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
+        elif path == "/sms-messages":
+            start_date = qs.get("start_date", [None])[0]
+            end_date = qs.get("end_date", [None])[0]
+            sender = qs.get("sender", [None])[0]
+            contains = qs.get("contains", [None])[0]
+            try:
+                limit = max(1, min(50000, int(qs.get("limit", ["1000"])[0])))
+            except (TypeError, ValueError):
+                limit = 1000
+            try:
+                rows = db.list_sms_messages(
+                    start_date=start_date,
+                    end_date=end_date,
+                    sender=sender,
+                    contains=contains,
+                    limit=limit,
+                )
+                self._send_json({"items": rows})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -332,6 +353,22 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 db.upsert_coupang_credential(label, email, password_obf)
                 self._send_json({"ok": True})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/sms-messages":
+            try:
+                body = self._read_json_body()
+                items = body.get("items")
+                if items is None and ("sender" in body or "body" in body or "received_at" in body):
+                    # 단건 페이로드도 허용 (안드로이드 워커가 메시지 1건씩 전송)
+                    items = [body]
+                if not isinstance(items, list):
+                    self._send_json({"error": "items must be a list"}, 400)
+                    return
+                changed = db.upsert_sms_messages(items)
+                self._send_json({"changed": changed, "received": len(items)})
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
             return

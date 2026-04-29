@@ -892,9 +892,9 @@ class CardUsageTab(QWidget):
         self.body_stack = QStackedWidget()
 
         # --- 테이블 뷰 ---
-        # 컬럼 순서: 날짜, 카테고리, 가맹점, 금액, 카드, 검토, 메모
-        self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["날짜", "카테고리", "가맹점", "금액", "카드", "검토", "메모"])
+        # 컬럼 순서: 날짜, 카테고리, 가맹점, 금액, 카드, 검토, 쿠팡매칭, 메모
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(["날짜", "카테고리", "가맹점", "금액", "카드", "검토", "쿠팡매칭", "메모"])
         # 더블클릭은 매칭 상세 팝업/리뷰 토글에 사용 → 편집은 Enter/F2 로만 시작
         self.table.setEditTriggers(QAbstractItemView.EditKeyPressed)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -921,7 +921,8 @@ class CardUsageTab(QWidget):
         h.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # 카드
         h.setSectionResizeMode(5, QHeaderView.Fixed)              # 검토
         self.table.setColumnWidth(5, 56)
-        h.setSectionResizeMode(6, QHeaderView.Stretch)            # 메모
+        h.setSectionResizeMode(6, QHeaderView.ResizeToContents)  # 쿠팡매칭
+        h.setSectionResizeMode(7, QHeaderView.Stretch)            # 메모
         h.setSectionsClickable(True)
         h.setSortIndicatorShown(True)
         h.setSortIndicator(self._sort_col, Qt.AscendingOrder if self._sort_asc else Qt.DescendingOrder)
@@ -1144,9 +1145,6 @@ class CardUsageTab(QWidget):
             if key:
                 new_index[key] = chosen
             usage.coupang_purchase_id = chosen.group_key
-            # 메모가 비어있으면 자동 채움
-            if not (usage.memo or "").strip():
-                usage.memo = f"🔗 쿠팡: {chosen.title}"
             matched += 1
 
         self._coupang_match_index.update(new_index)
@@ -1527,6 +1525,8 @@ class CardUsageTab(QWidget):
             key_fn = lambda it: (it.card_num or "")
         elif col == self.COL_REVIEW:
             key_fn = lambda it: (1 if self._is_reviewed(it) else 0)
+        elif col == self.COL_COUPANG:
+            key_fn = lambda it: (1 if getattr(it, "coupang_purchase_id", None) else 0)
         elif col == self.COL_MEMO:
             key_fn = lambda it: (it.memo or "")
         else:
@@ -1546,14 +1546,15 @@ class CardUsageTab(QWidget):
         else:
             self._render_table(items)
 
-    # 컬럼 인덱스: 0=날짜, 1=카테고리, 2=가맹점, 3=금액, 4=카드, 5=검토, 6=메모
+    # 컬럼 인덱스: 0=날짜, 1=카테고리, 2=가맹점, 3=금액, 4=카드, 5=검토, 6=쿠팡매칭, 7=메모
     COL_DATE = 0
     COL_CATEGORY = 1
     COL_STORE = 2
     COL_AMOUNT = 3
     COL_CARD = 4
     COL_REVIEW = 5
-    COL_MEMO = 6
+    COL_COUPANG = 6
+    COL_MEMO = 7
 
     def _find_offsetting_pairs(self, items: List[CardUsage]) -> set:
         """양수 결제 + 같은 가맹점·같은 금액 음수 취소가 정확히 짝을 이루는 행 식별.
@@ -1620,6 +1621,22 @@ class CardUsageTab(QWidget):
                 # 카드
                 card_item = QTableWidgetItem(_mask_card_number(usage.card_num))
                 card_item.setForeground(QBrush(QColor("#64748b")))
+                # 쿠팡매칭 (읽기 전용 — 더블클릭으로 상세보기)
+                if matched:
+                    key = usage.use_key or usage.id or ""
+                    chosen_group = self._coupang_match_index.get(key)
+                    if chosen_group is not None:
+                        coupang_text = f"🔗 {chosen_group.title}"
+                    else:
+                        coupang_text = "🔗 매칭됨"
+                    coupang_tooltip = "매칭된 쿠팡 구매내역 — 더블클릭으로 상세보기"
+                else:
+                    coupang_text = ""
+                    coupang_tooltip = ""
+                coupang_item = QTableWidgetItem(coupang_text)
+                coupang_item.setForeground(QBrush(QColor("#0f172a" if matched else "#94a3b8")))
+                if coupang_tooltip:
+                    coupang_item.setToolTip(coupang_tooltip)
                 # 메모 (편집 가능)
                 memo_item = QTableWidgetItem(usage.memo or "")
                 memo_item.setForeground(QBrush(QColor("#475569")))
@@ -1627,13 +1644,13 @@ class CardUsageTab(QWidget):
                 memo_item.setToolTip("더블클릭으로 메모 입력 · Enter 로 저장")
 
                 # 비메모 셀은 편집 불가
-                for it in (date_item, cat_item, store_item, amt_item, card_item):
+                for it in (date_item, cat_item, store_item, amt_item, card_item, coupang_item):
                     it.setFlags(it.flags() & ~Qt.ItemIsEditable)
 
                 # 결제+취소 짝이 맞아 0원 처리된 행: 취소선 + 회색
                 if offset_canceled:
                     strike_color = QBrush(QColor("#94a3b8"))
-                    for it in (date_item, cat_item, store_item, amt_item, card_item, memo_item):
+                    for it in (date_item, cat_item, store_item, amt_item, card_item, coupang_item, memo_item):
                         it.setForeground(strike_color)
                         sf = QFont(it.font())
                         sf.setStrikeOut(True)
@@ -1648,7 +1665,7 @@ class CardUsageTab(QWidget):
                 # 검토 완료 시 녹색 배경
                 if reviewed:
                     bg = QBrush(QColor("#dcfce7"))
-                    for it in (date_item, cat_item, store_item, amt_item, card_item, memo_item):
+                    for it in (date_item, cat_item, store_item, amt_item, card_item, coupang_item, memo_item):
                         it.setBackground(bg)
 
                 # 검토 버튼 (placeholder item — 배경/편집불가)
@@ -1663,6 +1680,7 @@ class CardUsageTab(QWidget):
                 self.table.setItem(r, self.COL_AMOUNT, amt_item)
                 self.table.setItem(r, self.COL_CARD, card_item)
                 self.table.setItem(r, self.COL_REVIEW, review_placeholder)
+                self.table.setItem(r, self.COL_COUPANG, coupang_item)
                 self.table.setItem(r, self.COL_MEMO, memo_item)
 
                 # 검토 버튼 — 커스텀 페인팅 정사각형 체크박스
@@ -1697,11 +1715,11 @@ class CardUsageTab(QWidget):
                         self.table.setCurrentCell(row, self.COL_MEMO)
                         self.table.editItem(memo_item)
                         return True
-        # 금액 컬럼 호버 시 손가락 커서로 변경 (매칭된 행만)
+        # 금액/쿠팡매칭 컬럼 호버 시 손가락 커서로 변경 (매칭된 행만)
         if obj is self.table.viewport() and event.type() == QEvent.MouseMove:
             idx = self.table.indexAt(event.pos())
             change_to = None
-            if idx.isValid() and idx.column() == self.COL_AMOUNT:
+            if idx.isValid() and idx.column() in (self.COL_AMOUNT, self.COL_COUPANG):
                 row = idx.row()
                 if 0 <= row < len(self._displayed_items):
                     usage = self._displayed_items[row]
@@ -1715,8 +1733,8 @@ class CardUsageTab(QWidget):
         return super().eventFilter(obj, event)
 
     def _on_table_cell_clicked(self, row: int, col: int) -> None:
-        """금액 셀 단일 클릭으로 매칭 상세 다이얼로그 열기."""
-        if col != self.COL_AMOUNT:
+        """금액/쿠팡매칭 셀 단일 클릭으로 매칭 상세 다이얼로그 열기."""
+        if col not in (self.COL_AMOUNT, self.COL_COUPANG):
             return
         if row < 0 or row >= len(self._displayed_items):
             return
@@ -1730,8 +1748,8 @@ class CardUsageTab(QWidget):
             return
         usage = self._displayed_items[row]
 
-        # 리뷰 모드 ON 이면 메모/검토 컬럼 외 더블클릭으로 검토 토글
-        if self._review_mode and col not in (self.COL_MEMO, self.COL_REVIEW):
+        # 리뷰 모드 ON 이면 메모/검토/쿠팡매칭 컬럼 외 더블클릭으로 검토 토글
+        if self._review_mode and col not in (self.COL_MEMO, self.COL_REVIEW, self.COL_COUPANG):
             self._toggle_reviewed(usage)
             return
 
@@ -1866,7 +1884,7 @@ class CardUsageTab(QWidget):
         try:
             for c in (
                 self.COL_DATE, self.COL_CATEGORY, self.COL_STORE,
-                self.COL_AMOUNT, self.COL_CARD, self.COL_MEMO,
+                self.COL_AMOUNT, self.COL_CARD, self.COL_COUPANG, self.COL_MEMO,
             ):
                 item = self.table.item(row, c)
                 if item is None:

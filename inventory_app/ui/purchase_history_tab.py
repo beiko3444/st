@@ -294,6 +294,8 @@ class _CrawlerWorker(QObject):
     log = Signal(str)
     login_required = Signal(str)
     finished = Signal(object)
+    # 실시간 부분결과: (records, orders, channel)
+    partial = Signal(object, object, str)
 
     def __init__(
         self,
@@ -331,10 +333,16 @@ class _CrawlerWorker(QObject):
             except Exception:
                 pass
             self.log.emit(str(msg))
+        def _emit_partial(recs, ords, ch):
+            try:
+                self.partial.emit(list(recs or []), list(ords or []), str(ch or self.channel))
+            except Exception:  # noqa: BLE001
+                pass
         progress = CrawlerProgress(
             on_log=_log,
             on_login_required=lambda msg: self.login_required.emit(str(msg)),
             cancelled=lambda: self._cancelled,
+            on_partial=_emit_partial,
         )
         try:
             ensure_browser_installed(progress)
@@ -1076,6 +1084,7 @@ class PurchaseHistoryTab(QWidget):
         worker.log.connect(self._on_crawler_log)
         worker.login_required.connect(self._on_login_required)
         worker.finished.connect(self._on_crawler_finished)
+        worker.partial.connect(self._on_crawler_partial)
 
         def _cleanup(_result: object = None) -> None:
             thread.quit()
@@ -1106,6 +1115,32 @@ class PurchaseHistoryTab(QWidget):
     def _on_login_required(self, msg: str) -> None:
         self.status.setText(msg)
 
+    def _on_crawler_partial(self, records: object, orders: object, channel: str) -> None:
+        """크롤 도중 부분결과를 받자마자 DB 저장 + UI 갱신.
+
+        save_records/save_orders 는 UPSERT 라 같은 fingerprint 가 두 번 와도 안전.
+        Pi write-through 도 동일하게 수행되므로 라즈베리파이에 점진적으로 전송됨.
+        """
+        try:
+            recs = records if isinstance(records, list) else []
+            ords = orders if isinstance(orders, list) else []
+            r_added = self.store.save_records(recs) if recs else 0
+            o_added = 0
+            if ords:
+                try:
+                    self.store.save_orders(ords)
+                    o_added = len(ords)
+                except Exception as exc:  # noqa: BLE001
+                    self.status.setText(f"부분 저장 중 오류(무시): {exc}")
+            ch_label = self.CHANNEL_LABELS.get(channel, channel)
+            self.status.setText(
+                f"⏳ {ch_label} 실시간 갱신: 품목 {len(recs)}건 (신규 {r_added}) · "
+                f"주문 {len(ords)}개 (저장 {o_added})"
+            )
+            self.reload()
+        except Exception as exc:  # noqa: BLE001
+            self.status.setText(f"실시간 갱신 실패(크롤은 계속): {exc}")
+
     def _on_crawler_finished(self, result: object) -> None:
         if not isinstance(result, CrawlResult):
             self.status.setText("\uc218\uc9d1\uc774 \uc885\ub8cc\ub418\uc5c8\uc9c0\ub9cc \uacb0\uacfc\ub97c \uc77d\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4.")
@@ -1134,10 +1169,27 @@ class PurchaseHistoryTab(QWidget):
                 order_msg = f" \u00b7 \uc8fc\ubb38 {len(orders_attr)}\uac1c (\uacb0\uc81c\uae08 {paid}\uac1c)"
             except Exception as exc:  # noqa: BLE001
                 order_msg = f" \u00b7 \uc8fc\ubb38 \uc800\uc7a5 \uc2e4\ud328: {exc}"
-        # Pi \uc5c5\ub85c\ub4dc \uc0c1\ud0dc (save_records/save_orders \uac00 write-through \ub85c Pi \uc5d0 \ub3d9\uc2dc \uc5c5\ub85c\ub4dc\ud568)
+        # \u2500\u2500 Pi \uc77c\uad04 \uc804\uc1a1: \ud06c\ub864 \uc644\ub8cc \uc2dc\uc810\uc5d0 \uba85\uc2dc\uc801\uc73c\ub85c \ud55c \ubc88 \ub354 push \u2500\u2500
+        # write-through \uac00 \ub3c4\uc911\uc5d0 \uc2e4\ud328\ud588\uc744 \uac00\ub2a5\uc131\uc744 \ub300\ube44\ud574 \ubaa8\ub4e0 records/orders \ub97c \ub2e4\uc2dc batch \uc804\uc1a1.
+        # Pi \uce21 fingerprint UNIQUE \ub85c \uc911\ubcf5\uc740 \uc790\ub3d9 ignore.
         pi_msg = ""
         if self._pi_client is not None and getattr(self._pi_client, "is_configured", False):
-            pi_msg = " \u00b7 \u2601 \ub77c\uc988\ubca0\ub9ac\ud30c\uc774 \uc790\ub3d9 \uc5c5\ub85c\ub4dc \uc644\ub8cc"
+            try:
+                from inventory_app.services.purchase_history_service import (
+                    PurchaseHistoryStore as _PHStore,
+                )
+                _store_for_fp = self.store if hasattr(self.store, "_fingerprint") else _PHStore()
+                pi_recs = self._pi_client.upload_purchase_records(
+                    list(result.records),
+                    _store_for_fp._fingerprint,  # type: ignore[attr-defined]
+                )
+                pi_ords = self._pi_client.upload_purchase_orders(list(orders_attr))
+                pi_msg = (
+                    f" \u00b7 \u2601 \ub77c\uc988\ubca0\ub9ac\ud30c\uc774 \uc77c\uad04\uc804\uc1a1 \uc644\ub8cc "
+                    f"(\ud488\ubaa9 \uc2e0\uaddc {pi_recs} \u00b7 \uc8fc\ubb38 {pi_ords})"
+                )
+            except Exception as exc:  # noqa: BLE001
+                pi_msg = f" \u00b7 \u26a0 \ub77c\uc988\ubca0\ub9ac\ud30c\uc774 \uc77c\uad04\uc804\uc1a1 \uc2e4\ud328: {exc}"
         else:
             pi_msg = " \u00b7 (Pi \ubbf8\uc124\uc815 \u2014 \ub85c\uceec\uc5d0\ub9cc \uc800\uc7a5)"
         self.status.setText(

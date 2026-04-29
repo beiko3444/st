@@ -50,6 +50,11 @@ class CrawlerProgress:
     on_log: Callable[[str], None] = field(default=lambda _msg: None)
     on_login_required: Callable[[str], None] = field(default=lambda _msg: None)
     cancelled: Callable[[], bool] = field(default=lambda: False)
+    # 실시간 부분결과 콜백 — (records, orders, channel) 을 받아 UI 가 즉시 저장+표시.
+    # 호출 시점: listing 페이지 추출 직후, 디테일 보충 패스 직후, 백필 직후.
+    on_partial: Callable[[List["PurchaseRecord"], List["PurchaseOrder"], str], None] = field(
+        default=lambda _r, _o, _c: None
+    )
 
 
 @dataclass
@@ -187,7 +192,14 @@ def _click_next_if_available(page) -> bool:
     return False
 
 
-def _collect_records(page, channel: str, max_pages: int, progress: CrawlerProgress) -> List[PurchaseRecord]:
+def _collect_records(
+    page,
+    channel: str,
+    max_pages: int,
+    progress: CrawlerProgress,
+    *,
+    account_label: str = "",
+) -> List[PurchaseRecord]:
     parser = PurchaseHistoryParser()
     records: List[PurchaseRecord] = []
     seen = set()
@@ -198,14 +210,25 @@ def _collect_records(page, channel: str, max_pages: int, progress: CrawlerProgre
         text = _body_text(page)
         parsed = parser.parse_text(channel, text, source_url=page.url)
         added = 0
+        new_recs: List[PurchaseRecord] = []
         for record in parsed:
             key = (record.order_date, record.order_no, record.title, record.amount)
             if key in seen:
                 continue
             seen.add(key)
+            if account_label:
+                try: record.account_label = account_label
+                except Exception: pass  # noqa: BLE001
             records.append(record)
+            new_recs.append(record)
             added += 1
         progress.on_log(f"{label} {page_no}\ud398\uc774\uc9c0: {added}\uac74 \ucd94\ucd9c")
+        # \ud398\uc774\uc9c0\ub9c8\ub2e4 \ubd80\ubd84\uacb0\uacfc emit \u2192 UI \uc989\uc2dc \uc5c5\ub370\uc774\ud2b8
+        if new_recs:
+            try:
+                progress.on_partial(new_recs, [], channel)
+            except Exception as exc:  # noqa: BLE001
+                progress.on_log(f"  partial emit \uc2e4\ud328(\ubb34\uc2dc): {exc}")
         if page_no >= max_pages:
             break
         if not _click_next_if_available(page):
@@ -262,8 +285,25 @@ def crawl_channel(
                 except Exception:
                     pass
                 _wait_for_user_login(page, channel, progress)
-                records = _collect_records(page, channel, max_pages, progress)
-                progress.on_log(f"{CHANNEL_LABELS[channel]} \uc218\uc9d1 \uc644\ub8cc: {len(records)}\uac74")
+                records = _collect_records(
+                    page, channel, max_pages, progress, account_label=account_label
+                )
+                # account_label \uc8fc\uc785 \u2014 \ub124\uc774\ubc84\ub294 \uc0ac\uc6a9\uc790 1\uacc4\uc815\uc774\uc9c0\ub9cc \ud45c\uc2dc/\ud544\ud130\ub97c \uc704\ud574 \uc804\ud30c
+                if account_label:
+                    for r in records:
+                        try:
+                            r.account_label = account_label
+                        except Exception:  # noqa: BLE001
+                            pass
+                progress.on_log(
+                    f"{CHANNEL_LABELS[channel]} \uc218\uc9d1 \uc644\ub8cc: {len(records)}\uac74"
+                    + (f" \u00b7 \uacc4\uc815 {account_label}" if account_label else "")
+                )
+                # \ub9c8\uc9c0\ub9c9 partial emit (\ub124\uc774\ubc84\ub294 listing \ub9cc \u2192 \ud55c \ubc88)
+                try:
+                    progress.on_partial(list(records), [], channel)
+                except Exception as exc:  # noqa: BLE001
+                    progress.on_log(f"  partial emit \uc2e4\ud328(\ubb34\uc2dc): {exc}")
                 return CrawlResult(channel=channel, records=records)
             finally:
                 context.close()
@@ -836,6 +876,21 @@ def _crawl_coupang_via_cdp(
                         f"주문 {len(page_orders)}개 (신규 {added_orders}) · "
                         f"hasNext={has_next}"
                     )
+                    # 페이지별 partial emit — 화면에 즉시 반영
+                    try:
+                        if added or added_orders:
+                            new_page_recs = [r for r in page_recs if (r.order_date or "", r.title or "", r.amount or 0) and r in records]  # noqa: F841
+                            # 단순화: 누적된 records / orders 전체를 보내고 UI 가 dedup (UPSERT) 처리.
+                            if account_label:
+                                for r in records:
+                                    try: r.account_label = account_label
+                                    except Exception: pass  # noqa: BLE001
+                                for o in orders:
+                                    try: o.account_label = account_label
+                                    except Exception: pass  # noqa: BLE001
+                            progress.on_partial(list(records), list(orders), "coupang")
+                    except Exception as exc:  # noqa: BLE001
+                        progress.on_log(f"  partial emit 실패(무시): {exc}")
 
                     # 종료 판단:
                     # 1) NEXT_DATA 의 hasNext=false → 정확한 마지막 페이지 신호
@@ -856,6 +911,20 @@ def _crawl_coupang_via_cdp(
             progress.on_log(
                 f"주문 추출 완료: 총 {len(orders)}개 (결제금 확정 {paid_count}개)"
             )
+
+            # ── 실시간 부분결과 emit (listing 종료 직후) ──
+            # account_label 미리 stamp 해서 UI 가 받자마자 화면에 정확히 표시.
+            try:
+                if account_label:
+                    for r in records:
+                        try: r.account_label = account_label
+                        except Exception: pass  # noqa: BLE001
+                    for o in orders:
+                        try: o.account_label = account_label
+                        except Exception: pass  # noqa: BLE001
+                progress.on_partial(list(records), list(orders), "coupang")
+            except Exception as exc:  # noqa: BLE001
+                progress.on_log(f"  partial emit 실패(무시): {exc}")
 
             # 디테일 페이지 보충 패스 — 결제수단/쿠팡캐시 추출
             # 쿠팡 리스트의 "주문 상세보기" 는 <a> 가 아닌 <span> + JS 핸들러라 DOM 에서
@@ -918,10 +987,127 @@ def _crawl_coupang_via_cdp(
                         for rec in records:
                             if rec.payment_method is None and rec.order_no in pm_by_order:
                                 rec.payment_method = pm_by_order[rec.order_no]
+                        # ── 실시간 부분결과 emit (디테일 보충 직후) ──
+                        try:
+                            progress.on_partial(list(records), list(orders), "coupang")
+                        except Exception as exc:  # noqa: BLE001
+                            progress.on_log(f"  partial emit 실패(무시): {exc}")
             except Exception as exc:  # noqa: BLE001
                 # 디테일 보충 단계 자체 실패해도 listing 결과는 보존
                 import traceback as _tb
                 progress.on_log(f"디테일 보충 단계 실패(listing 결과는 유지): {exc}")
+                progress.on_log(f"  trace: {_tb.format_exc().splitlines()[-3:]!r}")
+
+            # ── 백필 패스 ──
+            # listing 의 cutoff_date 때문에 제외됐거나, 과거 버그로 payment_method/account_label
+            # 이 비어있는 DB 주문을 재조회한다. 디테일 페이지가 정상 응답하면 = 현재 계정 소유.
+            # "주문정보가 존재하지 않습니다" 응답 = 다른 계정 → 스킵.
+            try:
+                from inventory_app.services.purchase_history_service import (
+                    PurchaseHistoryStore as _PHStore,
+                )
+                _store = _PHStore()
+                already_no = {o.order_no for o in orders if o.order_no}
+                db_orders = _store.load_orders(channel="coupang", limit=5000)
+                # 후보: 이번 listing 에서 안 다룬 주문 중, source_url 있고 payment_method 비어있음.
+                # (account_label 만 비어있는 경우는 다음번 listing 에 포함되면 자동 채워지므로 패스.)
+                candidates = [
+                    o for o in db_orders
+                    if o.order_no
+                    and o.order_no not in already_no
+                    and o.source_url
+                    and not o.payment_method
+                ]
+                # 1회 실행에서 너무 오래 걸리지 않도록 상한 — 다회 실행으로 점진적 보강.
+                max_backfill = 60
+                if len(candidates) > max_backfill:
+                    progress.on_log(
+                        f"백필 후보 {len(candidates)}개 → 이번 회차는 최신 {max_backfill}개만 처리"
+                    )
+                    candidates = candidates[:max_backfill]
+                if candidates:
+                    progress.on_log(
+                        f"백필 시작: DB 누락분 {len(candidates)}개 디테일 재조회 "
+                        "(다른 계정 주문이면 자동 스킵)"
+                    )
+                    bk_page = None
+                    try:
+                        bk_page = ctx.new_page()
+                    except Exception as exc:  # noqa: BLE001
+                        progress.on_log(f"  백필 탭 생성 실패(무시): {exc}")
+                    if bk_page is not None:
+                        try:
+                            backfilled = _crawl_coupang_order_details(
+                                bk_page,
+                                [c.source_url for c in candidates],
+                                progress,
+                                max_details=len(candidates),
+                                ctx=ctx,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            progress.on_log(f"  백필 디테일 예외(무시): {exc}")
+                            backfilled = []
+                        finally:
+                            try:
+                                bk_page.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                        bk_by_no = {b.order_no: b for b in backfilled if b.order_no}
+                        verified: List[PurchaseOrder] = []
+                        for c in candidates:
+                            d = bk_by_no.get(c.order_no)
+                            if d is None:
+                                continue  # 다른 계정 / 만료 → 스킵
+                            if not c.payment_method and d.payment_method:
+                                c.payment_method = d.payment_method
+                            if (not c.cash_used) and d.cash_used:
+                                c.cash_used = d.cash_used
+                                if c.payment_total is not None:
+                                    c.card_amount = max(
+                                        0, int(c.payment_total) - int(d.cash_used)
+                                    )
+                            verified.append(c)
+                        if verified:
+                            verified_no = {o.order_no for o in verified}
+                            # 같은 order_no 의 records 도 DB 에서 끌어와 payment_method/account_label 채움.
+                            db_records = _store.load_records(channel="coupang", limit=20000)
+                            pm_by_no = {
+                                o.order_no: o.payment_method
+                                for o in verified
+                                if o.payment_method
+                            }
+                            updated_recs = 0
+                            for r in db_records:
+                                if r.order_no and r.order_no in verified_no:
+                                    if not r.payment_method and r.order_no in pm_by_no:
+                                        r.payment_method = pm_by_no[r.order_no]
+                                    records.append(r)
+                                    updated_recs += 1
+                            orders.extend(verified)
+                            progress.on_log(
+                                f"✓ 백필 성공: 주문 {len(verified)}개 · 품목 {updated_recs}개 갱신 "
+                                f"(현재 계정 '{account_label or '미지정'}' 소속 확인됨)"
+                            )
+                            # 백필 결과만 따로 partial emit (account_label 은 아래 일괄 stamp 단계에서 채워짐)
+                            try:
+                                if account_label:
+                                    for vo in verified:
+                                        try: vo.account_label = account_label
+                                        except Exception: pass  # noqa: BLE001
+                                progress.on_partial(
+                                    [r for r in records if r.order_no in verified_no],
+                                    list(verified),
+                                    "coupang",
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                progress.on_log(f"  partial emit 실패(무시): {exc}")
+                        else:
+                            progress.on_log(
+                                "백필: 현재 계정에 속한 누락 주문 없음 (다른 계정의 데이터일 수 있음)"
+                            )
+            except Exception as exc:  # noqa: BLE001
+                import traceback as _tb
+                progress.on_log(f"백필 단계 실패(무시 — listing 결과 보존): {exc}")
                 progress.on_log(f"  trace: {_tb.format_exc().splitlines()[-3:]!r}")
 
     except Exception as exc:  # noqa: BLE001
@@ -1230,6 +1416,11 @@ def _parse_coupang_order_detail(text: str) -> dict:
     cash_total = sum(cash_per_keyword.values())
     if cash_total > 0:
         info["cash_used"] = cash_total
+    elif info.get("payment_total"):
+        # 본문 결제 정보 섹션이 정상 파싱(payment_total 잡힘)됐는데 cash 키워드가 없다
+        # → 명시적 0 으로 기록. (None 으로 두면 save_orders 의 COALESCE 가 DB 의
+        # 과거 잘못된 값(예: 5원 false positive)을 덮어쓰지 못함)
+        info["cash_used"] = 0
 
     # 주문일 (yyyy. M. d 주문)
     md = _COUPANG_DATE_RE.search(text or "")
@@ -1244,6 +1435,15 @@ def _parse_coupang_order_detail(text: str) -> dict:
 
 
 _CASH_KEYWORDS = ("cash", "coupay", "point", "reward", "saving", "saved", "coupon", "mileage")
+# 키 이름에 이 토큰이 포함되면 cash_used 로 보지 않음 — 비율/적립률/한도/예상치 등
+# (값=5 같은 작은 % 가 cash 로 오집계되는 버그 방지)
+_CASH_KEY_BLOCKLIST = (
+    "rate", "ratio", "percent", "pct",
+    "earn", "earned", "accrued", "accumulate", "expected",
+    "available", "balance", "remain", "max", "limit", "cap",
+    "min", "minimum", "default", "potential", "estimate", "preview",
+    "rule", "policy", "expir", "default", "config",
+)
 _CARD_KEYWORDS = ("creditcard", "checkcard", "credit", "debit")
 
 
@@ -1285,11 +1485,18 @@ def _walk_for_payment_info(obj, depth: int = 0) -> dict:
             if isinstance(v, (int, float)) and v > 0 and not result.get("payment_total"):
                 result["payment_total"] = int(v)
                 break
-        # 캐시/포인트류 합산: 키 이름에 cash/point/coupon/saving 등 포함 + amount 형 값
+        # 캐시/포인트류 합산: 키 이름에 cash/point/coupon/saving 등 포함 + amount 형 값.
+        # 단 rate/percent/earn/limit 등 비-사용금액 토큰이 있으면 제외 (오집계 방지).
+        # 또한 100원 미만은 거의 항상 적립률/% 메타 필드 → 차단 (과거 5원 false positive 사례).
         for key, val in obj.items():
             kl = str(key).lower()
-            if any(kw in kl for kw in _CASH_KEYWORDS) and isinstance(val, (int, float)) and val > 0 and val < 100_000_000:
-                result["cash_used"] += int(val)
+            if not any(kw in kl for kw in _CASH_KEYWORDS):
+                continue
+            if any(bad in kl for bad in _CASH_KEY_BLOCKLIST):
+                continue
+            if not isinstance(val, (int, float)) or val < 100 or val >= 100_000_000:
+                continue
+            result["cash_used"] += int(val)
             # 'type'/'methodType' 이 CASH/POINT/COUPON 인 항목의 amount 도 합산
         # paymentDetailList 형식: [{type:'COUPAY_CASH', amount: 1000}, ...]
         type_field = obj.get("type") or obj.get("paymentType") or obj.get("methodType")
@@ -1475,13 +1682,19 @@ def _crawl_coupang_order_details(
             except Exception:  # noqa: BLE001
                 pass
             info = _parse_coupang_order_detail(body)
-            # NEXT_DATA 결과를 텍스트 정규식 결과 위에 우선 적용
+            # NEXT_DATA 결과는 본문 파싱 실패분만 보충 (payment_method, payment_total).
             if nd_info.get("payment_method") and not info.get("payment_method"):
                 info["payment_method"] = nd_info["payment_method"]
-            if nd_info.get("cash_used") and not info.get("cash_used"):
-                info["cash_used"] = nd_info["cash_used"]
             if nd_info.get("payment_total") and not info.get("payment_total"):
                 info["payment_total"] = nd_info["payment_total"]
+            # cash_used 는 본문이 authoritative — payment_total 을 본문에서 잡았다는 건
+            # "결제 정보" 섹션 파싱이 성공했다는 뜻이므로 그 안에 cash 라인이 없으면
+            # 진짜 사용 안 한 것. NEXT_DATA 의 broad keyword scan 은 rate/percent/적립률
+            # 같은 메타 필드(예: 5)를 오집계하는 버그가 있어 fallback 하지 않는다.
+            if not info.get("cash_used") and not info.get("payment_total"):
+                # 본문 자체가 파싱 안 된 극단적 케이스에서만 NEXT_DATA 사용
+                if nd_info.get("cash_used"):
+                    info["cash_used"] = nd_info["cash_used"]
             # 진단 로그 — 어떤 소스에서 무엇이 잡혔는지
             progress.on_log(
                 f"  detail {idx + 1}/{max_details}: NEXT_DATA pm={nd_info.get('payment_method')} "
@@ -1519,7 +1732,7 @@ def _crawl_coupang_order_details(
                 source_url=url,
                 raw_text=(body or "")[:4000],
                 imported_at=now,
-                cash_used=int(cash) if cash else None,
+                cash_used=int(cash) if cash is not None else None,
                 card_amount=card_amt,
             )
             out.append(order)

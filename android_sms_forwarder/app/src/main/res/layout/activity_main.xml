@@ -1,0 +1,206 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true"
+    android:background="#f8fafc">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="라즈베리 SMS 포워더"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:textColor="#0f172a"
+            android:paddingBottom="4dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="수신 SMS 를 라즈베리 서버로 실시간 전송"
+            android:textSize="13sp"
+            android:textColor="#64748b"
+            android:paddingBottom="16dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="서버 URL (예: http://192.168.0.10:8765)"
+            android:textColor="#334155"
+            android:paddingBottom="4dp" />
+
+        <EditText
+            android:id="@+id/urlEdit"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="http://&lt;라즈베리주소&gt;:8765"
+            android:inputType="textUri"
+            android:singleLine="true"
+            android:autofillHints="off"
+            android:paddingBottom="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="토큰 (선택 — 사용 시 Authorization: Bearer 로 전송)"
+            android:textColor="#334155"
+            android:paddingBottom="4dp" />
+
+        <EditText
+            android:id="@+id/tokenEdit"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="(없으면 비워둠)"
+            android:inputType="text"
+            android:singleLine="true"
+            android:autofillHints="off"
+            android:paddingBottom="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="발신자/내용 필터 (콤마 구분, 비우면 전체)"
+            android:textColor="#334155"
+            android:paddingBottom="4dp" />
+
+        <EditText
+            android:id="@+id/filterEdit"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="예: 신한카드, 1599, 쿠팡"
+            android:inputType="text"
+            android:singleLine="true"
+            android:autofillHints="off"
+            android:paddingBottom="8dp" />
+
+        <CheckBox
+            android:id="@+id/enabledCheck"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="실시간 전송 활성화"
+            android:textColor="#0f172a" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:paddingTop="8dp">
+
+            <Button
+                android:id="@+id/saveBtn"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="저장" />
+
+            <Button
+                android:id="@+id/permBtn"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:text="권한 요청" />
+
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/testBtn"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="연결 테스트" />
+
+            <Button
+                android:id="@+id/batteryBtn"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:text="배터리 최적화 해제" />
+
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="(상태)"
+            android:textColor="#0f172a"
+            android:background="#e2e8f0"
+            android:padding="10dp"
+            android:layout_marginTop="12dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="서버에서 불러오기"
+            android:textStyle="bold"
+            android:textColor="#0f172a"
+            android:paddingTop="20dp"
+            android:paddingBottom="4dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/fetchBtn"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="최근 20건 불러오기" />
+
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/fetchedText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="(아직 불러오지 않음)"
+            android:textColor="#0f172a"
+            android:background="#ffffff"
+            android:padding="10dp"
+            android:textIsSelectable="true"
+            android:layout_marginTop="6dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="로그"
+            android:textStyle="bold"
+            android:textColor="#0f172a"
+            android:paddingTop="20dp"
+            android:paddingBottom="4dp" />
+
+        <Button
+            android:id="@+id/clearLogBtn"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="로그 지우기" />
+
+        <TextView
+            android:id="@+id/logText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="(로그 없음)"
+            android:textColor="#0f172a"
+            android:background="#ffffff"
+            android:padding="10dp"
+            android:textIsSelectable="true"
+            android:layout_marginTop="6dp" />
+
+    </LinearLayout>
+
+</ScrollView>
