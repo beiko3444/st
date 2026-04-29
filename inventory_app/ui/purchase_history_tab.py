@@ -809,9 +809,11 @@ class PurchaseHistoryTab(QWidget):
         red_brush = QBrush(QColor("#dc2626"))
         gray_brush = QBrush(QColor("#9ca3af"))
         zebra_brushes = [QBrush(QColor("#ffffff")), QBrush(QColor("#eef2f7"))]
+        summary_bg = QBrush(QColor("#fef9c3"))
+        summary_fg = QBrush(QColor("#854d0e"))
 
-        # 쿠팡캐시 차감을 별도 합계 행이 아니라 "품목"으로 한 줄 추가.
-        # 같은 order_no 의 마지막 아이템 뒤에 [쿠팡캐시 차감] 음수 행 삽입.
+        # 합계 행을 같은 주문번호 그룹 끝마다 1개씩 삽입.
+        # 결제금액 = 실 카드결제(캐시 차감 후), 상품/내역 = "총 N건 · X원 차감".
         order_meta: dict[str, "PurchaseOrder"] = {}
         try:
             for o in self.store.load_orders(channel="all", limit=20000):
@@ -826,43 +828,59 @@ class PurchaseHistoryTab(QWidget):
             key = (r.order_no or "").strip() or f"__none_{id(r)}"
             groups.setdefault(key, []).append(r)
 
-        enriched: List[PurchaseRecord] = []
+        # display sequence: ("item", record) 또는 ("summary", (items, ord_obj))
+        display: list[tuple[str, Any]] = []
         for key, items in groups.items():
-            enriched.extend(items)
-            order_no = (items[0].order_no or "").strip() if items else ""
-            if not order_no:
+            for r in items:
+                display.append(("item", r))
+            order_no_g = (items[0].order_no or "").strip() if items else ""
+            if not order_no_g:
                 continue
-            ord_obj = order_meta.get(order_no)
-            if ord_obj is None:
-                continue
-            cash = int(getattr(ord_obj, "cash_used", None) or 0)
-            if cash <= 0:
-                continue
-            base = items[-1]
-            cash_record = PurchaseRecord(
-                id=None,
-                channel=base.channel,
-                order_date=base.order_date,
-                order_no=base.order_no,
-                title="[쿠팡캐시 차감]",
-                amount=-cash,
-                payment_method=base.payment_method,
-                source_url=base.source_url,
-                raw_text="cash_deduction",
-                imported_at=base.imported_at,
-            )
-            try:
-                cash_record.account_label = getattr(base, "account_label", None)
-            except Exception:  # noqa: BLE001
-                pass
-            enriched.append(cash_record)
+            ord_obj = order_meta.get(order_no_g)
+            display.append(("summary", (items, ord_obj)))
 
-        rows = enriched
-        self.table.setRowCount(len(rows))
+        self.table.setRowCount(len(display))
 
         zebra_idx = 0
         prev_order_no: Optional[str] = None
-        for row_idx, record in enumerate(rows):
+        bold_f = QFont(); bold_f.setBold(True)
+        for row_idx, entry in enumerate(display):
+            row_type, payload = entry
+            if row_type == "summary":
+                items_list, ord_obj = payload  # type: ignore[misc]
+                cnt = len(items_list)
+                items_total = sum(self._signed_amount(r) for r in items_list)
+                cash = 0
+                if ord_obj is not None:
+                    cash = int(getattr(ord_obj, "cash_used", None) or 0)
+                final_amount = items_total - cash if cash > 0 else items_total
+                if cash > 0:
+                    detail_text = f"총 {cnt}건 · 쿠팡캐시 −{cash:,}원 차감"
+                else:
+                    detail_text = f"총 {cnt}건"
+                amt_item = _NumberItem(f"{final_amount:,}원")
+                amt_item.setData(Qt.UserRole, final_amount)
+                detail_item = QTableWidgetItem(detail_text)
+                cells = [
+                    QTableWidgetItem(""),  # 일자
+                    QTableWidgetItem(""),  # 채널
+                    QTableWidgetItem(""),  # 주문번호
+                    detail_item,           # 상품/내역 ← "총 N건 · X원 차감"
+                    amt_item,              # 결제금액 ← 실 카드결제 (캐시 차감 후)
+                    QTableWidgetItem(""),  # 결제수단
+                    QTableWidgetItem(""),  # 계정
+                    QTableWidgetItem(""),  # 가져온 시각
+                ]
+                for c, it in enumerate(cells):
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                    it.setBackground(summary_bg)
+                    it.setForeground(summary_fg)
+                    it.setFont(bold_f)
+                    self.table.setItem(row_idx, c, it)
+                self.table.setRowHeight(row_idx, 24)
+                continue
+
+            record: PurchaseRecord = payload  # type: ignore[assignment]
             current_order_no = (record.order_no or "").strip() or f"__row_{row_idx}"
             if prev_order_no is None:
                 zebra_idx = 0
