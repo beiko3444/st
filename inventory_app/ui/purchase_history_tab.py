@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -49,6 +50,7 @@ from inventory_app.services.purchase_history_service import (
     dedupe_order_items as _dedupe_order_items,
     normalize_record_title as _normalize_title,
 )
+from inventory_app.ui.card_usage_tab import _MonthYearPicker
 
 
 class _OrderDetailDialog(QDialog):
@@ -97,6 +99,9 @@ class _OrderDetailDialog(QDialog):
             order_date = order.order_date or ""
             payment_method = order.payment_method or ""
 
+        # 100원 미만 cash_used 는 과거 파서 false positive (예: '5원 적립') — 0 으로 간주
+        if cash_used is not None and 0 < int(cash_used) < 100:
+            cash_used = 0
         # card_amount 가 None 이면 payment_total - cash_used 로 추정
         if card_amount is None and payment_total is not None:
             card_amount = int(payment_total) - int(cash_used or 0)
@@ -466,6 +471,7 @@ class PurchaseHistoryTab(QWidget):
         self.parser = PurchaseHistoryParser()
         self._worker_thread: QThread | None = None
         self._worker: _CrawlerWorker | None = None
+        self._return_pending_keys: set[str] = self._load_return_pending_keys()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -525,6 +531,27 @@ class PurchaseHistoryTab(QWidget):
         # \u2500\u2500 \ud1b5\ud569 \uac80\uc0c9 \ubc14 \u2500\u2500
         search_row = QHBoxLayout()
         search_row.setSpacing(6)
+        # \uae30\uac04 \u2014 \uc5f0\ub3c4/\uc6d4 \ubd84\ub9ac \uc120\ud0dd
+        today = _date.today()
+        # \uae30\ubcf8: \ud604\uc7ac \uc6d4 1\uac1c\uc6d4
+        self.period_start = _MonthYearPicker(side="start", year=today.year, month=today.month)
+        self.period_end = _MonthYearPicker(side="end", year=today.year, month=today.month)
+        # \u300c\uc804\uccb4 \uae30\uac04\u300d \uccb4\ud06c\ubc15\uc2a4 \u2014 \ucf1c\uba74 \uae30\uac04 \ud544\ud130 \ube44\ud65c\uc131\ud654 (\uae30\uc874 \ub3d9\uc791\uacfc \ud638\ud658)
+        self.period_all_chk = QCheckBox("\uc804\uccb4 \uae30\uac04")
+        self.period_all_chk.setChecked(True)
+        self.period_all_chk.setToolTip("\uccb4\ud06c \ud574\uc81c \uc2dc \uc544\ub798 \uae30\uac04 \ubc94\uc704\ub85c \ud544\ud130\ub9c1")
+        # \uae30\ubcf8 '\uc804\uccb4 \uae30\uac04' \uc774\ubbc0\ub85c \uc2dc\uc791/\uc885\ub8cc \uc704\uc82f\uc740 \ube44\ud65c\uc131
+        self.period_start.setEnabled(False)
+        self.period_end.setEnabled(False)
+        self.period_all_chk.toggled.connect(lambda _ck: self._on_period_changed())
+        self.period_start.dateChanged.connect(lambda _d: self._on_period_changed())
+        self.period_end.dateChanged.connect(lambda _d: self._on_period_changed())
+        search_row.addWidget(QLabel("\uae30\uac04"))
+        search_row.addWidget(self.period_all_chk)
+        search_row.addWidget(self.period_start)
+        search_row.addWidget(QLabel("~"))
+        search_row.addWidget(self.period_end)
+        search_row.addSpacing(12)
         search_row.addWidget(QLabel("\ud83d\udd0d \ud1b5\ud569\uac80\uc0c9"))
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText(
@@ -643,6 +670,9 @@ class PurchaseHistoryTab(QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         # 상품명/내역 셀 더블클릭 → 상품 페이지로 이동
         self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
+        # 우클릭 → 반품예정 토글 메뉴
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_context_menu)
 
         # 컬럼 너비 저장/복원 (Pi DB 의 ui_prefs)
         self._col_save_timer = QTimer(self)
@@ -879,9 +909,35 @@ class PurchaseHistoryTab(QWidget):
         self.status.setText(msg.replace("\n", " · "))
         QMessageBox.information(self, "파이 업로드 결과", msg)
 
+    def _on_period_changed(self) -> None:
+        # period_all \uccb4\ud06c \uc2dc \uc2dc\uc791/\uc885\ub8cc \ube44\ud65c\uc131\ud654
+        if hasattr(self, "period_start"):
+            enabled = not self.period_all_chk.isChecked()
+            self.period_start.setEnabled(enabled)
+            self.period_end.setEnabled(enabled)
+        self.reload()
+
+    def _period_filter_range(self) -> Optional[tuple[str, str]]:
+        """\ud604\uc7ac \uae30\uac04 \ud544\ud130\uc758 (start_iso, end_iso). '\uc804\uccb4 \uae30\uac04'\uc774\uba74 None."""
+        if not hasattr(self, "period_all_chk") or self.period_all_chk.isChecked():
+            return None
+        sd = self.period_start.date()
+        ed = self.period_end.date()
+        if sd > ed:
+            sd, ed = ed, sd
+        return (sd.toString("yyyy-MM-dd"), ed.toString("yyyy-MM-dd"))
+
     def reload(self) -> None:
         channel = self._selected_channel()
         rows = self.store.load_records(channel=channel)
+        # \uae30\uac04 \ud544\ud130 (order_date \uac00 yyyy-MM-dd \ud615\ud0dc)
+        rng = self._period_filter_range()
+        if rng is not None:
+            s, e = rng
+            rows = [
+                r for r in rows
+                if r.order_date and (s <= r.order_date <= e)
+            ]
         # \ud1b5\ud569 \uac80\uc0c9 \ud544\ud130 (\uc788\uc744 \ub54c\ub9cc)
         q = ""
         if hasattr(self, "search_edit"):
@@ -990,6 +1046,72 @@ class PurchaseHistoryTab(QWidget):
         dlg = _OrderDetailDialog(order_no, order, items, parent=self)
         dlg.exec()
 
+    # ── 반품예정 마킹 (로컬 영속화) ─────────────────────────
+    @staticmethod
+    def _return_pending_path() -> Path:
+        d = Path.home() / ".smartinventory"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / "purchase_return_pending.json"
+
+    def _load_return_pending_keys(self) -> set[str]:
+        p = self._return_pending_path()
+        if not p.exists():
+            return set()
+        try:
+            import json as _j
+            data = _j.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return {str(x) for x in data if x}
+        except Exception:  # noqa: BLE001
+            pass
+        return set()
+
+    def _save_return_pending_keys(self) -> None:
+        try:
+            import json as _j
+            self._return_pending_path().write_text(
+                _j.dumps(sorted(self._return_pending_keys), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _record_key(record: PurchaseRecord) -> str:
+        if record.id is not None:
+            return f"id:{record.id}"
+        return (
+            f"k:{record.channel}|{record.order_no or ''}"
+            f"|{(record.title or '')[:80]}|{record.amount or 0}"
+        )
+
+    def _is_return_pending(self, record: PurchaseRecord) -> bool:
+        return self._record_key(record) in self._return_pending_keys
+
+    def _on_table_context_menu(self, pos) -> None:
+        idx = self.table.indexAt(pos)
+        if not idx.isValid():
+            return
+        row = idx.row()
+        record = getattr(self, "_row_records", {}).get(row)
+        if record is None:
+            return  # 합계행 등
+        is_pending = self._is_return_pending(record)
+        menu = QMenu(self.table)
+        text = "↩ 반품예정 해제" if is_pending else "↩ 반품예정으로 표시"
+        act = menu.addAction(text)
+        act.triggered.connect(lambda _checked=False, r=record: self._toggle_return_pending(r))
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _toggle_return_pending(self, record: PurchaseRecord) -> None:
+        key = self._record_key(record)
+        if key in self._return_pending_keys:
+            self._return_pending_keys.discard(key)
+        else:
+            self._return_pending_keys.add(key)
+        self._save_return_pending_keys()
+        self.reload()
+
     def _render(self, rows: List[PurchaseRecord]) -> None:
         self.table.setSortingEnabled(False)
         self.table.setAlternatingRowColors(False)
@@ -1026,7 +1148,18 @@ class PurchaseHistoryTab(QWidget):
             ord_obj = order_meta.get(order_no_g)
             display.append(("summary", (items, ord_obj)))
 
+        # 이전 렌더에서 설치된 cellWidget (반품예정 게이지 등) 을 명시적으로 제거.
+        # setRowCount 만으로는 살아있는 cellWidget 이 새 item 위에 그대로 남아
+        # 반품예정을 해제해도 화면이 갱신되지 않는 문제가 발생함.
+        for r in range(self.table.rowCount()):
+            for c in range(self.table.columnCount()):
+                if self.table.cellWidget(r, c) is not None:
+                    self.table.removeCellWidget(r, c)
+        # 행수를 0 으로 리셋 후 다시 설정 — 행 height 등 잔여 상태도 초기화
+        self.table.setRowCount(0)
         self.table.setRowCount(len(display))
+        # row index → PurchaseRecord (item 행만; 우클릭 컨텍스트 메뉴에서 사용)
+        self._row_records: dict[int, PurchaseRecord] = {}
 
         zebra_idx = 0
         prev_order_no: Optional[str] = None
@@ -1040,6 +1173,9 @@ class PurchaseHistoryTab(QWidget):
                 cash = 0
                 if ord_obj is not None:
                     cash = int(getattr(ord_obj, "cash_used", None) or 0)
+                # 100원 미만은 과거 파서 false positive (예: '5원 적립') — 무시
+                if cash < 100:
+                    cash = 0
                 final_amount = items_total - cash if cash > 0 else items_total
                 if cash > 0:
                     detail_text = f"총 {cnt}건 · 쿠팡캐시 −{cash:,}원 차감"
@@ -1068,6 +1204,7 @@ class PurchaseHistoryTab(QWidget):
                 continue
 
             record: PurchaseRecord = payload  # type: ignore[assignment]
+            self._row_records[row_idx] = record
             current_order_no = (record.order_no or "").strip() or f"__row_{row_idx}"
             if prev_order_no is None:
                 zebra_idx = 0
@@ -1088,17 +1225,20 @@ class PurchaseHistoryTab(QWidget):
                 getattr(record, "account_label", None) or "-",
                 record.imported_at.strftime("%Y-%m-%d %H:%M"),
             ]
-            # 일자 컬럼: 쿠팡 + 미취소 건은 30일 반품 게이지 cellWidget 추가.
-            # 게이지 위젯은 행마다 QWidget 생성이라 무거움 → 최근 60일까지만 그림.
-            # 그보다 오래된 주문은 반품 기간 만료 확정이라 게이지 의미 없음.
+            # 일자 컬럼: 우클릭으로 '반품예정' 표시한 행만 D-day 게이지 노출.
+            # (쿠팡 30일 반품 정책 기준 — 미취소 건만 의미 있음)
             gauge_widget: Optional[_DateGaugeCell] = None
-            if record.channel == "coupang" and not cancelled and record.order_date:
+            if (
+                self._is_return_pending(record)
+                and record.channel == "coupang"
+                and not cancelled
+                and record.order_date
+            ):
                 try:
                     od = _dt.strptime(record.order_date, "%Y-%m-%d").date()
                     days_passed = (_date.today() - od).days
-                    if days_passed <= 60:
-                        days_left = _DateGaugeCell.RETURN_DAYS - days_passed
-                        gauge_widget = _DateGaugeCell(record.order_date, days_left)
+                    days_left = _DateGaugeCell.RETURN_DAYS - days_passed
+                    gauge_widget = _DateGaugeCell(record.order_date, days_left)
                 except Exception:  # noqa: BLE001
                     gauge_widget = None
             for col_idx, value in enumerate(values):

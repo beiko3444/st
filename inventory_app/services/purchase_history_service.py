@@ -28,6 +28,78 @@ def normalize_record_title(title: Optional[str]) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+def normalize_order_source_url(channel: Optional[str], source_url: Optional[str]) -> Optional[str]:
+    """저장된 주문 상세 URL을 현재 유효한 주소로 보정."""
+    if not source_url:
+        return source_url
+    url = str(source_url).strip()
+    if (channel or "").lower() != "coupang":
+        return url
+    match = re.search(r"/order/(\d+)|orderId=(\d+)", url)
+    order_id = ""
+    if match:
+        order_id = match.group(1) or match.group(2) or ""
+    if order_id and "/ssr/desktop/order/detail" in url:
+        return f"https://mc.coupang.com/ssr/desktop/order/{order_id}"
+    return url
+
+
+_COUPANG_GENERIC_PAYMENT_METHODS = frozenset(
+    {
+        "ROCKET_CARD",
+        "ROCKET_PAY",
+        "COUPAY_CARD",
+        "CARD",
+        "CREDIT_CARD",
+        "CHECK_CARD",
+        "쿠페이 등록카드",
+        "카드",
+    }
+)
+
+
+def normalize_payment_method(channel: Optional[str], payment_method: Optional[str]) -> Optional[str]:
+    """플랫폼 내부 결제 코드를 사람이 읽는 표시명으로 보정."""
+    if payment_method is None:
+        return None
+    value = str(payment_method).strip()
+    if not value:
+        return None
+    if (channel or "").lower() != "coupang":
+        return value
+    upper = value.upper()
+    # 쿠팡 내부 코드/포괄 코드만 있으면 실제 결제수단으로 표시하지 않는다.
+    # 예: ROCKET_CARD / 일시불 은 카드사명이 아니라 API 내부값 + 추정 할부정보라서 제거.
+    if (
+        upper in _COUPANG_GENERIC_PAYMENT_METHODS
+        or upper.startswith("ROCKET_CARD")
+        or upper.startswith("ROCKET_PAY")
+        or upper.startswith("COUPAY_CARD")
+        or upper in {"CARD / 일시불", "CREDIT_CARD / 일시불", "CHECK_CARD / 일시불"}
+        or value in {"쿠페이 등록카드", "카드"}
+    ):
+        return None
+    return value
+
+
+def is_generic_payment_method(channel: Optional[str], payment_method: Optional[str]) -> bool:
+    """원시 코드/포괄 표시명이라 상세 파싱 결과로 덮어써도 되는 값인지 판단."""
+    if payment_method is None:
+        return True
+    raw = str(payment_method).strip()
+    if not raw:
+        return True
+    if (channel or "").lower() != "coupang":
+        return False
+    normalized = normalize_payment_method(channel, raw)
+    return (
+        normalized is None
+        or raw.upper() in _COUPANG_GENERIC_PAYMENT_METHODS
+        or raw.upper().startswith(("ROCKET_CARD", "ROCKET_PAY", "COUPAY_CARD"))
+        or raw in _COUPANG_GENERIC_PAYMENT_METHODS
+    )
+
+
 def dedupe_order_items(items: List[PurchaseRecord]) -> List[PurchaseRecord]:
     """같은 주문 내에서 (order_date, 정규화 title, amount, payment_method) 가 동일한
     품목 record 를 표시 단계에서 dedupe.
@@ -303,6 +375,52 @@ class PurchaseHistoryStore:
             rec_cols = {row[1] for row in conn.execute("PRAGMA table_info(purchase_records)").fetchall()}
             if "account_label" not in rec_cols:
                 conn.execute("ALTER TABLE purchase_records ADD COLUMN account_label TEXT")
+            # 과거 버그 잔재: 100원 미만의 cash_used 값(예: 적립률 5원 false positive)을 0 으로 정정.
+            # 실제 쿠팡캐시 차감은 항상 100원 이상이므로 < 100 은 노이즈로 판단.
+            conn.execute(
+                "UPDATE purchase_orders SET cash_used = 0 "
+                "WHERE cash_used IS NOT NULL AND cash_used > 0 AND cash_used < 100"
+            )
+            # 과거 쿠팡 주문 상세 URL 버그 보정:
+            # /ssr/desktop/order/detail?orderId=123 은 쿠팡에서 "주문정보 없음"을 띄우고,
+            # 실제 라우트는 /ssr/desktop/order/123 이다.
+            conn.execute(
+                """
+                UPDATE purchase_orders
+                SET source_url = 'https://mc.coupang.com/ssr/desktop/order/' || order_no
+                WHERE channel = 'coupang'
+                  AND order_no IS NOT NULL
+                  AND source_url LIKE '%/ssr/desktop/order/detail?orderId=%'
+                """
+            )
+            # 쿠팡 JSON 의 내부 결제 코드가 그대로 저장된 과거 데이터 제거.
+            # 실제 페이지/JSON 에서 카드사명이 확인된 값만 결제수단으로 저장한다.
+            conn.execute(
+                """
+                UPDATE purchase_orders
+                SET payment_method = NULL
+                WHERE channel = 'coupang'
+                  AND (
+                      UPPER(TRIM(COALESCE(payment_method, ''))) LIKE 'ROCKET_CARD%'
+                      OR UPPER(TRIM(COALESCE(payment_method, ''))) LIKE 'ROCKET_PAY%'
+                      OR UPPER(TRIM(COALESCE(payment_method, ''))) LIKE 'COUPAY_CARD%'
+                      OR TRIM(COALESCE(payment_method, '')) IN ('쿠페이 등록카드', '카드')
+                  )
+                """
+            )
+            conn.execute(
+                """
+                UPDATE purchase_records
+                SET payment_method = NULL
+                WHERE channel = 'coupang'
+                  AND (
+                      UPPER(TRIM(COALESCE(payment_method, ''))) LIKE 'ROCKET_CARD%'
+                      OR UPPER(TRIM(COALESCE(payment_method, ''))) LIKE 'ROCKET_PAY%'
+                      OR UPPER(TRIM(COALESCE(payment_method, ''))) LIKE 'COUPAY_CARD%'
+                      OR TRIM(COALESCE(payment_method, '')) IN ('쿠페이 등록카드', '카드')
+                  )
+                """
+            )
             conn.commit()
 
     @staticmethod
@@ -337,7 +455,7 @@ class PurchaseHistoryStore:
                     record.order_no,
                     record.title,
                     record.amount,
-                    record.payment_method,
+                    normalize_payment_method(record.channel, record.payment_method),
                     record.source_url,
                     record.raw_text,
                     self._fingerprint(record),
@@ -359,7 +477,17 @@ class PurchaseHistoryStore:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(fingerprint) DO UPDATE SET
-                    payment_method = COALESCE(excluded.payment_method, purchase_records.payment_method),
+                    payment_method = CASE
+                        WHEN excluded.payment_method IS NOT NULL
+                             AND (
+                                 purchase_records.payment_method IS NULL
+                                 OR UPPER(TRIM(purchase_records.payment_method)) LIKE 'ROCKET_CARD%'
+                                 OR UPPER(TRIM(purchase_records.payment_method)) IN ('CARD', 'CREDIT_CARD', 'CHECK_CARD')
+                                 OR TRIM(purchase_records.payment_method) IN ('쿠페이 등록카드', '카드')
+                             )
+                        THEN excluded.payment_method
+                        ELSE COALESCE(purchase_records.payment_method, excluded.payment_method)
+                    END,
                     account_label  = COALESCE(excluded.account_label,  purchase_records.account_label),
                     source_url     = COALESCE(excluded.source_url,     purchase_records.source_url),
                     raw_text       = excluded.raw_text,
@@ -416,8 +544,8 @@ class PurchaseHistoryStore:
                     int(o.payment_total) if o.payment_total is not None else None,
                     int(o.item_count or 0),
                     o.status,
-                    o.payment_method,
-                    o.source_url,
+                    normalize_payment_method(o.channel, o.payment_method),
+                    normalize_order_source_url(o.channel, o.source_url),
                     o.raw_text,
                     o.imported_at.isoformat(),
                     int(o.cash_used) if o.cash_used is not None else None,
@@ -441,7 +569,17 @@ class PurchaseHistoryStore:
                     payment_total  = COALESCE(excluded.payment_total, purchase_orders.payment_total),
                     item_count     = excluded.item_count,
                     status         = excluded.status,
-                    payment_method = COALESCE(excluded.payment_method, purchase_orders.payment_method),
+                    payment_method = CASE
+                        WHEN excluded.payment_method IS NOT NULL
+                             AND (
+                                 purchase_orders.payment_method IS NULL
+                                 OR UPPER(TRIM(purchase_orders.payment_method)) LIKE 'ROCKET_CARD%'
+                                 OR UPPER(TRIM(purchase_orders.payment_method)) IN ('CARD', 'CREDIT_CARD', 'CHECK_CARD')
+                                 OR TRIM(purchase_orders.payment_method) IN ('쿠페이 등록카드', '카드')
+                             )
+                        THEN excluded.payment_method
+                        ELSE COALESCE(purchase_orders.payment_method, excluded.payment_method)
+                    END,
                     source_url     = excluded.source_url,
                     raw_text       = excluded.raw_text,
                     imported_at    = excluded.imported_at,
@@ -495,8 +633,8 @@ class PurchaseHistoryStore:
                     payment_total=row[3],
                     item_count=int(row[4] or 0),
                     status=row[5],
-                    payment_method=row[6],
-                    source_url=row[7],
+                    payment_method=normalize_payment_method(row[0], row[6]),
+                    source_url=normalize_order_source_url(row[0], row[7]),
                     raw_text=row[8] or "",
                     imported_at=imported_at,
                     cash_used=row[10] if len(row) > 10 else None,
@@ -547,7 +685,7 @@ class PurchaseHistoryStore:
                 r.order_no,
                 r.title,
                 r.amount,
-                r.payment_method,
+                normalize_payment_method(r.channel, r.payment_method),
                 r.source_url,
                 r.raw_text,
                 self._fingerprint(r),
@@ -587,8 +725,8 @@ class PurchaseHistoryStore:
                 o.payment_total,
                 o.item_count,
                 o.status,
-                o.payment_method,
-                o.source_url,
+                normalize_payment_method(o.channel, o.payment_method),
+                normalize_order_source_url(o.channel, o.source_url),
                 o.raw_text,
                 o.imported_at.isoformat() if o.imported_at else datetime.now().isoformat(),
                 o.cash_used,
@@ -649,7 +787,7 @@ class PurchaseHistoryStore:
                     order_no=row[3],
                     title=row[4],
                     amount=row[5],
-                    payment_method=row[6],
+                    payment_method=normalize_payment_method(row[1], row[6]),
                     source_url=row[7],
                     raw_text=row[8],
                     imported_at=imported_at,

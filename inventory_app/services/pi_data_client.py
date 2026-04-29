@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from inventory_app.models import CardUsage, PurchaseOrder, PurchaseRecord
+from inventory_app.services.purchase_history_service import normalize_order_source_url, normalize_payment_method
 
 
 class PiDataError(Exception):
@@ -86,7 +87,7 @@ class PiDataClient:
                 "order_no": r.order_no,
                 "title": r.title,
                 "amount": r.amount,
-                "payment_method": r.payment_method,
+                "payment_method": normalize_payment_method(r.channel, r.payment_method),
                 "source_url": r.source_url,
                 "raw_text": r.raw_text,
                 "fingerprint": fingerprint_of(r),
@@ -129,7 +130,7 @@ class PiDataClient:
                 order_no=row.get("order_no"),
                 title=str(row.get("title") or ""),
                 amount=row.get("amount"),
-                payment_method=row.get("payment_method"),
+                payment_method=normalize_payment_method(row.get("channel"), row.get("payment_method")),
                 source_url=row.get("source_url"),
                 raw_text=str(row.get("raw_text") or ""),
                 imported_at=imported_at,
@@ -151,8 +152,8 @@ class PiDataClient:
                 "payment_total": o.payment_total,
                 "item_count": o.item_count,
                 "status": o.status,
-                "payment_method": o.payment_method,
-                "source_url": o.source_url,
+                "payment_method": normalize_payment_method(o.channel, o.payment_method),
+                "source_url": normalize_order_source_url(o.channel, o.source_url),
                 "raw_text": o.raw_text,
                 "imported_at": o.imported_at.isoformat() if o.imported_at else datetime.now().isoformat(),
                 "cash_used": o.cash_used,
@@ -181,8 +182,8 @@ class PiDataClient:
                 payment_total=row.get("payment_total"),
                 item_count=int(row.get("item_count") or 0),
                 status=row.get("status"),
-                payment_method=row.get("payment_method"),
-                source_url=row.get("source_url"),
+                payment_method=normalize_payment_method(row.get("channel"), row.get("payment_method")),
+                source_url=normalize_order_source_url(str(row.get("channel") or ""), row.get("source_url")),
                 raw_text=str(row.get("raw_text") or ""),
                 imported_at=imported_at,
                 cash_used=row.get("cash_used"),

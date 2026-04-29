@@ -36,6 +36,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStackedWidget,
+    QStyle,
+    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -558,7 +560,7 @@ class _CoupangMatchDetailDialog(QDialog):
                         f" <span style='color:#64748b; font-size:11px;'>"
                         f"(결제총액 {int(order.payment_total):,}원"
                     )
-                    if order.cash_used:
+                    if order.cash_used and int(order.cash_used) >= 100:
                         tot_line += f" − 캐시 {int(order.cash_used):,}원"
                     tot_line += ")</span>"
             lines.append(f"<div style='margin-top:4px;'>{tot_line}</div>")
@@ -756,6 +758,100 @@ class _CalendarDayCell(QFrame):
         super().mousePressEvent(event)
 
 
+class _BgPaintingDelegate(QStyledItemDelegate):
+    """item.setBackground() 가 QSS QTableWidget::item 에 의해 무시되는 문제 우회.
+
+    paint 단계에서 직접 배경을 칠한다.
+    - reviewed 행: 항상 연한 녹색 페인트 (선택 상태와 무관)
+    - 선택된 행: 위에 반투명 darken 오버레이로 구분 (QSS :selected bg 는 사용 안 함)
+    """
+
+    def paint(self, painter, option, index):  # type: ignore[override]
+        bg = index.data(Qt.BackgroundRole)
+        brush: Optional[QBrush] = None
+        if isinstance(bg, QBrush) and bg.style() != Qt.NoBrush:
+            brush = bg
+        elif isinstance(bg, QColor) and bg.isValid():
+            brush = QBrush(bg)
+        if brush is not None:
+            painter.save()
+            painter.fillRect(option.rect, brush)
+            painter.restore()
+        # super 의 selection / focus bg QSS 페인팅 비활성화 — 우리가 직접 오버레이로 처리
+        selected = bool(option.state & QStyle.State_Selected)
+        from PySide6.QtWidgets import QStyleOptionViewItem
+        opt = QStyleOptionViewItem(option)
+        opt.state = option.state & ~QStyle.State_Selected & ~QStyle.State_HasFocus
+        super().paint(painter, opt, index)
+        if selected:
+            painter.save()
+            painter.fillRect(option.rect, QColor(15, 23, 42, 28))  # 약 11% darken
+            painter.restore()
+
+
+class _MonthYearPicker(QWidget):
+    """연도/월 분리 콤보박스 — QDateEdit 호환 API (date(), setDate(), dateChanged) 제공.
+
+    side="start" 면 1일, "end" 면 말일을 반환하는 QDate 를 만든다.
+    """
+
+    dateChanged = Signal(QDate)
+
+    def __init__(self, *, side: str, year: int, month: int) -> None:
+        super().__init__()
+        self._side = side
+        self._suspend = False
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self.year_combo = QComboBox()
+        # ±5 년 범위 제공 (필요시 사용자가 조회로 갱신해도 무방)
+        cur_year = date.today().year
+        for y in range(cur_year - 6, cur_year + 2):
+            self.year_combo.addItem(f"{y}년", y)
+        self.month_combo = QComboBox()
+        for m in range(1, 13):
+            self.month_combo.addItem(f"{m:02d}월", m)
+
+        self._set_combo(self.year_combo, year)
+        self._set_combo(self.month_combo, month)
+
+        self.year_combo.currentIndexChanged.connect(self._emit_changed)
+        self.month_combo.currentIndexChanged.connect(self._emit_changed)
+
+        layout.addWidget(self.year_combo)
+        layout.addWidget(self.month_combo)
+
+    @staticmethod
+    def _set_combo(combo: QComboBox, value: int) -> None:
+        idx = combo.findData(value)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+
+    def _emit_changed(self, *_: object) -> None:
+        if self._suspend:
+            return
+        self.dateChanged.emit(self.date())
+
+    def date(self) -> QDate:
+        y = int(self.year_combo.currentData() or date.today().year)
+        m = int(self.month_combo.currentData() or 1)
+        if self._side == "start":
+            return QDate(y, m, 1)
+        last_day = calendar.monthrange(y, m)[1]
+        return QDate(y, m, last_day)
+
+    def setDate(self, qd: QDate) -> None:
+        self._suspend = True
+        try:
+            self._set_combo(self.year_combo, qd.year())
+            self._set_combo(self.month_combo, qd.month())
+        finally:
+            self._suspend = False
+
+
 # ---------------------------------------------------------------------------
 # 메인 탭
 # ---------------------------------------------------------------------------
@@ -781,6 +877,9 @@ class CardUsageTab(QWidget):
         self._coupang_match_index: Dict[str, PurchaseGroup] = {}  # use_key/id → matched group
         # 캘린더 셀 클릭 → 테이블에서 해당 일자 단일 필터
         self._jump_to_date: Optional[date] = None
+        # 캘린더 모드에서 보고 있는 월 (period 필터와 독립; 네비게이션 버튼으로 변경)
+        self._cal_view_year: Optional[int] = None
+        self._cal_view_month: Optional[int] = None
         # Pi 데이터 API: 카드내역과 구매내역 모두 라즈베리에 저장
         self.pi = PiDataClient(getattr(config, "monitor_url", None))
 
@@ -871,12 +970,13 @@ class CardUsageTab(QWidget):
         filter_row = QHBoxLayout()
         filter_row.setSpacing(8)
         start_d, end_d = self._this_month_range()
-        self.start_edit = QDateEdit(QDate(start_d.year, start_d.month, start_d.day))
-        self.start_edit.setCalendarPopup(True)
-        self.start_edit.setDisplayFormat("yyyy-MM-dd")
-        self.end_edit = QDateEdit(QDate(end_d.year, end_d.month, end_d.day))
-        self.end_edit.setCalendarPopup(True)
-        self.end_edit.setDisplayFormat("yyyy-MM-dd")
+        # 월 단위 선택 — 연도/월 분리 콤보박스 (start = 1일, end = 말일 반환)
+        self.start_edit = _MonthYearPicker(
+            side="start", year=start_d.year, month=start_d.month
+        )
+        self.end_edit = _MonthYearPicker(
+            side="end", year=end_d.year, month=end_d.month
+        )
 
         self.card_combo = QComboBox()
         self.card_combo.addItem("카드번호 전체", "")
@@ -967,7 +1067,11 @@ class CardUsageTab(QWidget):
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setTabKeyNavigation(False)
         self.table.installEventFilter(self)
-        self.table.setAlternatingRowColors(True)
+        # alternating row colors 는 per-item setBackground (검토 완료 녹색)을 덮어쓸 수 있어 비활성화
+        self.table.setAlternatingRowColors(False)
+        # QSS 가 item 배경을 무시하는 케이스 대응 — delegate 로 명시적 페인팅
+        self._bg_delegate = _BgPaintingDelegate(self.table)
+        self.table.setItemDelegate(self._bg_delegate)
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
         self.table.setStyleSheet(
@@ -1120,6 +1224,9 @@ class CardUsageTab(QWidget):
         if orders:
             for o in orders:
                 cash_used = int(o.cash_used or 0)
+                # 100원 미만 cash_used 는 과거 파서 false positive — 무시
+                if 0 < cash_used < 100:
+                    cash_used = 0
                 card_amt = o.card_amount if o.card_amount is not None else o.payment_total
                 if card_amt is None or card_amt <= 0:
                     continue
@@ -1362,6 +1469,9 @@ class CardUsageTab(QWidget):
         if key and key in self._reviewed_keys:
             return True
         if usage.reviewed:
+            return True
+        # 메모에 내용이 있으면 자동으로 검토 완료 처리
+        if (usage.memo or "").strip():
             return True
         return False
 
@@ -1846,9 +1956,9 @@ class CardUsageTab(QWidget):
                         (store_item.toolTip() or "") + "\n🚫 제외됨 (집계 안 함) · 우클릭으로 해제"
                     )
 
-                # 검토 완료 시 녹색 배경
+                # 검토 완료 시 연한 녹색 배경
                 if reviewed:
-                    bg = QBrush(QColor("#dcfce7"))
+                    bg = QBrush(QColor("#f0fdf4"))
                     for it in (date_item, cat_item, store_item, amt_item, card_item, coupang_item, memo_item):
                         it.setBackground(bg)
 
@@ -1856,7 +1966,7 @@ class CardUsageTab(QWidget):
                 review_placeholder = QTableWidgetItem("")
                 review_placeholder.setFlags(Qt.ItemIsEnabled)
                 if reviewed:
-                    review_placeholder.setBackground(QBrush(QColor("#dcfce7")))
+                    review_placeholder.setBackground(QBrush(QColor("#f0fdf4")))
 
                 self.table.setItem(r, self.COL_DATE, date_item)
                 self.table.setItem(r, self.COL_CATEGORY, cat_item)
@@ -1936,7 +2046,7 @@ class CardUsageTab(QWidget):
         self._open_match_dialog(usage)
 
     def _on_table_context_menu(self, pos) -> None:
-        """우클릭 → 제외 토글 메뉴."""
+        """우클릭 → 카테고리 변경 / 제외 토글 메뉴."""
         idx = self.table.indexAt(pos)
         if not idx.isValid():
             return
@@ -1944,12 +2054,40 @@ class CardUsageTab(QWidget):
         if row < 0 or row >= len(self._displayed_items):
             return
         usage = self._displayed_items[row]
-        is_excl = self._is_excluded(usage)
+        cur_code = self._categories_index.get(usage.use_key or usage.id or "", "OTHER")
         menu = QMenu(self.table)
+        # 카테고리 변경 (서브메뉴)
+        cat_menu = menu.addMenu("🏷 카테고리 변경")
+        for meta in DEFAULT_CATEGORIES:
+            label = f"{meta.emoji} {meta.label}"
+            if meta.code == cur_code:
+                label = f"● {label}"
+            a = cat_menu.addAction(label)
+            a.triggered.connect(
+                lambda _checked=False, u=usage, code=meta.code: self._change_category(u, code)
+            )
+        menu.addSeparator()
+        # 제외 토글
+        is_excl = self._is_excluded(usage)
         action_text = "✓ 제외 해제" if is_excl else "🚫 제외하기 (집계 제외)"
         act = menu.addAction(action_text)
         act.triggered.connect(lambda _checked=False, u=usage: self._toggle_excluded(u))
         menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _change_category(self, usage: CardUsage, new_code: str) -> None:
+        key = usage.use_key or usage.id or ""
+        if not key:
+            return
+        cur = self._categories_index.get(key, "OTHER")
+        if cur == new_code:
+            return
+        self._categories_index[key] = new_code
+        usage.category = new_code
+        self._save_usage_change(usage, category=new_code)
+        # 집계/카테고리 칩/리스트 모두 갱신
+        self._render_list()
+        self._refresh_summary_cards()
+        self._refresh_chip_amounts()
 
     def _toggle_excluded(self, usage: CardUsage) -> None:
         new_state = not self._is_excluded(usage)
@@ -2021,6 +2159,7 @@ class CardUsageTab(QWidget):
         *,
         memo: Optional[str] = None,
         reviewed: Optional[bool] = None,
+        category: Optional[str] = None,
     ) -> None:
         """단건 변경을 Pi 에 즉시 저장 (best-effort)."""
         if not self.pi.is_configured:
@@ -2037,6 +2176,8 @@ class CardUsageTab(QWidget):
                     kwargs["memo"] = memo
             if reviewed is not None:
                 kwargs["reviewed"] = bool(reviewed)
+            if category is not None:
+                kwargs["category"] = category
             if not kwargs:
                 return
             self.pi.patch_card_usage(use_key, **kwargs)
@@ -2096,7 +2237,7 @@ class CardUsageTab(QWidget):
             return
 
         reviewed = self._is_reviewed(usage)
-        bg = QBrush(QColor("#dcfce7")) if reviewed else QBrush()
+        bg = QBrush(QColor("#f0fdf4")) if reviewed else QBrush()
 
         # 스크롤/포커스 보존
         sb = self.table.verticalScrollBar()
@@ -2260,6 +2401,37 @@ class CardUsageTab(QWidget):
         # 표시 단계에서 제거.
         return order, dedupe_order_items(items)
 
+    def _period_month_bounds(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        """기간 위젯 기준 (start_year, start_month), (end_year, end_month)."""
+        sd = self.start_edit.date()
+        ed = self.end_edit.date()
+        return (sd.year(), sd.month()), (ed.year(), ed.month())
+
+    def _clamp_cal_view_month(self) -> None:
+        (sy, sm), (ey, em) = self._period_month_bounds()
+        ord_min = sy * 12 + (sm - 1)
+        ord_max = ey * 12 + (em - 1)
+        cur = int(self._cal_view_year) * 12 + (int(self._cal_view_month) - 1)
+        cur = max(ord_min, min(ord_max, cur))
+        self._cal_view_year = cur // 12
+        self._cal_view_month = (cur % 12) + 1
+
+    def _can_shift_cal_view(self, delta: int) -> bool:
+        (sy, sm), (ey, em) = self._period_month_bounds()
+        ord_min = sy * 12 + (sm - 1)
+        ord_max = ey * 12 + (em - 1)
+        cur = int(self._cal_view_year) * 12 + (int(self._cal_view_month) - 1)
+        nxt = cur + delta
+        return ord_min <= nxt <= ord_max
+
+    def _shift_cal_view(self, delta: int) -> None:
+        if not self._can_shift_cal_view(delta):
+            return
+        cur = int(self._cal_view_year) * 12 + (int(self._cal_view_month) - 1) + delta
+        self._cal_view_year = cur // 12
+        self._cal_view_month = (cur % 12) + 1
+        self._render_list()
+
     def _render_calendar(self, items: List[CardUsage]) -> None:
         # 기존 캘린더 클리어
         while self._cal_inner_layout.count():
@@ -2273,9 +2445,13 @@ class CardUsageTab(QWidget):
                 if lay is not None:
                     self._clear_layout(lay)
 
-        # 표시할 월 결정 — start_edit 의 연/월 사용
-        qd = self.start_edit.date()
-        year, month = qd.year(), qd.month()
+        # 표시할 월 결정 — _cal_view_year/month (없으면 start_edit 의 월로 초기화).
+        # 기간 범위 [start_edit, end_edit] 안에서만 이동 가능하도록 클램프.
+        if self._cal_view_year is None or self._cal_view_month is None:
+            sd = self.start_edit.date()
+            self._cal_view_year, self._cal_view_month = sd.year(), sd.month()
+        self._clamp_cal_view_month()
+        year, month = int(self._cal_view_year), int(self._cal_view_month)
         first_weekday, days_in_month = calendar.monthrange(year, month)
         # Python: monday=0 → 우리 캘린더는 일요일 시작이므로 col_offset 계산
         # 일=0, 월=1, ..., 토=6
@@ -2312,11 +2488,34 @@ class CardUsageTab(QWidget):
         )
         self._cal_inner_layout.addWidget(info)
 
+        # 월 네비게이션 (◀ yyyy년 M월 ▶) — period 범위 안에서만 이동
+        nav_row = QHBoxLayout()
+        nav_row.setSpacing(6)
+        prev_btn = QPushButton("◀")
+        next_btn = QPushButton("▶")
+        nav_btn_style = (
+            "QPushButton { background: #ffffff; border: 1px solid #e2e8f0; "
+            "border-radius: 6px; padding: 4px 12px; font-size: 13px; color: #475569; }"
+            "QPushButton:hover { background: #f1f5f9; }"
+            "QPushButton:disabled { color: #cbd5e1; background: #f8fafc; }"
+        )
+        prev_btn.setStyleSheet(nav_btn_style)
+        next_btn.setStyleSheet(nav_btn_style)
+        prev_btn.setCursor(Qt.PointingHandCursor)
+        next_btn.setCursor(Qt.PointingHandCursor)
+        prev_btn.setEnabled(self._can_shift_cal_view(-1))
+        next_btn.setEnabled(self._can_shift_cal_view(+1))
+        prev_btn.clicked.connect(lambda: self._shift_cal_view(-1))
+        next_btn.clicked.connect(lambda: self._shift_cal_view(+1))
         title = QLabel(f"{year}년 {month}월")
         tf = QFont(); tf.setBold(True); tf.setPointSize(13)
         title.setFont(tf)
-        title.setStyleSheet("color: #0f172a; padding: 4px 2px;")
-        self._cal_inner_layout.addWidget(title)
+        title.setStyleSheet("color: #0f172a; padding: 4px 8px;")
+        nav_row.addWidget(prev_btn)
+        nav_row.addWidget(title)
+        nav_row.addWidget(next_btn)
+        nav_row.addStretch(1)
+        self._cal_inner_layout.addLayout(nav_row)
 
         # 그리드
         grid_box = QFrame()
