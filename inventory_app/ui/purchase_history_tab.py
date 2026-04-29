@@ -1014,14 +1014,17 @@ class PurchaseHistoryTab(QWidget):
                 getattr(record, "account_label", None) or "-",
                 record.imported_at.strftime("%Y-%m-%d %H:%M"),
             ]
-            # 일자 컬럼: 쿠팡 + 미취소 건은 30일 반품 게이지 cellWidget 추가
+            # 일자 컬럼: 쿠팡 + 미취소 건은 30일 반품 게이지 cellWidget 추가.
+            # 게이지 위젯은 행마다 QWidget 생성이라 무거움 → 최근 60일까지만 그림.
+            # 그보다 오래된 주문은 반품 기간 만료 확정이라 게이지 의미 없음.
             gauge_widget: Optional[_DateGaugeCell] = None
             if record.channel == "coupang" and not cancelled and record.order_date:
                 try:
                     od = _dt.strptime(record.order_date, "%Y-%m-%d").date()
                     days_passed = (_date.today() - od).days
-                    days_left = _DateGaugeCell.RETURN_DAYS - days_passed
-                    gauge_widget = _DateGaugeCell(record.order_date, days_left)
+                    if days_passed <= 60:
+                        days_left = _DateGaugeCell.RETURN_DAYS - days_passed
+                        gauge_widget = _DateGaugeCell(record.order_date, days_left)
                 except Exception:  # noqa: BLE001
                     gauge_widget = None
             for col_idx, value in enumerate(values):

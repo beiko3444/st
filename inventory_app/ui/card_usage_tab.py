@@ -250,6 +250,66 @@ class _SummaryCard(QFrame):
         self.sub_label.setText(f"· {sub}" if sub else "")
 
 
+class _FlowLayout(QHBoxLayout):
+    """간단 flow 레이아웃 — 가로 공간 부족하면 줄바꿈.
+
+    Qt 표준이 없어 직접 구현. PySide6.QtWidgets.QLayout 을 상속해 heightForWidth 지원.
+    """
+
+    def __init__(self, parent=None, spacing_h: int = 8, spacing_v: int = 8) -> None:
+        super().__init__()
+        # NOTE: QHBoxLayout 을 상속받지만 실제로는 별도 wrap 동작이 필요 — Qt 의
+        # QLayout 직접 상속이 더 정확하지만 PySide6 에서 까다로워 wrapper 위젯으로 구현.
+        # → 아래 _FlowWrap 위젯 사용을 권장.
+        raise NotImplementedError("_FlowLayout placeholder — use _FlowWrap widget")
+
+
+class _FlowWrap(QWidget):
+    """가로 공간이 부족하면 자동으로 줄바꿈하는 컨테이너.
+
+    QLayout 직접 상속 대신 resizeEvent 마다 자식 위젯들의 위치를 재계산.
+    """
+
+    def __init__(self, h_spacing: int = 8, v_spacing: int = 6, parent=None) -> None:
+        super().__init__(parent)
+        self._h_spacing = h_spacing
+        self._v_spacing = v_spacing
+        self._items: list[QWidget] = []
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.MinimumExpanding)
+
+    def add_widget(self, w: QWidget) -> None:
+        w.setParent(self)
+        self._items.append(w)
+        w.show()
+        self._relayout()
+
+    def _relayout(self) -> None:
+        x = 0
+        y = 0
+        line_h = 0
+        max_w = max(0, self.width() - 1)
+        for w in self._items:
+            sh = w.sizeHint()
+            ww = sh.width()
+            wh = sh.height()
+            if x + ww > max_w and x > 0:
+                # 다음 줄로
+                x = 0
+                y += line_h + self._v_spacing
+                line_h = 0
+            w.setGeometry(x, y, ww, wh)
+            x += ww + self._h_spacing
+            if wh > line_h:
+                line_h = wh
+        total_h = y + line_h
+        # 부모에게 적정 높이 전달
+        self.setMinimumHeight(total_h)
+
+    def resizeEvent(self, event):  # type: ignore[override]
+        super().resizeEvent(event)
+        self._relayout()
+
+
 class _CategoryChip(QPushButton):
     """카테고리 칩 (선택 시 체크 상태)."""
 
@@ -788,15 +848,14 @@ class CardUsageTab(QWidget):
         self.status_banner.setVisible(False)
         layout.addWidget(self.status_banner)
 
-        # ===== 카테고리 칩 =====
-        chip_row = QHBoxLayout()
-        chip_row.setSpacing(8)
+        # ===== 카테고리 칩 (가로 공간 부족 시 자동 줄바꿈) =====
         self.category_chips: Dict[str, _CategoryChip] = {}
+        chip_wrap = _FlowWrap(h_spacing=8, v_spacing=6)
         for meta in DEFAULT_CATEGORIES:
             chip = _CategoryChip(meta.code, meta.label, meta.emoji, meta.bg_color)
             chip.clicked.connect(lambda _checked, c=meta.code: self._on_chip_clicked(c))
             self.category_chips[meta.code] = chip
-            chip_row.addWidget(chip)
+            chip_wrap.add_widget(chip)
         self.clear_filter_btn = QPushButton("✕ 필터 해제")
         self.clear_filter_btn.setCursor(Qt.PointingHandCursor)
         self.clear_filter_btn.setStyleSheet(
@@ -805,19 +864,8 @@ class CardUsageTab(QWidget):
             "QPushButton:hover { color: #0f172a; }"
         )
         self.clear_filter_btn.clicked.connect(self._on_clear_filter)
-        chip_row.addWidget(self.clear_filter_btn)
-        chip_row.addStretch(1)
-
-        chip_scroll = QScrollArea()
-        chip_scroll.setWidgetResizable(True)
-        chip_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        chip_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        chip_scroll.setFixedHeight(42)
-        chip_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
-        chip_inner = QWidget()
-        chip_inner.setLayout(chip_row)
-        chip_scroll.setWidget(chip_inner)
-        layout.addWidget(chip_scroll)
+        chip_wrap.add_widget(self.clear_filter_btn)
+        layout.addWidget(chip_wrap)
 
         # ===== 필터 영역 =====
         filter_row = QHBoxLayout()
@@ -1768,13 +1816,14 @@ class CardUsageTab(QWidget):
                 for it in (date_item, cat_item, store_item, amt_item, card_item, coupang_item):
                     it.setFlags(it.flags() & ~Qt.ItemIsEditable)
 
-                # 결제+취소 짝이 맞아 0원 처리된 행: 취소선 + 회색
+                # 결제+취소 짝이 맞아 0원 처리된 행: 취소선 + 회색 (볼드 해제)
                 if offset_canceled:
                     strike_color = QBrush(QColor("#94a3b8"))
                     for it in (date_item, cat_item, store_item, amt_item, card_item, coupang_item, memo_item):
                         it.setForeground(strike_color)
                         sf = QFont(it.font())
                         sf.setStrikeOut(True)
+                        sf.setBold(False)  # 빨간볼드 해제 — 회색 일반 가중치
                         it.setFont(sf)
                     if matched:
                         store_item.setToolTip(
@@ -1783,7 +1832,7 @@ class CardUsageTab(QWidget):
                     else:
                         store_item.setToolTip("결제+취소가 짝지어 0원 처리")
 
-                # 사용자 수동 제외 행: 취소선 + 회색 + tooltip
+                # 사용자 수동 제외 행: 취소선 + 회색 (볼드 해제) + tooltip
                 excluded = self._is_excluded(usage)
                 if excluded:
                     strike_color = QBrush(QColor("#94a3b8"))
@@ -1791,6 +1840,7 @@ class CardUsageTab(QWidget):
                         it.setForeground(strike_color)
                         sf = QFont(it.font())
                         sf.setStrikeOut(True)
+                        sf.setBold(False)
                         it.setFont(sf)
                     store_item.setToolTip(
                         (store_item.toolTip() or "") + "\n🚫 제외됨 (집계 안 함) · 우클릭으로 해제"

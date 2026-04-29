@@ -4269,11 +4269,17 @@ class MainWindow(QMainWindow):
 
     @Slot(bool, int, int, str)
     def _on_purchase_pi_finished(self, ok: bool, rec_n: int, ord_n: int, err: str) -> None:
-        # 구매내역 탭 새로고침
+        # 구매내역 탭 새로고침 — 지연 호출로 UI 블록 완화.
+        # 전체동기화 도중에 여러 콜백이 쌓이면 무거운 reload 가 연속 발생해 UI 가
+        # 멈춰 보이는 현상이 있어, QTimer.singleShot 로 다음 이벤트 루프에 양보.
         try:
-            self.purchase_history_tab.reload()
+            from PySide6.QtCore import QTimer as _QT
+            _QT.singleShot(0, self.purchase_history_tab.reload)
         except Exception:  # noqa: BLE001
-            pass
+            try:
+                self.purchase_history_tab.reload()
+            except Exception:  # noqa: BLE001
+                pass
         self._on_sub_sync_finished("구매내역", ok)
 
     def _on_sub_sync_finished(self, source: str, succeeded: bool) -> None:
