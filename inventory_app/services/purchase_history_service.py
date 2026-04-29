@@ -349,13 +349,21 @@ class PurchaseHistoryStore:
             return 0
         with self._guard, self._connection() as conn:
             before = conn.total_changes
+            # UPSERT: 같은 fingerprint 가 있으면 비어있던 필드(payment_method, account_label,
+            # source_url)만 채우고, 이미 채워진 값은 보존. raw_text/imported_at 은 갱신.
             conn.executemany(
                 """
-                INSERT OR IGNORE INTO purchase_records (
+                INSERT INTO purchase_records (
                     channel, order_date, order_no, title, amount, payment_method,
                     source_url, raw_text, fingerprint, imported_at, account_label
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(fingerprint) DO UPDATE SET
+                    payment_method = COALESCE(excluded.payment_method, purchase_records.payment_method),
+                    account_label  = COALESCE(excluded.account_label,  purchase_records.account_label),
+                    source_url     = COALESCE(excluded.source_url,     purchase_records.source_url),
+                    raw_text       = excluded.raw_text,
+                    imported_at    = excluded.imported_at
                 """,
                 rows,
             )

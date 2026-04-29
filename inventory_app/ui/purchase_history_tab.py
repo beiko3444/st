@@ -324,8 +324,15 @@ class _CrawlerWorker(QObject):
         self._cancelled = True
 
     def run(self) -> None:
+        import sys as _sys
+        def _log(msg):
+            try:
+                print(f"[crawler] {msg}", file=_sys.stderr, flush=True)
+            except Exception:
+                pass
+            self.log.emit(str(msg))
         progress = CrawlerProgress(
-            on_log=lambda msg: self.log.emit(str(msg)),
+            on_log=_log,
             on_login_required=lambda msg: self.login_required.emit(str(msg)),
             cancelled=lambda: self._cancelled,
         )
@@ -470,7 +477,7 @@ class PurchaseHistoryTab(QWidget):
 
         self.crawl_days_spin = QSpinBox()
         self.crawl_days_spin.setRange(1, 730)
-        self.crawl_days_spin.setValue(90)
+        self.crawl_days_spin.setValue(7)
         self.crawl_days_spin.setSuffix("\uc77c")
         self.crawl_days_spin.setToolTip("\ucd5c\uadfc N\uc77c \uc774\ub0b4\uc758 \uc8fc\ubb38\ub9cc \uc218\uc9d1. \ucef7\uc624\ud504 \ub3c4\ub2ec \uc2dc \uc790\ub3d9 \uc885\ub8cc.")
 
@@ -799,11 +806,60 @@ class PurchaseHistoryTab(QWidget):
     def _render(self, rows: List[PurchaseRecord]) -> None:
         self.table.setSortingEnabled(False)
         self.table.setAlternatingRowColors(False)
-        self.table.setRowCount(len(rows))
         red_brush = QBrush(QColor("#dc2626"))
         gray_brush = QBrush(QColor("#9ca3af"))
-        # \uc8fc\ubb38\ubc88\ud638 \uae30\uc900 \uc9c0\ube0c\ub77c: \uc8fc\ubb38\ubc88\ud638\uac00 \ubc14\ub014 \ub54c\ub9c8\ub2e4 \uc0c9 \ud1a0\uae00
         zebra_brushes = [QBrush(QColor("#ffffff")), QBrush(QColor("#eef2f7"))]
+
+        # 쿠팡캐시 차감을 별도 합계 행이 아니라 "품목"으로 한 줄 추가.
+        # 같은 order_no 의 마지막 아이템 뒤에 [쿠팡캐시 차감] 음수 행 삽입.
+        order_meta: dict[str, "PurchaseOrder"] = {}
+        try:
+            for o in self.store.load_orders(channel="all", limit=20000):
+                if o.order_no:
+                    order_meta[o.order_no] = o
+        except Exception:  # noqa: BLE001
+            pass
+
+        from collections import OrderedDict
+        groups: "OrderedDict[str, list[PurchaseRecord]]" = OrderedDict()
+        for r in rows:
+            key = (r.order_no or "").strip() or f"__none_{id(r)}"
+            groups.setdefault(key, []).append(r)
+
+        enriched: List[PurchaseRecord] = []
+        for key, items in groups.items():
+            enriched.extend(items)
+            order_no = (items[0].order_no or "").strip() if items else ""
+            if not order_no:
+                continue
+            ord_obj = order_meta.get(order_no)
+            if ord_obj is None:
+                continue
+            cash = int(getattr(ord_obj, "cash_used", None) or 0)
+            if cash <= 0:
+                continue
+            base = items[-1]
+            cash_record = PurchaseRecord(
+                id=None,
+                channel=base.channel,
+                order_date=base.order_date,
+                order_no=base.order_no,
+                title="[쿠팡캐시 차감]",
+                amount=-cash,
+                payment_method=base.payment_method,
+                source_url=base.source_url,
+                raw_text="cash_deduction",
+                imported_at=base.imported_at,
+            )
+            try:
+                cash_record.account_label = getattr(base, "account_label", None)
+            except Exception:  # noqa: BLE001
+                pass
+            enriched.append(cash_record)
+
+        rows = enriched
+        self.table.setRowCount(len(rows))
+
         zebra_idx = 0
         prev_order_no: Optional[str] = None
         for row_idx, record in enumerate(rows):
@@ -856,7 +912,8 @@ class PurchaseHistoryTab(QWidget):
                         item.setToolTip(record.raw_text[:1000] if record.raw_text else "")
                 self.table.setItem(row_idx, col_idx, item)
         self.table.resizeColumnsToContents()
-        self.table.setSortingEnabled(True)
+        # 합계 행이 정렬에 섞이지 않도록 사용자 정렬 비활성화
+        self.table.setSortingEnabled(False)
 
     # ---------- 쿠팡 다중 계정 ----------
 
@@ -983,8 +1040,9 @@ class PurchaseHistoryTab(QWidget):
             return
         thread = QThread(self)
         days = int(self.crawl_days_spin.value())
-        # 페이지당 약 10개 가정 → 일수/3 + 여유. 컷오프 도달 시 조기 종료.
-        max_pages = max(10, (days // 3) + 5)
+        # 쿠팡은 페이지당 ~5건. 컷오프(날짜) 도달 시 조기 종료되므로 상한은 넉넉히.
+        # 30일에 하루 3주문 = ~90개 → 18페이지 + 버퍼.
+        max_pages = max(30, days + 10)
         worker = _CrawlerWorker(
             channel,
             headless=False,

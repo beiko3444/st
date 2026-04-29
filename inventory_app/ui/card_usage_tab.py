@@ -1555,9 +1555,37 @@ class CardUsageTab(QWidget):
     COL_REVIEW = 5
     COL_MEMO = 6
 
+    def _find_offsetting_pairs(self, items: List[CardUsage]) -> set:
+        """양수 결제 + 같은 가맹점·같은 금액 음수 취소가 정확히 짝을 이루는 행 식별.
+
+        반환: 짝이 맞춰진 row 의 (use_key/id) set — 양쪽 모두 포함.
+        """
+        # (store, abs_amount) → (positives, negatives)
+        idx: dict = {}
+        for it in items:
+            store = (it.store_name or "").strip()
+            amt = int(it.amount or 0)
+            if amt == 0 or not store:
+                continue
+            key = (store, abs(amt))
+            slot = idx.setdefault(key, ([], []))
+            (slot[0] if amt > 0 else slot[1]).append(it)
+        offset_keys: set[str] = set()
+        for key, (pos, neg) in idx.items():
+            n = min(len(pos), len(neg))
+            for i in range(n):
+                p_key = pos[i].use_key or pos[i].id or ""
+                n_key = neg[i].use_key or neg[i].id or ""
+                if p_key:
+                    offset_keys.add(p_key)
+                if n_key:
+                    offset_keys.add(n_key)
+        return offset_keys
+
     def _render_table(self, items: List[CardUsage]) -> None:
         self._suspend_memo_signal = True
         try:
+            offset_keys = self._find_offsetting_pairs(items)
             self.table.setRowCount(0)
             self.table.setRowCount(len(items))
             for r, usage in enumerate(items):
@@ -1567,6 +1595,7 @@ class CardUsageTab(QWidget):
                 cancelled = amount_int < 0
                 reviewed = self._is_reviewed(usage)
                 matched = bool(getattr(usage, "coupang_purchase_id", None))
+                offset_canceled = (usage.use_key or usage.id or "") in offset_keys
 
                 # 날짜
                 date_item = QTableWidgetItem(_format_used_at_short(usage.used_at))
@@ -1600,6 +1629,21 @@ class CardUsageTab(QWidget):
                 # 비메모 셀은 편집 불가
                 for it in (date_item, cat_item, store_item, amt_item, card_item):
                     it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+
+                # 결제+취소 짝이 맞아 0원 처리된 행: 취소선 + 회색
+                if offset_canceled:
+                    strike_color = QBrush(QColor("#94a3b8"))
+                    for it in (date_item, cat_item, store_item, amt_item, card_item, memo_item):
+                        it.setForeground(strike_color)
+                        sf = QFont(it.font())
+                        sf.setStrikeOut(True)
+                        it.setFont(sf)
+                    if matched:
+                        store_item.setToolTip(
+                            (store_item.toolTip() or "") + "\n(결제+취소가 짝지어 0원 처리)"
+                        )
+                    else:
+                        store_item.setToolTip("결제+취소가 짝지어 0원 처리")
 
                 # 검토 완료 시 녹색 배경
                 if reviewed:

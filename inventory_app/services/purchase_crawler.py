@@ -862,57 +862,90 @@ def _crawl_coupang_via_cdp(
             # href 를 못 가져옴. 따라서 우리가 직접 source_url(`?orderId=...`)을 사용한다.
             # 일부 orderId 는 "주문정보가 존재하지 않습니다" 팝업이 뜨므로, 디테일 크롤러가
             # 그 팝업을 자동으로 닫고 해당 주문은 건너뛴다.
-            need_detail = [
-                o for o in orders
-                if o.source_url and (o.payment_method is None or o.cash_used in (None, 0))
-            ][:30]
-            if need_detail:
-                progress.on_log(
-                    f"디테일 보충 {len(need_detail)}개 조회 시작 (백그라운드 탭, 에러 팝업 자동 처리)..."
-                )
-                detail_page = None
-                try:
-                    detail_page = ctx.new_page()
-                except Exception as exc:  # noqa: BLE001
-                    progress.on_log(f"  보충용 탭 생성 실패: {exc}. 보충 패스 생략.")
-                if detail_page is not None:
-                    try:
-                        detail_orders = _crawl_coupang_order_details(
-                            detail_page,
-                            [o.source_url for o in need_detail],
-                            progress,
-                            max_details=len(need_detail),
-                        )
-                    finally:
-                        try:
-                            detail_page.close()
-                        except Exception:  # noqa: BLE001
-                            pass
-                    detail_by_no = {o.order_no: o for o in detail_orders if o.order_no}
-                    merged = 0
-                    for o in orders:
-                        d = detail_by_no.get(o.order_no)
-                        if d is None:
-                            continue
-                        if o.payment_method is None and d.payment_method:
-                            o.payment_method = d.payment_method
-                            merged += 1
-                        if (o.cash_used in (None, 0)) and d.cash_used:
-                            o.cash_used = d.cash_used
-                            if o.payment_total is not None:
-                                o.card_amount = max(0, int(o.payment_total) - int(d.cash_used))
-                            merged += 1
+            # 사용자가 설정한 기간(crawl_days)에 해당하는 주문 전체에 대해 디테일 보충.
+            # 안전 상한은 500 (대량 크롤 시 무한 루프 방지). [:30] 캡 제거.
+            # 디테일 보충 패스 전체를 격리된 try/except 로 감쌈 — 여기서 예외 나도
+            # listing 결과(records/orders)는 그대로 살리고 정상 종료로 빠지게.
+            try:
+                need_detail = [
+                    o for o in orders
+                    if o.source_url and (o.payment_method is None or o.cash_used in (None, 0))
+                ][:500]
+                if need_detail:
                     progress.on_log(
-                        f"보충 완료: {merged}개 필드 갱신 (성공 {len(detail_orders)}/{len(need_detail)})"
+                        f"디테일 보충 {len(need_detail)}개 조회 시작 (백그라운드 탭, 에러 팝업 자동 처리)..."
                     )
-                    pm_by_order = {o.order_no: o.payment_method for o in orders if o.payment_method}
-                    for rec in records:
-                        if rec.payment_method is None and rec.order_no in pm_by_order:
-                            rec.payment_method = pm_by_order[rec.order_no]
+                    detail_page = None
+                    try:
+                        detail_page = ctx.new_page()
+                    except Exception as exc:  # noqa: BLE001
+                        progress.on_log(f"  보충용 탭 생성 실패: {exc}. 보충 패스 생략.")
+                    if detail_page is not None:
+                        try:
+                            detail_orders = _crawl_coupang_order_details(
+                                detail_page,
+                                [o.source_url for o in need_detail],
+                                progress,
+                                max_details=len(need_detail),
+                                ctx=ctx,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            progress.on_log(f"  디테일 크롤 도중 예외(무시하고 부분결과 유지): {exc}")
+                            detail_orders = []
+                        finally:
+                            try:
+                                detail_page.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                        detail_by_no = {o.order_no: o for o in detail_orders if o.order_no}
+                        merged = 0
+                        for o in orders:
+                            d = detail_by_no.get(o.order_no)
+                            if d is None:
+                                continue
+                            if o.payment_method is None and d.payment_method:
+                                o.payment_method = d.payment_method
+                                merged += 1
+                            if (o.cash_used in (None, 0)) and d.cash_used:
+                                o.cash_used = d.cash_used
+                                if o.payment_total is not None:
+                                    o.card_amount = max(0, int(o.payment_total) - int(d.cash_used))
+                                merged += 1
+                        progress.on_log(
+                            f"보충 완료: {merged}개 필드 갱신 (성공 {len(detail_orders)}/{len(need_detail)})"
+                        )
+                        pm_by_order = {o.order_no: o.payment_method for o in orders if o.payment_method}
+                        for rec in records:
+                            if rec.payment_method is None and rec.order_no in pm_by_order:
+                                rec.payment_method = pm_by_order[rec.order_no]
+            except Exception as exc:  # noqa: BLE001
+                # 디테일 보충 단계 자체 실패해도 listing 결과는 보존
+                import traceback as _tb
+                progress.on_log(f"디테일 보충 단계 실패(listing 결과는 유지): {exc}")
+                progress.on_log(f"  trace: {_tb.format_exc().splitlines()[-3:]!r}")
 
     except Exception as exc:  # noqa: BLE001
-        progress.on_log(f"오류: {exc}")
-        return CrawlResult(channel="coupang", records=[], error=str(exc))
+        # 디테일 크롤 도중 예외라도 이미 모은 records/orders 는 살려서 반환.
+        partial_records = locals().get("records") or []
+        partial_orders = locals().get("orders") or []
+        import traceback as _tb
+        progress.on_log(
+            f"오류: {exc} (부분 결과 records={len(partial_records)} orders={len(partial_orders)} 보존)"
+        )
+        progress.on_log(f"  trace: {_tb.format_exc().splitlines()[-3:]!r}")
+        if account_label:
+            for r in partial_records:
+                try: r.account_label = account_label
+                except Exception: pass  # noqa: BLE001
+            for o in partial_orders:
+                try: o.account_label = account_label
+                except Exception: pass  # noqa: BLE001
+        return CrawlResult(
+            channel="coupang",
+            records=partial_records,
+            orders=partial_orders,
+            error=f"부분 수집됨 — {exc}",
+        )
     finally:
         # 수집 종료 시 Chrome 창 자동 닫음
         try:
@@ -1178,15 +1211,21 @@ def _parse_coupang_order_detail(text: str) -> dict:
     # 캐시/포인트/적립금 차감 — 키워드별 '최대' 금액 1개씩만 사용해 중복 매칭 방지.
     # (텍스트가 "쿠팡캐시 3,114원" 을 두 번 표시하면 합치면 안 됨 — 같은 한 건이므로 max)
     # 할인금액(쿠폰 외)은 카드 외 차감이 아니라 상품가격 인하라 제외.
-    cash_keywords = ("쿠팡캐시", "쿠페이캐시", "적립금", "포인트", "마일리지", "쿠폰\\s*할인", "즉시\\s*할인")
+    cash_keywords = ("쿠팡캐시", "쿠페이캐시", "적립금", "포인트", "마일리지", r"쿠폰\s*할인", r"즉시\s*할인")
     cash_per_keyword: dict[str, int] = {}
     for kw_pat in cash_keywords:
+        # 키워드 → (선택적 [:\s]) → 선택적 부호 → 금액 → "원"
+        # \s 가 줄바꿈도 포함하므로 멀티라인 본문에서도 매칭됨
+        # 큰 단위 가드: 1억 미만 (총 결제금액 같은 거대 수치 오매칭 방지 — 캐시는 보통 수만~수십만)
         for cm in re.finditer(rf"{kw_pat}\s*[:\s]*[-−]?\s*([0-9][0-9,]+)\s*원", text):
             try:
                 amt = int(cm.group(1).replace(",", ""))
             except ValueError:
                 continue
-            key = re.sub(r"\\s\*", "", kw_pat)
+            if amt > 100_000_000 or amt <= 0:
+                continue
+            # 같은 키워드의 여러 매칭 중 최대값 사용 (중복 표시 방지)
+            key = re.sub(r"\s+", "", kw_pat)
             cash_per_keyword[key] = max(cash_per_keyword.get(key, 0), amt)
     cash_total = sum(cash_per_keyword.values())
     if cash_total > 0:
@@ -1311,7 +1350,8 @@ def _crawl_coupang_order_details(
     detail_urls: List[str],
     progress: CrawlerProgress,
     *,
-    max_details: int = 60,
+    max_details: int = 500,
+    ctx=None,
 ) -> List[PurchaseOrder]:
     """각 주문 상세 페이지를 방문해 order_no + payment_total + payment_method + cash_used 수집.
 
@@ -1321,30 +1361,65 @@ def _crawl_coupang_order_details(
     out: List[PurchaseOrder] = []
     now = datetime.now()
     seen: set[str] = set()
-    # 쿠팡이 띄우는 alert/confirm 다이얼로그 자동 처리 — "주문정보가 존재하지 않습니다" 등
-    try:
-        page.on("dialog", lambda d: d.dismiss())
-    except Exception:  # noqa: BLE001
-        pass
+
+    def _attach_dialog_handler(p) -> None:
+        # 쿠팡이 띄우는 alert/confirm 다이얼로그 자동 처리 — "주문정보가 존재하지 않습니다" 등
+        try:
+            p.on("dialog", lambda d: d.dismiss())
+        except Exception:  # noqa: BLE001
+            pass
+
+    _attach_dialog_handler(page)
+    total = min(len(detail_urls), max_details)
+    progress.on_log(f"  디테일 루프 진입: 총 {total}건 처리 예정")
     for idx, url in enumerate(detail_urls[:max_details]):
         if progress.cancelled():
+            progress.on_log(f"  사용자 취소 감지 → 디테일 루프 중단 ({idx}/{total})")
             break
         if url in seen:
             continue
         seen.add(url)
+        # 페이지가 닫혔는지 검사 — 닫혔으면 재생성
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-            time.sleep(0.5)
+            is_closed = page.is_closed()
+        except Exception:  # noqa: BLE001
+            is_closed = True
+        if is_closed:
+            if ctx is None:
+                progress.on_log(f"  detail {idx + 1}/{total}: 페이지 종료 감지 + ctx 없음 → 루프 종료")
+                break
             try:
-                page.wait_for_load_state("networkidle", timeout=4_000)
-            except Exception:
-                pass
-            # 페이지에 떠 있는 모달 팝업 자동 닫기 — "주문정보가 존재하지 않습니다" 의 [확인]/[X] 버튼
+                page = ctx.new_page()
+                _attach_dialog_handler(page)
+                progress.on_log(f"  detail {idx + 1}/{total}: 페이지 재생성 OK")
+            except Exception as exc:  # noqa: BLE001
+                progress.on_log(f"  detail {idx + 1}/{total}: 페이지 재생성 실패: {exc} → 루프 종료")
+                break
+        progress.on_log(f"  detail {idx + 1}/{total} 시작: {url[-40:]}")
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+            # 결제 정보 섹션 또는 에러 페이지 텍스트가 나타날 때까지 0.2s 간격 최대 5초 polling
+            # (networkidle 보다 텍스트 기반 조건이 빠르고 안정적)
+            for _ in range(25):  # 25 * 0.2s = 5s
+                try:
+                    has_signal = page.evaluate(
+                        """
+                        () => {
+                            const t = document.body ? document.body.innerText : '';
+                            return /총\\s*결제\\s*금액|결제수단|주문정보가\\s*존재하지/.test(t);
+                        }
+                        """
+                    )
+                except Exception:
+                    has_signal = False
+                if has_signal:
+                    break
+                time.sleep(0.2)
+            # 떠 있는 모달 팝업 자동 닫기
             try:
                 page.evaluate(
                     """
                     () => {
-                        // class 기반 모달 close 버튼들 시도
                         const labels = ['확인', '닫기'];
                         const buttons = Array.from(document.querySelectorAll('button, a'));
                         for (const b of buttons) {
@@ -1369,6 +1444,19 @@ def _crawl_coupang_order_details(
             if "주문정보가 존재하지" in body or "주문 정보가 존재하지" in body:
                 progress.on_log(f"  detail {idx + 1}/{max_details}: 주문정보 없음 페이지 → 스킵")
                 continue
+            # 디버그 덤프: 모든 방문 주문을 저장 (overwrite OK) — 진단/공유용
+            try:
+                # URL 의 orderId 추출 — path 형태(/order/12345) 또는 query 형태(?orderId=12345) 모두 지원
+                m_oid = re.search(r"/order/(\d+)|orderId=(\d+)", url)
+                oid = (m_oid.group(1) or m_oid.group(2)) if m_oid else f"unknown_{idx}"
+                dump_dir = Path.home() / ".smartinventory" / "debug_coupang_detail"
+                dump_dir.mkdir(parents=True, exist_ok=True)
+                (dump_dir / f"{oid}.txt").write_text(
+                    f"URL: {url}\nlen(body)={len(body)}\n--- BODY ---\n{body[:8000]}\n",
+                    encoding="utf-8",
+                )
+            except Exception:  # noqa: BLE001
+                pass
             info = _parse_coupang_order_detail(body)
             # NEXT_DATA 결과를 텍스트 정규식 결과 위에 우선 적용
             if nd_info.get("payment_method") and not info.get("payment_method"):
@@ -1387,8 +1475,8 @@ def _crawl_coupang_order_details(
             if not order_no:
                 # 진단: URL 의 orderId 와 본문 첫 200자 / 에러 키워드 포함 여부
                 import re as _re
-                m = _re.search(r"orderId=(\d+)", url)
-                req_oid = m.group(1) if m else "?"
+                m = _re.search(r"/order/(\d+)|orderId=(\d+)", url)
+                req_oid = (m.group(1) or m.group(2)) if m else "?"
                 snippet = (body or "").replace("\n", " ").strip()[:200]
                 err_flags = []
                 for kw in ("ERR_CODE_SYSTEM_ERROR", "주문정보가 존재하지 않습니다", "주문 정보가 존재하지", "Access Denied", "edgesuite"):
@@ -1520,16 +1608,12 @@ def _navigate_coupang_to_page(page, page_no: int, progress: CrawlerProgress) -> 
             except Exception:
                 pass
             loc.click(timeout=3000)
-            # 다음 페이지 로드 기다림 — URL 변경 또는 networkidle
             try:
-                page.wait_for_load_state("domcontentloaded", timeout=10_000)
+                page.wait_for_load_state("domcontentloaded", timeout=8_000)
             except Exception:
                 pass
-            try:
-                page.wait_for_load_state("networkidle", timeout=4_000)
-            except Exception:
-                pass
-            time.sleep(1.2)
+            # NEXT_DATA 가 SSR HTML 안에 있어 networkidle 대기 불필요. 짧게 안정화만.
+            time.sleep(0.4)
             new_url = ""
             try:
                 new_url = page.url or ""
@@ -1545,8 +1629,8 @@ def _navigate_coupang_to_page(page, page_no: int, progress: CrawlerProgress) -> 
     page_index = max(0, page_no - 1)
     new_url = f"{base}?pageIndex={page_index}"
     try:
-        page.goto(new_url, wait_until="domcontentloaded", timeout=20_000)
-        time.sleep(1.5)
+        page.goto(new_url, wait_until="domcontentloaded", timeout=15_000)
+        time.sleep(0.4)
         progress.on_log(f"  '다음' 버튼 못 찾음 → URL 폴백 pageIndex={page_index} (앱 페이지 {page_no})")
         return True
     except Exception as exc:  # noqa: BLE001
@@ -1624,7 +1708,8 @@ def _extract_coupang_orders_from_next_data(
             item_count=item_count,
             status=status,
             payment_method=None,  # NEXT_DATA 에는 안 들어있음
-            source_url=f"https://mc.coupang.com/ssr/desktop/order/detail?orderId={order_id}",
+            # 실제 쿠팡 주문상세 URL 패턴: /ssr/desktop/order/{orderId} (path 형태)
+            source_url=f"https://mc.coupang.com/ssr/desktop/order/{order_id}",
             raw_text=title[:500],
             imported_at=now,
             cash_used=int(cash_used) if cash_used else None,
