@@ -112,6 +112,8 @@ class _AsyncDispatcher(QObject):
     승격돼 on_done 이 메인 스레드에서 안전하게 실행된다.
     """
 
+    handled = Signal()
+
     def __init__(
         self,
         parent: QObject,
@@ -127,6 +129,8 @@ class _AsyncDispatcher(QObject):
         except Exception as exc:  # noqa: BLE001
             # UI 콜백 자체에서 실수가 나도 앱이 죽지 않게 한다.
             print(f"[fassto async on_done error] {exc}")
+        finally:
+            self.handled.emit()
 
 
 def _run_async(
@@ -136,14 +140,27 @@ def _run_async(
     worker = FasstoJob(func)
     worker.moveToThread(thread)
     dispatcher = _AsyncDispatcher(parent, on_done)
+    active_jobs = getattr(parent, "_fassto_async_jobs", None)
+    if active_jobs is None:
+        active_jobs = []
+        setattr(parent, "_fassto_async_jobs", active_jobs)
+    job_ref = (thread, worker, dispatcher)
+    active_jobs.append(job_ref)
+
+    def cleanup() -> None:
+        try:
+            active_jobs.remove(job_ref)
+        except ValueError:
+            pass
+        dispatcher.deleteLater()
 
     thread.started.connect(worker.run)
     # 명시적 QueuedConnection — 어떤 환경(번들 vs 개발)이든 worker(작업 스레드)
     # 에서 emit 된 신호가 메인 스레드 이벤트 루프에 큐잉되도록 강제.
     worker.finished.connect(dispatcher.handle, Qt.QueuedConnection)
     worker.finished.connect(thread.quit, Qt.QueuedConnection)
-    thread.finished.connect(worker.deleteLater)
-    thread.finished.connect(dispatcher.deleteLater)
+    worker.finished.connect(worker.deleteLater)
+    dispatcher.handled.connect(cleanup)
     thread.finished.connect(thread.deleteLater)
     thread.start()
 
@@ -229,7 +246,7 @@ class _SortableItem(QTableWidgetItem):
                 return float(a) < float(b)
             except (TypeError, ValueError):
                 pass
-        return super().__lt__(other)
+        return self.text() < other.text()
 
 
 def _make_item(value: Any) -> QTableWidgetItem:

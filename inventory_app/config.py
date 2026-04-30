@@ -24,6 +24,7 @@ class AppConfig:
     max_products: int
     # 이하 default 필드들
     monitor_url: str | None = None  # 라즈베리파이 재고 API URL
+    monitor_url_gist: str = ""  # gist raw URL (Pi 재부팅 후 새 tunnel URL 재해상용)
     smartstore_store_url: str = ""  # 예: "https://smartstore.naver.com/baikoapp"
     fassto_api_url: str = "https://fmsapi.fassto.ai"
     fassto_api_cd: str = ""
@@ -53,6 +54,11 @@ def _get_optional(config: Dict[str, Any], default: Any, *keys: str) -> Any:
             return default
         current = current[key]
     return current
+
+
+def resolve_monitor_url_from_gist(gist_raw_url: str, timeout: float = 5.0) -> str | None:
+    """공개 헬퍼 — Pi 재부팅 후 PiDataClient/UI 가 동적으로 URL 재해상."""
+    return _resolve_monitor_url_from_gist(gist_raw_url, timeout)
 
 
 def _resolve_monitor_url_from_gist(gist_raw_url: str, timeout: float = 5.0) -> str | None:
@@ -134,6 +140,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         timeout_seconds=int(_get(raw, "request", "timeout_seconds")),
         max_products=int(_get(raw, "request", "max_products")),
         monitor_url=resolved_monitor_url,
+        monitor_url_gist=gist_raw_url,
         fassto_api_url=str(
             _get_optional(raw, "https://fmsapi.fassto.ai", "fassto", "api_url")
         ),

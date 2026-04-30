@@ -23,10 +23,20 @@ class PiDataError(Exception):
 
 
 class PiDataClient:
-    def __init__(self, base_url: Optional[str], timeout: float = 10.0) -> None:
+    # cloudflared quick tunnel 이 죽었거나 갈렸을 때의 응답 코드들 — gist 재해상 트리거.
+    _TUNNEL_DOWN_STATUS = (502, 503, 504, 530)
+
+    def __init__(
+        self,
+        base_url: Optional[str],
+        timeout: float = 10.0,
+        *,
+        gist_raw_url: str = "",
+    ) -> None:
         self.base_url = (base_url or "").rstrip("/")
         self.timeout = float(timeout)
         self._client: Optional[httpx.Client] = None
+        self._gist_raw_url = (gist_raw_url or "").strip()
 
     @property
     def is_configured(self) -> bool:
@@ -46,6 +56,25 @@ class PiDataClient:
                 pass
             self._client = None
 
+    def _try_refresh_from_gist(self) -> bool:
+        """gist 에서 새 tunnel URL 을 받아 base_url 갱신. 성공 = True."""
+        if not self._gist_raw_url:
+            return False
+        try:
+            from inventory_app.config import resolve_monitor_url_from_gist
+            new_url = resolve_monitor_url_from_gist(self._gist_raw_url, timeout=5.0)
+        except Exception:  # noqa: BLE001
+            return False
+        if not new_url:
+            return False
+        new_url = new_url.rstrip("/")
+        if new_url == self.base_url:
+            return False  # 동일 URL — 갱신 의미 없음
+        self.base_url = new_url
+        # 기존 client 폐기 후 재생성
+        self.close()
+        return True
+
     def _request(
         self,
         method: str,
@@ -56,10 +85,30 @@ class PiDataClient:
     ) -> Dict[str, Any]:
         if not self.is_configured:
             raise PiDataError("Pi monitor_url 미설정")
+
+        def _do_request() -> httpx.Response:
+            return self.client.request(method, path, json=json_body, params=params)
+
+        # 1차 시도
         try:
-            resp = self.client.request(method, path, json=json_body, params=params)
+            resp = _do_request()
         except httpx.HTTPError as exc:
-            raise PiDataError(f"Pi 통신 실패: {exc}") from exc
+            # 연결 자체가 안 됐다 → tunnel down 가능성. gist 재해상 후 재시도.
+            if self._try_refresh_from_gist():
+                try:
+                    resp = _do_request()
+                except httpx.HTTPError as exc2:
+                    raise PiDataError(f"Pi 통신 실패 (tunnel URL 재해상 후도 실패): {exc2}") from exc2
+            else:
+                raise PiDataError(f"Pi 통신 실패: {exc}") from exc
+        else:
+            # tunnel down 응답 코드 → 재해상 + 재시도
+            if resp.status_code in self._TUNNEL_DOWN_STATUS and self._try_refresh_from_gist():
+                try:
+                    resp = _do_request()
+                except httpx.HTTPError as exc:
+                    raise PiDataError(f"Pi 통신 실패 (재해상 후 재시도 중 끊김): {exc}") from exc
+
         try:
             payload = resp.json()
         except ValueError:

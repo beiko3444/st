@@ -287,6 +287,16 @@ class _FlowWrap(QWidget):
         w.show()
         self._relayout()
 
+    def remove_widget(self, w: QWidget) -> None:
+        if w in self._items:
+            self._items.remove(w)
+        try:
+            w.setParent(None)
+            w.deleteLater()
+        except Exception:  # noqa: BLE001
+            pass
+        self._relayout()
+
     def set_order(self, widgets: list[QWidget]) -> None:
         """이미 추가된 위젯들의 표시 순서를 바꾼다."""
         known = [w for w in widgets if w in self._items]
@@ -399,15 +409,63 @@ class _CategoryChip(QPushButton):
         mime = QMimeData()
         mime.setData("application/x-smartinventory-card-category", self.code.encode("utf-8"))
         drag.setMimeData(mime)
-        drag.exec(Qt.MoveAction)
+        # 드래그 중 칩 모양 그대로 보이도록 pixmap 부착 + 그림자 효과
+        try:
+            from PySide6.QtGui import QPixmap as _QPx, QPainter as _QPa
+            from PySide6.QtCore import QSize as _QSize
+            src_pix = self.grab()
+            # 그림자/투명도 효과 — 시각적 드래그 확인용
+            pix = _QPx(src_pix.size())
+            pix.fill(Qt.transparent)
+            painter = _QPa(pix)
+            painter.setOpacity(0.85)
+            painter.drawPixmap(0, 0, src_pix)
+            painter.end()
+            drag.setPixmap(pix)
+            drag.setHotSpot(self._press_pos)
+        except Exception:  # noqa: BLE001
+            drag.setPixmap(self.grab())
+            drag.setHotSpot(self._press_pos or self.rect().center())
+        # 드래그 시작 시 원본 칩을 살짝 흐리게 — 사용자가 "잡혔다" 는 걸 인식
+        try:
+            self.setStyleSheet(self.styleSheet() + "\nQPushButton { color: #94a3b8; }")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            drag.exec(Qt.MoveAction)
+        finally:
+            self._refresh_style()  # 원래 스타일로 복귀
 
     def dragEnterEvent(self, event):  # type: ignore[override]
         if event.mimeData().hasFormat("application/x-smartinventory-card-category"):
+            source = bytes(
+                event.mimeData().data("application/x-smartinventory-card-category")
+            ).decode("utf-8")
+            if source and source != self.code:
+                # 드롭 타겟 강조 — 파란 점선 보더
+                self.setStyleSheet(
+                    f"QPushButton {{ background: #dbeafe; color: #1e40af; "
+                    f"border: 2px dashed #2563eb; "
+                    f"border-radius: 16px; padding: 5px 13px; font-weight: 600; }}"
+                )
+                event.acceptProposedAction()
+                return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):  # type: ignore[override]
+        if event.mimeData().hasFormat("application/x-smartinventory-card-category"):
             event.acceptProposedAction()
-        else:
-            super().dragEnterEvent(event)
+            return
+        super().dragMoveEvent(event)
+
+    def dragLeaveEvent(self, event):  # type: ignore[override]
+        # 강조 해제
+        self._refresh_style()
+        super().dragLeaveEvent(event)
 
     def dropEvent(self, event):  # type: ignore[override]
+        # 강조 해제 (성공/실패 둘 다)
+        self._refresh_style()
         if not event.mimeData().hasFormat("application/x-smartinventory-card-category"):
             super().dropEvent(event)
             return
@@ -430,13 +488,15 @@ _CATEGORY_ICON_CHOICES: list[tuple[str, str]] = [
 
 
 class _CategoryEditDialog(QDialog):
-    """카테고리 표시명/아이콘 편집."""
+    """카테고리 표시명/아이콘 편집 + 삭제."""
 
     def __init__(self, meta: CategoryMeta, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("카테고리 수정")
         self.setMinimumWidth(420)
         self._selected_emoji = meta.emoji
+        self._delete_requested = False
+        self._meta_code = meta.code
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
@@ -488,10 +548,38 @@ class _CategoryEditDialog(QDialog):
         self.icon_list.currentItemChanged.connect(self._on_icon_changed)
         layout.addWidget(self.icon_list)
 
+        # 삭제 버튼 — 좌측, 빨강
+        btn_row = QHBoxLayout()
+        self.delete_btn = QPushButton("🗑 삭제")
+        self.delete_btn.setStyleSheet(
+            "QPushButton { background: #fef2f2; color: #b91c1c; "
+            "border: 1px solid #fecaca; border-radius: 8px; "
+            "padding: 6px 14px; font-weight: 600; }"
+            "QPushButton:hover { background: #fee2e2; }"
+        )
+        self.delete_btn.clicked.connect(self._on_delete_clicked)
+        btn_row.addWidget(self.delete_btn)
+        btn_row.addStretch(1)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        btn_row.addWidget(buttons)
+        layout.addLayout(btn_row)
+
+    def _on_delete_clicked(self) -> None:
+        ans = QMessageBox.question(
+            self, "카테고리 삭제",
+            f"'{self.name_edit.text().strip() or self._meta_code}' 카테고리를 칩 목록에서 제거할까요?\n\n"
+            "이 카테고리에 속해 있던 항목은 모두 '기타' 로 이동합니다.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans == QMessageBox.Yes:
+            self._delete_requested = True
+            self.accept()
+
+    def is_delete_requested(self) -> bool:
+        return self._delete_requested
 
     def _on_icon_changed(self, current: Optional[QListWidgetItem], _previous: Optional[QListWidgetItem]) -> None:
         if current is not None:
@@ -500,6 +588,333 @@ class _CategoryEditDialog(QDialog):
     def values(self) -> tuple[str, str]:
         label = self.name_edit.text().strip()
         return label, self._selected_emoji
+
+
+class _FixedCostsService:
+    """매월 반복되는 고정비 (구독료, 통신비, 임대료 등) 저장/조회.
+
+    저장 위치: ~/.smartinventory/fixed_costs.json
+    각 항목: {id: int, name: str, day_of_month: int (1-31), amount: int, memo: str, active: bool}
+    """
+
+    def __init__(self) -> None:
+        self._items: List[Dict[str, Any]] = []
+        self._load()
+
+    @staticmethod
+    def _path() -> Path:
+        d = Path.home() / ".smartinventory"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / "fixed_costs.json"
+
+    def _load(self) -> None:
+        try:
+            import json as _j
+            p = self._path()
+            if not p.exists():
+                self._items = []
+                return
+            data = _j.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                self._items = [
+                    {
+                        "id": int(x.get("id") or 0),
+                        "name": str(x.get("name") or ""),
+                        "day_of_month": max(1, min(31, int(x.get("day_of_month") or 1))),
+                        "amount": int(x.get("amount") or 0),
+                        "memo": str(x.get("memo") or ""),
+                        "active": bool(x.get("active", True)),
+                    }
+                    for x in data if isinstance(x, dict)
+                ]
+        except Exception:  # noqa: BLE001
+            self._items = []
+
+    def _save(self) -> None:
+        try:
+            import json as _j
+            self._path().write_text(
+                _j.dumps(self._items, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def list_items(self) -> List[Dict[str, Any]]:
+        return [dict(it) for it in self._items]
+
+    def add(self, name: str, day_of_month: int, amount: int, memo: str = "") -> int:
+        new_id = (max((it["id"] for it in self._items), default=0) or 0) + 1
+        self._items.append({
+            "id": new_id,
+            "name": name.strip() or "(이름 없음)",
+            "day_of_month": max(1, min(31, int(day_of_month or 1))),
+            "amount": int(amount or 0),
+            "memo": memo.strip(),
+            "active": True,
+        })
+        self._save()
+        return new_id
+
+    def update(self, item_id: int, **kwargs) -> None:
+        for it in self._items:
+            if it["id"] == item_id:
+                for k, v in kwargs.items():
+                    if k == "day_of_month":
+                        it[k] = max(1, min(31, int(v or 1)))
+                    elif k == "amount":
+                        it[k] = int(v or 0)
+                    elif k == "active":
+                        it[k] = bool(v)
+                    else:
+                        it[k] = str(v or "")
+                self._save()
+                return
+
+    def delete(self, item_id: int) -> None:
+        self._items = [it for it in self._items if it["id"] != item_id]
+        self._save()
+
+    def total_active(self) -> int:
+        return sum(int(it.get("amount") or 0) for it in self._items if it.get("active", True))
+
+
+class _FixedCostsTable(QWidget):
+    """고정비 입력/관리 테이블. changed Signal 으로 합계 재계산 트리거."""
+
+    changed = Signal()
+
+    def __init__(self, service: _FixedCostsService, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._service = service
+        self._suspend = False
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
+
+        # 안내 + 합계
+        head = QHBoxLayout()
+        info = QLabel(
+            "💡 매달 반복되는 고정비를 입력하세요. 일자(매월 며칠)와 금액을 적으면 "
+            "이번 달 총 지출에 자동으로 합산됩니다."
+        )
+        info.setStyleSheet(
+            "QLabel { background: #fef9c3; border: 1px solid #fde68a; border-radius: 6px; "
+            "padding: 6px 10px; color: #854d0e; font-size: 11px; }"
+        )
+        info.setWordWrap(True)
+        head.addWidget(info, 1)
+        v.addLayout(head)
+
+        # 입력 row
+        add_row = QHBoxLayout()
+        add_row.setSpacing(6)
+        self.day_edit = QLineEdit()
+        self.day_edit.setPlaceholderText("일자 (1~31)")
+        self.day_edit.setFixedWidth(90)
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("항목명 (예: 임대료, 인터넷)")
+        self.amount_edit = QLineEdit()
+        self.amount_edit.setPlaceholderText("금액 (원)")
+        self.amount_edit.setFixedWidth(140)
+        self.memo_edit = QLineEdit()
+        self.memo_edit.setPlaceholderText("메모(선택)")
+        self.add_btn = QPushButton("＋ 추가")
+        self.add_btn.setStyleSheet(
+            "QPushButton { background: #0f172a; color: #ffffff; border: none; "
+            "border-radius: 6px; padding: 6px 14px; font-weight: 600; }"
+            "QPushButton:hover { background: #1e293b; }"
+        )
+        self.add_btn.clicked.connect(self._on_add)
+        for w in (self.day_edit, self.name_edit, self.amount_edit, self.memo_edit):
+            w.setStyleSheet(
+                "QLineEdit { border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px 8px; "
+                "background: #ffffff; }"
+                "QLineEdit:focus { border-color: #0f172a; }"
+            )
+        # Enter 로도 추가
+        self.amount_edit.returnPressed.connect(self._on_add)
+        self.memo_edit.returnPressed.connect(self._on_add)
+        add_row.addWidget(self.day_edit)
+        add_row.addWidget(self.name_edit, 2)
+        add_row.addWidget(self.amount_edit)
+        add_row.addWidget(self.memo_edit, 2)
+        add_row.addWidget(self.add_btn)
+        v.addLayout(add_row)
+
+        # 테이블
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["사용", "일자", "항목명", "금액", "메모", "삭제"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.setStyleSheet(
+            "QTableWidget { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px;"
+            " gridline-color: #eef2f7; outline: 0; }"
+            "QHeaderView::section { background: #f8fafc; border: none;"
+            " border-right: 1px solid #eef2f7;"
+            " border-bottom: 1px solid #e2e8f0; padding: 8px; font-weight: 600; color: #475569; }"
+            "QTableWidget::item { padding: 6px 8px; border: none;"
+            " border-right: 1px solid #f1f5f9; }"
+        )
+        h = self.table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(2, QHeaderView.Stretch)
+        h.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(4, QHeaderView.Stretch)
+        h.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.table.cellChanged.connect(self._on_cell_changed)
+        v.addWidget(self.table, 1)
+
+        self._render()
+
+    def _on_add(self) -> None:
+        try:
+            day = int(self.day_edit.text().strip() or "0")
+        except ValueError:
+            day = 0
+        if day < 1 or day > 31:
+            QMessageBox.warning(self, "일자 오류", "일자는 1~31 사이의 숫자여야 합니다.")
+            return
+        name = self.name_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "항목명 필요", "항목명을 입력하세요.")
+            return
+        try:
+            amount = int(self.amount_edit.text().strip().replace(",", "") or "0")
+        except ValueError:
+            QMessageBox.warning(self, "금액 오류", "금액은 숫자로 입력하세요.")
+            return
+        if amount <= 0:
+            QMessageBox.warning(self, "금액 오류", "금액은 0원보다 커야 합니다.")
+            return
+        memo = self.memo_edit.text().strip()
+        self._service.add(name, day, amount, memo)
+        self.day_edit.clear()
+        self.name_edit.clear()
+        self.amount_edit.clear()
+        self.memo_edit.clear()
+        self._render()
+        self.changed.emit()
+        self.day_edit.setFocus()
+
+    def _render(self) -> None:
+        self._suspend = True
+        try:
+            items = self._service.list_items()
+            items.sort(key=lambda x: (x.get("day_of_month") or 0, x.get("name") or ""))
+            self.table.setRowCount(len(items))
+            for r, it in enumerate(items):
+                # 사용 체크박스
+                chk = QCheckBox()
+                chk.setChecked(bool(it.get("active", True)))
+                chk.toggled.connect(
+                    lambda checked, iid=it["id"]: self._on_active_toggled(iid, checked)
+                )
+                wrap = QWidget()
+                wlay = QHBoxLayout(wrap)
+                wlay.setContentsMargins(0, 0, 0, 0)
+                wlay.setAlignment(Qt.AlignCenter)
+                wlay.addWidget(chk)
+                self.table.setCellWidget(r, 0, wrap)
+
+                # 일자
+                day_item = QTableWidgetItem(str(it.get("day_of_month") or ""))
+                day_item.setTextAlignment(Qt.AlignCenter)
+                day_item.setData(Qt.UserRole, it["id"])
+                self.table.setItem(r, 1, day_item)
+
+                # 항목명
+                name_item = QTableWidgetItem(str(it.get("name") or ""))
+                name_item.setData(Qt.UserRole, it["id"])
+                self.table.setItem(r, 2, name_item)
+
+                # 금액
+                amt_item = QTableWidgetItem(f"{int(it.get('amount') or 0):,}")
+                amt_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                af = QFont(); af.setBold(True); amt_item.setFont(af)
+                amt_item.setData(Qt.UserRole, it["id"])
+                self.table.setItem(r, 3, amt_item)
+
+                # 메모
+                memo_item = QTableWidgetItem(str(it.get("memo") or ""))
+                memo_item.setData(Qt.UserRole, it["id"])
+                self.table.setItem(r, 4, memo_item)
+
+                # 삭제 버튼
+                del_btn = QPushButton("🗑")
+                del_btn.setCursor(Qt.PointingHandCursor)
+                del_btn.setStyleSheet(
+                    "QPushButton { background: #fef2f2; color: #b91c1c; "
+                    "border: 1px solid #fecaca; border-radius: 6px; "
+                    "padding: 2px 8px; font-weight: 600; }"
+                    "QPushButton:hover { background: #fee2e2; }"
+                )
+                del_btn.clicked.connect(
+                    lambda _ck=False, iid=it["id"]: self._on_delete(iid)
+                )
+                wrap2 = QWidget()
+                wlay2 = QHBoxLayout(wrap2)
+                wlay2.setContentsMargins(2, 0, 2, 0)
+                wlay2.addWidget(del_btn)
+                self.table.setCellWidget(r, 5, wrap2)
+                self.table.setRowHeight(r, 30)
+        finally:
+            self._suspend = False
+
+    def _on_active_toggled(self, item_id: int, checked: bool) -> None:
+        self._service.update(item_id, active=bool(checked))
+        self.changed.emit()
+
+    def _on_delete(self, item_id: int) -> None:
+        ans = QMessageBox.question(
+            self, "고정비 삭제", "이 고정비 항목을 삭제할까요?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+        self._service.delete(item_id)
+        self._render()
+        self.changed.emit()
+
+    def _on_cell_changed(self, row: int, col: int) -> None:
+        if self._suspend:
+            return
+        if col not in (1, 2, 3, 4):
+            return
+        item = self.table.item(row, col)
+        if item is None:
+            return
+        item_id = item.data(Qt.UserRole)
+        if item_id is None:
+            return
+        new_text = item.text().strip()
+        try:
+            if col == 1:
+                day = int(new_text or "0")
+                if day < 1 or day > 31:
+                    raise ValueError("1~31")
+                self._service.update(item_id, day_of_month=day)
+            elif col == 2:
+                self._service.update(item_id, name=new_text)
+            elif col == 3:
+                amt = int(new_text.replace(",", "") or "0")
+                if amt < 0:
+                    raise ValueError("음수 불가")
+                self._service.update(item_id, amount=amt)
+            elif col == 4:
+                self._service.update(item_id, memo=new_text)
+        except Exception:  # noqa: BLE001
+            QMessageBox.warning(self, "값 오류", "유효하지 않은 값입니다.")
+            self._render()
+            return
+        self._render()
+        self.changed.emit()
 
 
 class _UsageRow(QFrame):
@@ -1066,7 +1481,10 @@ class CardUsageTab(QWidget):
         self._cal_view_year: Optional[int] = None
         self._cal_view_month: Optional[int] = None
         # Pi 데이터 API: 카드내역과 구매내역 모두 라즈베리에 저장
-        self.pi = PiDataClient(getattr(config, "monitor_url", None))
+        self.pi = PiDataClient(
+            getattr(config, "monitor_url", None),
+            gist_raw_url=getattr(config, "monitor_url_gist", "") or "",
+        )
         self._category_customizations: Dict[str, Dict[str, str]] = self._load_category_customizations()
         self._category_order: List[str] = self._load_category_order()
         self._category_shortcuts: List[QShortcut] = []
@@ -1113,13 +1531,18 @@ class CardUsageTab(QWidget):
 
         layout.addLayout(header)
 
+        # ===== 고정비 서비스 (요약카드 합계 계산에 필요해 미리 생성) =====
+        self._fixed_service = _FixedCostsService()
+
         # ===== 통계 카드 =====
         cards_row = QHBoxLayout()
         cards_row.setSpacing(8)
         self.card_total = _SummaryCard("이번 달 총 지출")
         self.card_count = _SummaryCard("거래 건수")
         self.card_avg = _SummaryCard("일평균 지출")
-        for c in (self.card_total, self.card_count, self.card_avg):
+        # 손익분기 매출 — 마진율 40% 가정. (총지출 + 고정비) / 0.4
+        self.card_breakeven = _SummaryCard("손익분기 매출 (마진 40%)")
+        for c in (self.card_total, self.card_count, self.card_avg, self.card_breakeven):
             c.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
             c.setFixedHeight(40)
             cards_row.addWidget(c, 1)
@@ -1217,7 +1640,7 @@ class CardUsageTab(QWidget):
         vg_layout = QHBoxLayout(view_group)
         vg_layout.setContentsMargins(2, 2, 2, 2)
         vg_layout.setSpacing(0)
-        for code, label in (("table", "테이블"), ("calendar", "캘린더")):
+        for code, label in (("table", "테이블"), ("calendar", "캘린더"), ("fixed", "고정비")):
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setCursor(Qt.PointingHandCursor)
@@ -1319,10 +1742,15 @@ class CardUsageTab(QWidget):
         self._cal_inner_layout.setContentsMargins(8, 8, 8, 8)
         self._cal_inner_layout.setSpacing(8)
         cal_scroll.setWidget(self._cal_inner)
-        self.body_stack.addWidget(cal_scroll)  # idx 2 = calendar
+        self.body_stack.addWidget(cal_scroll)  # idx 1 = calendar
+
+        # --- 고정비 뷰 ---
+        self.fixed_view = _FixedCostsTable(self._fixed_service)
+        self.fixed_view.changed.connect(self._on_fixed_costs_changed)
+        self.body_stack.addWidget(self.fixed_view)  # idx 2 = fixed
 
         # 초기 페이지: 테이블
-        _initial_idx = {"table": 0, "calendar": 1}.get(self._view_mode, 0)
+        _initial_idx = {"table": 0, "calendar": 1, "fixed": 2}.get(self._view_mode, 0)
         self.body_stack.setCurrentIndex(_initial_idx)
         layout.addWidget(self.body_stack, 1)
 
@@ -1522,6 +1950,10 @@ class CardUsageTab(QWidget):
         dialog = _CategoryEditDialog(meta, self)
         if dialog.exec() != QDialog.Accepted:
             return
+        # 삭제 요청 처리
+        if dialog.is_delete_requested():
+            self._delete_category(code)
+            return
         label, emoji = dialog.values()
         if not label:
             QMessageBox.warning(self, "카테고리명 필요", "카테고리명을 입력하세요.")
@@ -1543,6 +1975,49 @@ class CardUsageTab(QWidget):
         self.status_banner.setStyleSheet(
             "QLabel { background: #ecfdf5; border: 1px solid #bbf7d0; border-radius: 6px; "
             "padding: 6px 10px; color: #047857; font-size: 11px; }"
+        )
+        self.status_banner.setVisible(True)
+
+    def _delete_category(self, code: str) -> None:
+        """카테고리를 칩 목록에서 제거 + 해당 카테고리의 항목을 'OTHER' 로 재할당."""
+        if code == "OTHER":
+            QMessageBox.information(self, "삭제 불가", "기타(OTHER) 카테고리는 삭제할 수 없습니다.")
+            return
+        # 1) 순서 목록에서 제거
+        if code in self._category_order:
+            self._category_order = [c for c in self._category_order if c != code]
+            self._save_category_order()
+        # 2) 커스텀(이름/아이콘) 정리
+        self._category_customizations.pop(code, None)
+        self._save_category_customizations()
+        # 3) 해당 카테고리의 in-memory 항목들 OTHER 로 이동 + Pi 동기화
+        affected_keys = [k for k, v in self._categories_index.items() if v == code]
+        for k in affected_keys:
+            self._categories_index[k] = "OTHER"
+        # in-memory CardUsage 객체도 동기화 + Pi 저장
+        for it in self._all_items:
+            ukey = it.use_key or it.id or ""
+            if ukey in affected_keys:
+                it.category = "OTHER"
+                self._save_usage_change(it, category="OTHER")
+        # 4) UI 칩 위젯 제거 (기존 위젯이 떠있어서 즉시 사라지게)
+        chip = self.category_chips.pop(code, None)
+        if chip is not None:
+            try:
+                self.category_chip_wrap.remove_widget(chip)
+            except Exception:  # noqa: BLE001
+                chip.setParent(None)
+                chip.deleteLater()
+        self._install_category_shortcuts()
+        self._refresh_chip_amounts()
+        self._render_list()
+        self._refresh_summary_cards()
+        self.status_banner.setText(
+            f"🗑 '{code}' 카테고리를 제거했습니다 — {len(affected_keys)}건이 '기타' 로 이동"
+        )
+        self.status_banner.setStyleSheet(
+            "QLabel { background: #fef9c3; border: 1px solid #fde68a; border-radius: 6px; "
+            "padding: 6px 10px; color: #854d0e; font-size: 11px; }"
         )
         self.status_banner.setVisible(True)
 
@@ -1799,18 +2274,26 @@ class CardUsageTab(QWidget):
     # ----- 뷰 모드 / 리뷰 모드 -----
 
     def _on_view_mode(self, code: str) -> None:
-        if code not in ("table", "calendar"):
+        if code not in ("table", "calendar", "fixed"):
             return
         self._view_mode = code
         for c, btn in self._view_btns.items():
             btn.setChecked(c == code)
         self._refresh_view_mode_styles()
-        idx = {"table": 0, "calendar": 1}[code]
+        idx = {"table": 0, "calendar": 1, "fixed": 2}[code]
         self.body_stack.setCurrentIndex(idx)
         # 캘린더 모드로 돌아가면 점프 필터 해제 (전체 재표시)
         if code == "calendar":
             self._jump_to_date = None
-        self._render_list()
+        if code != "fixed":
+            self._render_list()
+
+    def _on_fixed_costs_changed(self) -> None:
+        """고정비 추가/수정/삭제 → 요약카드 즉시 재계산."""
+        try:
+            self._refresh_summary_cards()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _on_calendar_day_clicked(self, year: int, month: int, day: int) -> None:
         """캘린더 셀 클릭 → 테이블 뷰로 전환 + 해당 일자만 표시."""
@@ -2150,15 +2633,18 @@ class CardUsageTab(QWidget):
             d = _parse_used_at(it.used_at)
             if d and d.date() >= first and d.date() <= today:
                 month_items.append(it)
-        total = sum(int(it.amount or 0) for it in month_items)
         # 음수(취소) 차감 이미 들어있음 (final amount 가 음수)
         positive_total = sum(int(it.amount or 0) for it in month_items if (it.amount or 0) > 0)
         cancel_total = abs(sum(int(it.amount or 0) for it in month_items if (it.amount or 0) < 0))
-        net = positive_total - cancel_total
+        variable = positive_total - cancel_total
 
+        # 고정비 합계 (활성 항목만, 매월 동일)
+        fixed = self._fixed_service.total_active() if hasattr(self, "_fixed_service") else 0
+
+        net = variable + fixed
         self.card_total.set_value(
             f"{net:,}원",
-            f"{first.strftime('%Y. %m. %d')} ─ {today.strftime('%m. %d')}",
+            f"지출 {variable:,} · 고정비 {fixed:,} · {first.strftime('%m.%d')}~{today.strftime('%m.%d')}",
         )
 
         confirmed = sum(1 for it in month_items if (it.amount or 0) != 0)
@@ -2170,7 +2656,27 @@ class CardUsageTab(QWidget):
 
         days_passed = max(1, (today - first).days + 1)
         avg = net // days_passed
-        self.card_avg.set_value(f"{avg:,}원", f"{days_passed}일 기준")
+        self.card_avg.set_value(f"{avg:,}원", f"{days_passed}일 기준 (고정비 포함)")
+
+        # 손익분기 매출 — 마진율 40% 기준: net = 0.4 × 매출 → 매출 = net / 0.4
+        margin = 0.40
+        if net > 0:
+            be = int(net / margin)
+            # 이달 일수 기준 일매출 (해당 월 전체 일수, days_passed 가 아니라 월 전체)
+            import calendar as _cal
+            days_in_month = _cal.monthrange(today.year, today.month)[1]
+            daily_be = be // days_in_month
+            be_man = be // 10000
+            be_remain = be % 10000
+            be_human = (
+                f"{be_man:,}만 {be_remain:,}원" if be_remain else f"{be_man:,}만원"
+            ) if be_man else f"{be:,}원"
+            self.card_breakeven.set_value(
+                f"{be:,}원",
+                f"마진 40% · 일매출 {daily_be:,}원/{days_in_month}일 ({be_human})",
+            )
+        else:
+            self.card_breakeven.set_value("-", "지출 없음")
 
     def _refresh_chip_amounts(self) -> None:
         sums: Dict[str, int] = {}

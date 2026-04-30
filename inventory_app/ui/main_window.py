@@ -3860,7 +3860,10 @@ class MainWindow(QMainWindow):
             fetch_fn=self.keyword_service.fetch,
             default_days=sales_days,
         )
-        self.purchase_history_tab = PurchaseHistoryTab(monitor_url=config.monitor_url)
+        self.purchase_history_tab = PurchaseHistoryTab(
+            monitor_url=config.monitor_url,
+            monitor_url_gist=getattr(config, "monitor_url_gist", "") or "",
+        )
         self.card_usage_tab = CardUsageTab(config)
         self.fassto_tab = FasstoTab(config)
 
@@ -4176,10 +4179,42 @@ class MainWindow(QMainWindow):
     def _check_pi_status(self) -> None:
         import httpx as _httpx
         url = self.config.monitor_url
-        if not url:
+        gist = getattr(self.config, "monitor_url_gist", "") or ""
+        if not url and not gist:
             return
+
+        def _try(url_in: str):
+            return _httpx.get(f"{url_in.rstrip('/')}/status", timeout=8)
+
         try:
-            resp = _httpx.get(f"{url.rstrip('/')}/status", timeout=8)
+            resp = None
+            try:
+                if url:
+                    resp = _try(url)
+            except _httpx.HTTPError:
+                resp = None
+            tunnel_down = (
+                resp is None
+                or resp.status_code in (502, 503, 504, 530)
+            )
+            if tunnel_down and gist:
+                # gist 에서 새 URL 받아서 재시도
+                try:
+                    from inventory_app.config import resolve_monitor_url_from_gist
+                    new_url = resolve_monitor_url_from_gist(gist, timeout=5.0)
+                except Exception:  # noqa: BLE001
+                    new_url = None
+                if new_url and new_url != url:
+                    self.config.monitor_url = new_url
+                    url = new_url
+                    # 자식 탭들의 PiDataClient 도 함께 갱신
+                    self._propagate_new_monitor_url(new_url)
+                    try:
+                        resp = _try(new_url)
+                    except _httpx.HTTPError:
+                        resp = None
+            if resp is None:
+                raise RuntimeError("Pi 응답 없음 (tunnel 다운/네트워크)")
             resp.raise_for_status()
             data = resp.json()
             naver_ts = data.get("naver_last_updated") or "-"
@@ -4205,6 +4240,34 @@ class MainWindow(QMainWindow):
         except Exception as e:
             msg = f"❌ 연결 실패\n\n{e}"
         QMessageBox.information(self, "📡 라즈베리파이 상태", msg)
+
+    def _propagate_new_monitor_url(self, new_url: str) -> None:
+        """gist 재해상으로 받은 새 tunnel URL 을 모든 자식 PiDataClient 에 전파."""
+        new_url = (new_url or "").rstrip("/")
+        targets = []
+        try:
+            targets.append(self.purchase_history_tab._pi_client)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            targets.append(self.purchase_history_tab.store._pi)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            targets.append(self.card_usage_tab.pi)
+        except Exception:  # noqa: BLE001
+            pass
+        for cli in targets:
+            if cli is None:
+                continue
+            try:
+                cli.close()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                cli.base_url = new_url
+            except Exception:  # noqa: BLE001
+                pass
 
     def sync_now(self) -> None:
         started_sources: set[str] = set()

@@ -456,14 +456,19 @@ class PurchaseHistoryTab(QWidget):
         "\ubc18\ud488",
     )
 
-    def __init__(self, monitor_url: str | None = None) -> None:
+    def __init__(
+        self,
+        monitor_url: str | None = None,
+        *,
+        monitor_url_gist: str = "",
+    ) -> None:
         super().__init__()
         # Pi write-through: monitor_url 이 있으면 라즈베리에 동기화
         pi_client = None
         if monitor_url:
             try:
                 from inventory_app.services.pi_data_client import PiDataClient
-                pi_client = PiDataClient(monitor_url)
+                pi_client = PiDataClient(monitor_url, gist_raw_url=monitor_url_gist or "")
             except Exception:  # noqa: BLE001
                 pi_client = None
         self._pi_client = pi_client
