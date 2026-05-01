@@ -17,9 +17,10 @@
 from __future__ import annotations
 
 import csv
+import json
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QDate, QObject, QThread, Qt, Signal, Slot
 from PySide6.QtGui import QColor
@@ -28,6 +29,8 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDateEdit,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -51,10 +54,12 @@ from inventory_app.config import AppConfig
 from inventory_app.connectors.fassto import (
     FasstoApiError,
     FasstoConnector,
+    FasstoDeliveryRow,
     FasstoDeliveryGoodDetailRow,
     FasstoGoodsElementRow,
     FasstoGoodsRow,
     FasstoStockRow,
+    FasstoWarehousingRow,
     extract_fassto_list,
     normalize_fassto_deliveries,
     normalize_fassto_delivery_good_details,
@@ -322,6 +327,489 @@ def _export_table_to_csv(
         )
     except Exception as exc:  # noqa: BLE001
         QMessageBox.warning(parent, "저장 실패", str(exc))
+
+
+def _json_text(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2)
+
+
+def _date_to_api_yyyymmdd(edit: QDateEdit) -> str:
+    return edit.date().toString("yyyyMMdd")
+
+
+def _clean_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _item_text(table: QTableWidget, row: int, col: int) -> str:
+    item = table.item(row, col)
+    return item.text().strip() if item is not None else ""
+
+
+def _set_item(table: QTableWidget, row: int, col: int, text: Any) -> None:
+    table.setItem(row, col, QTableWidgetItem("" if text is None else str(text)))
+
+
+def _serial_list(text: str) -> List[str]:
+    return [part.strip() for part in text.replace("\n", ",").split(",") if part.strip()]
+
+
+def _goods_label(row: FasstoGoodsRow) -> str:
+    bits = [row.cstGodCd]
+    if row.godNm:
+        bits.append(row.godNm)
+    if row.barcode:
+        bits.append(row.barcode)
+    return " · ".join(bits)
+
+
+def _unique_options(rows: Sequence[Any], code_attr: str, name_attr: str) -> List[tuple[str, str]]:
+    seen: set[str] = set()
+    options: List[tuple[str, str]] = []
+    for row in rows:
+        code = _clean_text(getattr(row, code_attr, ""))
+        name = _clean_text(getattr(row, name_attr, ""))
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        options.append((code, name))
+    return options
+
+
+def _combo_with_options(options: Sequence[tuple[str, str]], current: str = "") -> QComboBox:
+    combo = QComboBox()
+    combo.setEditable(True)
+    combo.addItem("", "")
+    for code, name in options:
+        label = f"{name} ({code})" if name else code
+        combo.addItem(label, code)
+    if current:
+        index = combo.findData(current)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        else:
+            combo.setEditText(current)
+    return combo
+
+
+def _combo_value(combo: QComboBox) -> str:
+    data = combo.currentData()
+    if isinstance(data, str) and data:
+        return data.strip()
+    text = combo.currentText().strip()
+    if text.endswith(")") and "(" in text:
+        return text.rsplit("(", 1)[1][:-1].strip()
+    return text
+
+
+class _FasstoWriteDialog(QDialog):
+    def __init__(self, parent: QWidget, title: str, goods: Sequence[FasstoGoodsRow]) -> None:
+        super().__init__(parent)
+        self._goods = list(goods)
+        self.setWindowTitle(title)
+        self.resize(980, 720)
+
+    def _make_goods_picker(self) -> tuple[QComboBox, QPushButton]:
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setMinimumWidth(420)
+        for row in self._goods:
+            combo.addItem(_goods_label(row), row)
+        add_btn = QPushButton("상품 추가")
+        return combo, add_btn
+
+    def _selected_goods(self, combo: QComboBox) -> tuple[str, str]:
+        data = combo.currentData()
+        if isinstance(data, FasstoGoodsRow):
+            return data.cstGodCd, data.godNm or ""
+        text = combo.currentText().strip()
+        if "·" in text:
+            code = text.split("·", 1)[0].strip()
+        else:
+            code = text.split(maxsplit=1)[0].strip() if text else ""
+        name = text
+        for row in self._goods:
+            if row.cstGodCd.upper() == code.upper():
+                return row.cstGodCd, row.godNm or ""
+        return code, name
+
+
+class _WarehousingWriteDialog(_FasstoWriteDialog):
+    COLS = ("상품코드", "상품명", "요청수량", "시리얼(쉼표 구분)")
+
+    def __init__(
+        self,
+        parent: QWidget,
+        *,
+        title: str,
+        goods: Sequence[FasstoGoodsRow],
+        initial: Optional[Mapping[str, Any]] = None,
+        update_mode: bool = False,
+        warehouse_options: Sequence[tuple[str, str]] = (),
+        supplier_options: Sequence[tuple[str, str]] = (),
+        in_way_options: Sequence[tuple[str, str]] = (),
+    ) -> None:
+        super().__init__(parent, title, goods)
+        self._update_mode = update_mode
+        initial = initial or {}
+
+        layout = QVBoxLayout(self)
+
+        form_box = QGroupBox("입고 정보")
+        form = QFormLayout(form_box)
+        self.slip_edit = QLineEdit(_clean_text(initial.get("slipNo")))
+        self.slip_edit.setReadOnly(not update_mode)
+        self.slip_edit.setPlaceholderText("생성 시 파스토에서 발급되면 비워둡니다.")
+        self.ord_no_edit = QLineEdit(_clean_text(initial.get("ordNo")))
+        self.ord_no_edit.setPlaceholderText("내부 발주번호 또는 입고 요청번호")
+        self.ord_dt_edit = QDateEdit()
+        self.ord_dt_edit.setCalendarPopup(True)
+        self.ord_dt_edit.setDisplayFormat("yyyy-MM-dd")
+        raw_dt = _clean_text(initial.get("ordDt") or initial.get("inDt"))
+        if len(raw_dt) == 8 and raw_dt.isdigit():
+            self.ord_dt_edit.setDate(QDate(int(raw_dt[:4]), int(raw_dt[4:6]), int(raw_dt[6:])))
+        else:
+            today = date.today()
+            self.ord_dt_edit.setDate(QDate(today.year, today.month, today.day))
+        self.wh_cd_combo = _combo_with_options(warehouse_options, _clean_text(initial.get("whCd")))
+        self.sup_cd_combo = _combo_with_options(supplier_options, _clean_text(initial.get("supCd")))
+        self.in_way_combo = _combo_with_options(in_way_options, _clean_text(initial.get("inWay")))
+        self.parcel_comp_edit = QLineEdit(_clean_text(initial.get("parcelComp")))
+        self.invoice_edit = QLineEdit(_clean_text(initial.get("parcelInvoiceNo")))
+        self.remark_edit = QLineEdit(_clean_text(initial.get("remark")))
+        if update_mode:
+            form.addRow("전표번호", self.slip_edit)
+        form.addRow("발주번호", self.ord_no_edit)
+        form.addRow("입고예정일", self.ord_dt_edit)
+        form.addRow("입고창고", self.wh_cd_combo)
+        form.addRow("공급사", self.sup_cd_combo)
+        form.addRow("입고경로", self.in_way_combo)
+        form.addRow("택배사", self.parcel_comp_edit)
+        form.addRow("송장번호", self.invoice_edit)
+        form.addRow("비고", self.remark_edit)
+        layout.addWidget(form_box)
+
+        picker_row = QHBoxLayout()
+        self.goods_combo, add_btn = self._make_goods_picker()
+        self.goods_combo.setPlaceholderText("상품명/상품코드/바코드 검색")
+        add_btn.clicked.connect(self._add_selected_goods)
+        remove_btn = QPushButton("선택 삭제")
+        remove_btn.clicked.connect(self._remove_selected_rows)
+        picker_row.addWidget(QLabel("상품 검색"))
+        picker_row.addWidget(self.goods_combo, 1)
+        add_btn.setText("입고 품목 추가")
+        picker_row.addWidget(add_btn)
+        picker_row.addWidget(remove_btn)
+        layout.addLayout(picker_row)
+
+        self.table = QTableWidget(0, len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        layout.addWidget(self.table, 1)
+
+        for item in initial.get("goods") or []:
+            if isinstance(item, Mapping):
+                self._append_item(
+                    _clean_text(item.get("cstGodCd")),
+                    _clean_text(item.get("godNm")),
+                    item.get("ordQty") or item.get("inQty") or 1,
+                    ", ".join(str(v) for v in item.get("goodsSerialNo") or [])
+                    if isinstance(item.get("goodsSerialNo"), list)
+                    else _clean_text(item.get("goodsSerialNo")),
+                )
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _append_item(self, code: str, name: str, qty: Any = 1, serial: str = "") -> None:
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        _set_item(self.table, row, 0, code)
+        _set_item(self.table, row, 1, name)
+        _set_item(self.table, row, 2, qty)
+        _set_item(self.table, row, 3, serial)
+
+    def _add_selected_goods(self) -> None:
+        code, name = self._selected_goods(self.goods_combo)
+        if not code:
+            QMessageBox.information(self, "상품 선택", "추가할 상품을 선택하거나 상품코드를 입력하세요.")
+            return
+        self._append_item(code, name, 1, "")
+
+    def _remove_selected_rows(self) -> None:
+        for idx in sorted(self.table.selectionModel().selectedRows(), key=lambda i: i.row(), reverse=True):
+            self.table.removeRow(idx.row())
+
+    def payload(self) -> Optional[Dict[str, Any]]:
+        goods: List[Dict[str, Any]] = []
+        for row in range(self.table.rowCount()):
+            code = _item_text(self.table, row, 0)
+            if not code:
+                continue
+            try:
+                qty = int(float(_item_text(self.table, row, 2) or "0"))
+            except ValueError:
+                QMessageBox.warning(self, "입력 오류", f"{row + 1}행 요청수량이 숫자가 아닙니다.")
+                return None
+            if qty <= 0:
+                QMessageBox.warning(self, "입력 오류", f"{row + 1}행 요청수량은 1 이상이어야 합니다.")
+                return None
+            item: Dict[str, Any] = {"cstGodCd": code, "ordQty": qty}
+            serials = _serial_list(_item_text(self.table, row, 3))
+            if serials:
+                item["goodsSerialNo"] = serials
+            goods.append(item)
+        if not goods:
+            QMessageBox.warning(self, "입력 오류", "입고 품목을 1개 이상 추가하세요.")
+            return None
+
+        body: Dict[str, Any] = {
+            "ordDt": _date_to_api_yyyymmdd(self.ord_dt_edit),
+            "goods": goods,
+        }
+        for key, widget in (
+            ("slipNo", self.slip_edit),
+            ("ordNo", self.ord_no_edit),
+            ("parcelComp", self.parcel_comp_edit),
+            ("parcelInvoiceNo", self.invoice_edit),
+            ("remark", self.remark_edit),
+        ):
+            value = widget.text().strip()
+            if value:
+                body[key] = value
+        for key, combo in (
+            ("whCd", self.wh_cd_combo),
+            ("supCd", self.sup_cd_combo),
+            ("inWay", self.in_way_combo),
+        ):
+            value = _combo_value(combo)
+            if value:
+                body[key] = value
+        if self._update_mode and not body.get("slipNo"):
+            QMessageBox.warning(self, "입력 오류", "입고 수정에는 전표번호가 필요합니다.")
+            return None
+        return body
+
+    def accept(self) -> None:
+        if self.payload() is None:
+            return
+        super().accept()
+
+
+class _DeliveryWriteDialog(_FasstoWriteDialog):
+    COLS = ("상품코드", "상품명", "주문수량")
+
+    def __init__(
+        self,
+        parent: QWidget,
+        *,
+        title: str,
+        goods: Sequence[FasstoGoodsRow],
+        initial: Optional[Mapping[str, Any]] = None,
+        update_mode: bool = False,
+        warehouse_options: Sequence[tuple[str, str]] = (),
+        out_div_options: Sequence[tuple[str, str]] = (),
+    ) -> None:
+        super().__init__(parent, title, goods)
+        self._update_mode = update_mode
+        initial = initial or {}
+
+        layout = QVBoxLayout(self)
+        form_box = QGroupBox("출고 정보")
+        form = QFormLayout(form_box)
+        self.slip_edit = QLineEdit(_clean_text(initial.get("slipNo")))
+        self.slip_edit.setReadOnly(not update_mode)
+        self.slip_edit.setPlaceholderText("생성 시 파스토에서 발급되면 비워둡니다.")
+        self.ord_no_edit = QLineEdit(_clean_text(initial.get("ordNo")))
+        self.ord_no_edit.setPlaceholderText("쇼핑몰 주문번호 또는 내부 주문번호")
+        self.ord_dt_edit = QDateEdit()
+        self.ord_dt_edit.setCalendarPopup(True)
+        self.ord_dt_edit.setDisplayFormat("yyyy-MM-dd")
+        raw_dt = _clean_text(initial.get("ordDt"))
+        if len(raw_dt) == 8 and raw_dt.isdigit():
+            self.ord_dt_edit.setDate(QDate(int(raw_dt[:4]), int(raw_dt[4:6]), int(raw_dt[6:])))
+        else:
+            today = date.today()
+            self.ord_dt_edit.setDate(QDate(today.year, today.month, today.day))
+        self.out_div_combo = _combo_with_options(out_div_options, _clean_text(initial.get("outDiv") or "1"))
+        self.wh_cd_combo = _combo_with_options(warehouse_options, _clean_text(initial.get("whCd")))
+        self.shop_cd_edit = QLineEdit(_clean_text(initial.get("shopCd")))
+        self.cust_nm_edit = QLineEdit(_clean_text(initial.get("custNm")))
+        self.cust_tel_edit = QLineEdit(_clean_text(initial.get("custTelNo")))
+        self.cust_addr_edit = QLineEdit(_clean_text(initial.get("custAddr")))
+        self.parcel_cd_edit = QLineEdit(_clean_text(initial.get("parcelCd")))
+        self.invoice_edit = QLineEdit(_clean_text(initial.get("invoiceNo") or initial.get("parcelInvoiceNo")))
+        self.remark_edit = QLineEdit(_clean_text(initial.get("remark")))
+        if update_mode:
+            form.addRow("전표번호", self.slip_edit)
+        form.addRow("주문번호", self.ord_no_edit)
+        form.addRow("주문일", self.ord_dt_edit)
+        form.addRow("출고구분", self.out_div_combo)
+        form.addRow("출고창고", self.wh_cd_combo)
+        form.addRow("판매처코드", self.shop_cd_edit)
+        form.addRow("수취인", self.cust_nm_edit)
+        form.addRow("연락처", self.cust_tel_edit)
+        form.addRow("주소", self.cust_addr_edit)
+        form.addRow("택배사코드", self.parcel_cd_edit)
+        form.addRow("송장번호", self.invoice_edit)
+        form.addRow("비고", self.remark_edit)
+        layout.addWidget(form_box)
+
+        picker_row = QHBoxLayout()
+        self.goods_combo, add_btn = self._make_goods_picker()
+        self.goods_combo.setPlaceholderText("상품명/상품코드/바코드 검색")
+        add_btn.clicked.connect(self._add_selected_goods)
+        remove_btn = QPushButton("선택 삭제")
+        remove_btn.clicked.connect(self._remove_selected_rows)
+        picker_row.addWidget(QLabel("상품 검색"))
+        picker_row.addWidget(self.goods_combo, 1)
+        add_btn.setText("출고 품목 추가")
+        picker_row.addWidget(add_btn)
+        picker_row.addWidget(remove_btn)
+        layout.addLayout(picker_row)
+
+        self.table = QTableWidget(0, len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        layout.addWidget(self.table, 1)
+
+        for item in initial.get("goods") or []:
+            if isinstance(item, Mapping):
+                self._append_item(
+                    _clean_text(item.get("cstGodCd")),
+                    _clean_text(item.get("godNm")),
+                    item.get("ordQty") or item.get("outQty") or 1,
+                )
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _append_item(self, code: str, name: str, qty: Any = 1) -> None:
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        _set_item(self.table, row, 0, code)
+        _set_item(self.table, row, 1, name)
+        _set_item(self.table, row, 2, qty)
+
+    def _add_selected_goods(self) -> None:
+        code, name = self._selected_goods(self.goods_combo)
+        if not code:
+            QMessageBox.information(self, "상품 선택", "추가할 상품을 선택하거나 상품코드를 입력하세요.")
+            return
+        self._append_item(code, name, 1)
+
+    def _remove_selected_rows(self) -> None:
+        for idx in sorted(self.table.selectionModel().selectedRows(), key=lambda i: i.row(), reverse=True):
+            self.table.removeRow(idx.row())
+
+    def payload(self) -> Optional[Dict[str, Any]]:
+        goods: List[Dict[str, Any]] = []
+        for row in range(self.table.rowCount()):
+            code = _item_text(self.table, row, 0)
+            if not code:
+                continue
+            try:
+                qty = int(float(_item_text(self.table, row, 2) or "0"))
+            except ValueError:
+                QMessageBox.warning(self, "입력 오류", f"{row + 1}행 주문수량이 숫자가 아닙니다.")
+                return None
+            if qty <= 0:
+                QMessageBox.warning(self, "입력 오류", f"{row + 1}행 주문수량은 1 이상이어야 합니다.")
+                return None
+            goods.append({"cstGodCd": code, "ordQty": qty})
+        if not goods and not self._update_mode:
+            QMessageBox.warning(self, "입력 오류", "출고 품목을 1개 이상 추가하세요.")
+            return None
+
+        body: Dict[str, Any] = {
+            "ordDt": _date_to_api_yyyymmdd(self.ord_dt_edit),
+        }
+        if goods:
+            body["goods"] = goods
+        for key, widget in (
+            ("slipNo", self.slip_edit),
+            ("ordNo", self.ord_no_edit),
+            ("shopCd", self.shop_cd_edit),
+            ("custNm", self.cust_nm_edit),
+            ("custTelNo", self.cust_tel_edit),
+            ("custAddr", self.cust_addr_edit),
+            ("parcelCd", self.parcel_cd_edit),
+            ("invoiceNo", self.invoice_edit),
+            ("remark", self.remark_edit),
+        ):
+            value = widget.text().strip()
+            if value:
+                body[key] = value
+        for key, combo in (
+            ("outDiv", self.out_div_combo),
+            ("whCd", self.wh_cd_combo),
+        ):
+            value = _combo_value(combo)
+            if value:
+                body[key] = value
+        if self._update_mode and not body.get("slipNo"):
+            QMessageBox.warning(self, "입력 오류", "출고 수정에는 전표번호가 필요합니다.")
+            return None
+        return body
+
+    def accept(self) -> None:
+        if self.payload() is None:
+            return
+        super().accept()
+
+
+class _DeliveryCancelDialog(QDialog):
+    def __init__(self, parent: QWidget, initial: Optional[Mapping[str, Any]] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("출고 취소")
+        self.resize(420, 180)
+        initial = initial or {}
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.slip_edit = QLineEdit(_clean_text(initial.get("slipNo")))
+        self.ord_no_edit = QLineEdit(_clean_text(initial.get("ordNo")))
+        self.remark_edit = QLineEdit(_clean_text(initial.get("remark")))
+        form.addRow("전표번호", self.slip_edit)
+        form.addRow("주문번호", self.ord_no_edit)
+        form.addRow("취소사유/비고", self.remark_edit)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def payload(self) -> Optional[Dict[str, Any]]:
+        body: Dict[str, Any] = {}
+        for key, widget in (
+            ("slipNo", self.slip_edit),
+            ("ordNo", self.ord_no_edit),
+            ("remark", self.remark_edit),
+        ):
+            value = widget.text().strip()
+            if value:
+                body[key] = value
+        if not body.get("slipNo") and not body.get("ordNo"):
+            QMessageBox.warning(self, "입력 오류", "전표번호 또는 주문번호가 필요합니다.")
+            return None
+        return body
+
+    def accept(self) -> None:
+        if self.payload() is None:
+            return
+        super().accept()
+
+
+def _show_write_result(parent: QWidget, title: str, data: Any) -> None:
+    text = _json_text(data)
+    if len(text) > 4000:
+        text = text[:4000] + "\n..."
+    QMessageBox.information(parent, title, text)
 
 
 # ---------------------------------------------------------------------------
@@ -1016,6 +1504,10 @@ class _WarehousingSubTab(QWidget):
         self.end_edit.setDisplayFormat("yyyy-MM-dd")
         self.refresh_btn = QPushButton("기간 조회")
         self.refresh_btn.clicked.connect(self._refresh_list)
+        self.create_btn = QPushButton("입고 생성")
+        self.create_btn.clicked.connect(self._create_warehousing)
+        self.update_btn = QPushButton("입고 수정")
+        self.update_btn.clicked.connect(self._update_warehousing)
         self.export_btn = QPushButton("CSV 저장")
         self.export_btn.clicked.connect(
             lambda: _export_table_to_csv(self.table, self, "fassto_warehousing")
@@ -1027,6 +1519,8 @@ class _WarehousingSubTab(QWidget):
         top.addWidget(self.end_edit)
         top.addWidget(_DatePresetBar(self.start_edit, self.end_edit))
         top.addWidget(self.refresh_btn)
+        top.addWidget(self.create_btn)
+        top.addWidget(self.update_btn)
         top.addWidget(self.export_btn)
 
         detail_row = QHBoxLayout()
@@ -1045,6 +1539,7 @@ class _WarehousingSubTab(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSortingEnabled(True)
         self.table.cellClicked.connect(self._on_row_clicked)
+        self._rows: List[FasstoWarehousingRow] = []
 
         splitter = QSplitter(Qt.Vertical)
         splitter.addWidget(self.table)
@@ -1097,8 +1592,9 @@ class _WarehousingSubTab(QWidget):
             if not result.ok:
                 self.status.setText(f"❌ {result.error}")
                 return
+            self._rows = result.data
             rows: List[List[Any]] = []
-            for r_ in result.data:
+            for r_ in self._rows:
                 status_cell = _delivery_status_cell(r_.wrkStat or "", r_.wrkStatNm or "")
                 # ordQty == inQty ? 완료
                 qty_fg = None
@@ -1129,6 +1625,114 @@ class _WarehousingSubTab(QWidget):
         item = self.table.item(row, 0)
         if item is not None:
             self.slip_edit.setText(item.text())
+
+    def _selected_payload(self) -> Dict[str, Any]:
+        slip = self.slip_edit.text().strip()
+        for row in self._rows:
+            if row.slipNo == slip and isinstance(row.raw, dict):
+                return dict(row.raw)
+        payload: Dict[str, Any] = {}
+        if slip:
+            payload["slipNo"] = slip
+        return payload
+
+    def _run_write(
+        self,
+        *,
+        title: str,
+        payload: Dict[str, Any],
+        call: Callable[[List[Dict[str, Any]]], Any],
+    ) -> None:
+        self.status.setText(f"{title} 요청 중...")
+        self.create_btn.setEnabled(False)
+        self.update_btn.setEnabled(False)
+
+        def done(result: JobResult) -> None:
+            self.create_btn.setEnabled(True)
+            self.update_btn.setEnabled(True)
+            if not result.ok:
+                self.status.setText(f"❌ {title} 실패: {result.error}")
+                return
+            self.status.setText(f"✅ {title} 완료")
+            _show_write_result(self, f"{title} 응답", result.data)
+            self._refresh_list()
+
+        _run_async(self, lambda: call([payload]), done)
+
+    def _create_warehousing(self) -> None:
+        if not self._tab.require_configured(self):
+            return
+        self.status.setText("파스토 상품 불러오는 중...")
+        self.create_btn.setEnabled(False)
+
+        def work() -> List[FasstoGoodsRow]:
+            env = self._tab.connector.get_goods_list()
+            return normalize_fassto_goods(extract_fassto_list(env))
+
+        def done(result: JobResult) -> None:
+            self.create_btn.setEnabled(True)
+            if not result.ok:
+                self.status.setText(f"❌ 상품 조회 실패: {result.error}")
+                return
+            dialog = _WarehousingWriteDialog(
+                self,
+                title="입고 생성",
+                goods=result.data,
+                warehouse_options=_unique_options(self._rows, "whCd", "whNm"),
+                supplier_options=_unique_options(self._rows, "supCd", "supNm"),
+                in_way_options=_unique_options(self._rows, "inWay", "inWayNm"),
+            )
+            if dialog.exec() != QDialog.Accepted:
+                return
+            payload = dialog.payload()
+            if payload is None:
+                return
+            self._run_write(
+                title="입고 생성",
+                payload=payload,
+                call=self._tab.connector.create_warehousing,
+            )
+
+        _run_async(self, work, done)
+
+    def _update_warehousing(self) -> None:
+        if not self._tab.require_configured(self):
+            return
+        selected = self._selected_payload()
+        self.status.setText("파스토 상품 불러오는 중...")
+        self.update_btn.setEnabled(False)
+
+        def work() -> List[FasstoGoodsRow]:
+            env = self._tab.connector.get_goods_list()
+            return normalize_fassto_goods(extract_fassto_list(env))
+
+        def done(result: JobResult) -> None:
+            self.update_btn.setEnabled(True)
+            if not result.ok:
+                self.status.setText(f"❌ 상품 조회 실패: {result.error}")
+                return
+            dialog = _WarehousingWriteDialog(
+                self,
+                title="입고 수정",
+                goods=result.data,
+                initial=selected or {"slipNo": self.slip_edit.text().strip()},
+                update_mode=True,
+                warehouse_options=_unique_options(self._rows, "whCd", "whNm"),
+                supplier_options=_unique_options(self._rows, "supCd", "supNm"),
+                in_way_options=_unique_options(self._rows, "inWay", "inWayNm"),
+            )
+            if dialog.exec() != QDialog.Accepted:
+                return
+            payload = dialog.payload()
+            if payload is None:
+                return
+            self._run_write(
+                title="입고 수정",
+                payload=payload,
+                call=self._tab.connector.update_warehousing,
+            )
+
+        _run_async(self, work, done)
 
     def _refresh_detail(self) -> None:
         if not self._tab.require_configured(self):
@@ -1233,6 +1837,12 @@ class _DeliverySubTab(QWidget):
 
         self.refresh_btn = QPushButton("조회")
         self.refresh_btn.clicked.connect(self._refresh)
+        self.create_btn = QPushButton("출고 생성")
+        self.create_btn.clicked.connect(self._create_delivery)
+        self.update_btn = QPushButton("출고 수정")
+        self.update_btn.clicked.connect(self._update_delivery)
+        self.cancel_btn = QPushButton("출고 취소")
+        self.cancel_btn.clicked.connect(self._cancel_delivery)
         self.export_btn = QPushButton("CSV 저장")
         self.export_btn.clicked.connect(
             lambda: _export_table_to_csv(self.table, self, "fassto_delivery")
@@ -1249,6 +1859,9 @@ class _DeliverySubTab(QWidget):
         top.addWidget(QLabel("출고구분"))
         top.addWidget(self.out_div_combo)
         top.addWidget(self.refresh_btn)
+        top.addWidget(self.create_btn)
+        top.addWidget(self.update_btn)
+        top.addWidget(self.cancel_btn)
         top.addWidget(self.export_btn)
 
         detail_row = QHBoxLayout()
@@ -1266,6 +1879,7 @@ class _DeliverySubTab(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSortingEnabled(True)
         self.table.cellClicked.connect(self._on_row_clicked)
+        self._rows: List[FasstoDeliveryRow] = []
 
         splitter = QSplitter(Qt.Vertical)
         splitter.addWidget(self.table)
@@ -1321,9 +1935,10 @@ class _DeliverySubTab(QWidget):
             if not result.ok:
                 self.status.setText(f"❌ {result.error}")
                 return
+            self._rows = result.data
             rows: List[List[Any]] = []
             status_counter: Dict[str, int] = {}
-            for r_ in result.data:
+            for r_ in self._rows:
                 key = r_.statusNm or r_.status or ""
                 status_counter[key] = status_counter.get(key, 0) + 1
                 rows.append(
@@ -1355,6 +1970,138 @@ class _DeliverySubTab(QWidget):
         item = self.table.item(row, 0)
         if item is not None:
             self.slip_edit.setText(item.text())
+
+    def _selected_payload(self) -> Dict[str, Any]:
+        slip = self.slip_edit.text().strip()
+        for row in self._rows:
+            if row.slipNo == slip and isinstance(row.raw, dict):
+                return dict(row.raw)
+        payload: Dict[str, Any] = {}
+        if slip:
+            payload["slipNo"] = slip
+        return payload
+
+    def _run_write(
+        self,
+        *,
+        title: str,
+        payload: Dict[str, Any],
+        call: Callable[[List[Dict[str, Any]]], Any],
+    ) -> None:
+        self.status.setText(f"{title} 요청 중...")
+        for button in (self.create_btn, self.update_btn, self.cancel_btn):
+            button.setEnabled(False)
+
+        def done(result: JobResult) -> None:
+            for button in (self.create_btn, self.update_btn, self.cancel_btn):
+                button.setEnabled(True)
+            if not result.ok:
+                self.status.setText(f"❌ {title} 실패: {result.error}")
+                return
+            self.status.setText(f"✅ {title} 완료")
+            _show_write_result(self, f"{title} 응답", result.data)
+            self._refresh()
+
+        _run_async(self, lambda: call([payload]), done)
+
+    def _create_delivery(self) -> None:
+        if not self._tab.require_configured(self):
+            return
+        self.status.setText("파스토 상품 불러오는 중...")
+        self.create_btn.setEnabled(False)
+
+        def work() -> List[FasstoGoodsRow]:
+            env = self._tab.connector.get_goods_list()
+            return normalize_fassto_goods(extract_fassto_list(env))
+
+        def done(result: JobResult) -> None:
+            self.create_btn.setEnabled(True)
+            if not result.ok:
+                self.status.setText(f"❌ 상품 조회 실패: {result.error}")
+                return
+            dialog = _DeliveryWriteDialog(
+                self,
+                title="출고 생성",
+                goods=result.data,
+                initial={"outDiv": self.out_div_combo.currentText() or "1"},
+                warehouse_options=_unique_options(self._rows, "whCd", "whNm"),
+                out_div_options=_unique_options(self._rows, "outDiv", "outDivNm")
+                or [("1", "일반"), ("2", "기타")],
+            )
+            if dialog.exec() != QDialog.Accepted:
+                return
+            payload = dialog.payload()
+            if payload is None:
+                return
+            self._run_write(
+                title="출고 생성",
+                payload=payload,
+                call=self._tab.connector.create_delivery_parcel,
+            )
+
+        _run_async(self, work, done)
+
+    def _update_delivery(self) -> None:
+        if not self._tab.require_configured(self):
+            return
+        selected = self._selected_payload()
+        self.status.setText("파스토 상품 불러오는 중...")
+        self.update_btn.setEnabled(False)
+
+        def work() -> List[FasstoGoodsRow]:
+            env = self._tab.connector.get_goods_list()
+            return normalize_fassto_goods(extract_fassto_list(env))
+
+        def done(result: JobResult) -> None:
+            self.update_btn.setEnabled(True)
+            if not result.ok:
+                self.status.setText(f"❌ 상품 조회 실패: {result.error}")
+                return
+            dialog = _DeliveryWriteDialog(
+                self,
+                title="출고 수정",
+                goods=result.data,
+                initial=selected or {"slipNo": self.slip_edit.text().strip()},
+                update_mode=True,
+                warehouse_options=_unique_options(self._rows, "whCd", "whNm"),
+                out_div_options=_unique_options(self._rows, "outDiv", "outDivNm")
+                or [("1", "일반"), ("2", "기타")],
+            )
+            if dialog.exec() != QDialog.Accepted:
+                return
+            payload = dialog.payload()
+            if payload is None:
+                return
+            self._run_write(
+                title="출고 수정",
+                payload=payload,
+                call=self._tab.connector.update_delivery_parcel,
+            )
+
+        _run_async(self, work, done)
+
+    def _cancel_delivery(self) -> None:
+        if not self._tab.require_configured(self):
+            return
+        selected = self._selected_payload()
+        dialog = _DeliveryCancelDialog(self, selected or {"slipNo": self.slip_edit.text().strip()})
+        if dialog.exec() != QDialog.Accepted:
+            return
+        payload = dialog.payload()
+        if payload is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "출고 취소 확인",
+            "이 출고 취소 요청을 파스토로 전송할까요?",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._run_write(
+            title="출고 취소",
+            payload=payload,
+            call=self._tab.connector.cancel_delivery,
+        )
 
     def _refresh_detail(self) -> None:
         if not self._tab.require_configured(self):
