@@ -593,12 +593,15 @@ class _CategoryEditDialog(QDialog):
 class _FixedCostsService:
     """매월 반복되는 고정비 (구독료, 통신비, 임대료 등) 저장/조회.
 
-    저장 위치: ~/.smartinventory/fixed_costs.json
+    영속성:
+      - 1순위 Pi (라즈베리파이 fixed_costs 테이블) write-through
+      - 2순위 로컬 캐시 ~/.smartinventory/fixed_costs.json (Pi 미설정/오프라인 시)
     각 항목: {id: int, name: str, day_of_month: int (1-31), amount: int, memo: str, active: bool}
     """
 
-    def __init__(self) -> None:
+    def __init__(self, pi_client: Optional[Any] = None) -> None:
         self._items: List[Dict[str, Any]] = []
+        self._pi = pi_client
         self._load()
 
     @staticmethod
@@ -607,7 +610,21 @@ class _FixedCostsService:
         d.mkdir(parents=True, exist_ok=True)
         return d / "fixed_costs.json"
 
+    def _pi_ok(self) -> bool:
+        return bool(self._pi and getattr(self._pi, "is_configured", False))
+
     def _load(self) -> None:
+        # 1순위: Pi
+        if self._pi_ok():
+            try:
+                remote = self._pi.list_fixed_costs()
+                if isinstance(remote, list):
+                    self._items = [self._normalize(x) for x in remote if isinstance(x, dict)]
+                    self._save_local()
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+        # 2순위: 로컬 캐시
         try:
             import json as _j
             p = self._path()
@@ -616,21 +633,22 @@ class _FixedCostsService:
                 return
             data = _j.loads(p.read_text(encoding="utf-8"))
             if isinstance(data, list):
-                self._items = [
-                    {
-                        "id": int(x.get("id") or 0),
-                        "name": str(x.get("name") or ""),
-                        "day_of_month": max(1, min(31, int(x.get("day_of_month") or 1))),
-                        "amount": int(x.get("amount") or 0),
-                        "memo": str(x.get("memo") or ""),
-                        "active": bool(x.get("active", True)),
-                    }
-                    for x in data if isinstance(x, dict)
-                ]
+                self._items = [self._normalize(x) for x in data if isinstance(x, dict)]
         except Exception:  # noqa: BLE001
             self._items = []
 
-    def _save(self) -> None:
+    @staticmethod
+    def _normalize(x: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": int(x.get("id") or 0),
+            "name": str(x.get("name") or ""),
+            "day_of_month": max(1, min(31, int(x.get("day_of_month") or 1))),
+            "amount": int(x.get("amount") or 0),
+            "memo": str(x.get("memo") or ""),
+            "active": bool(x.get("active", True)),
+        }
+
+    def _save_local(self) -> None:
         try:
             import json as _j
             self._path().write_text(
@@ -640,20 +658,39 @@ class _FixedCostsService:
         except Exception:  # noqa: BLE001
             pass
 
+    def _push_pi(self, items: List[Dict[str, Any]]) -> None:
+        """Pi 에 batch upsert (best-effort)."""
+        if not self._pi_ok() or not items:
+            return
+        try:
+            self._pi.upsert_fixed_costs(items)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _push_pi_delete(self, item_id: int) -> None:
+        if not self._pi_ok():
+            return
+        try:
+            self._pi.delete_fixed_cost(int(item_id))
+        except Exception:  # noqa: BLE001
+            pass
+
     def list_items(self) -> List[Dict[str, Any]]:
         return [dict(it) for it in self._items]
 
     def add(self, name: str, day_of_month: int, amount: int, memo: str = "") -> int:
         new_id = (max((it["id"] for it in self._items), default=0) or 0) + 1
-        self._items.append({
+        item = {
             "id": new_id,
             "name": name.strip() or "(이름 없음)",
             "day_of_month": max(1, min(31, int(day_of_month or 1))),
             "amount": int(amount or 0),
             "memo": memo.strip(),
             "active": True,
-        })
-        self._save()
+        }
+        self._items.append(item)
+        self._save_local()
+        self._push_pi([item])
         return new_id
 
     def update(self, item_id: int, **kwargs) -> None:
@@ -668,12 +705,14 @@ class _FixedCostsService:
                         it[k] = bool(v)
                     else:
                         it[k] = str(v or "")
-                self._save()
+                self._save_local()
+                self._push_pi([dict(it)])
                 return
 
     def delete(self, item_id: int) -> None:
         self._items = [it for it in self._items if it["id"] != item_id]
-        self._save()
+        self._save_local()
+        self._push_pi_delete(item_id)
 
     def total_active(self) -> int:
         return sum(int(it.get("amount") or 0) for it in self._items if it.get("active", True))
@@ -1532,7 +1571,8 @@ class CardUsageTab(QWidget):
         layout.addLayout(header)
 
         # ===== 고정비 서비스 (요약카드 합계 계산에 필요해 미리 생성) =====
-        self._fixed_service = _FixedCostsService()
+        # PiDataClient (self.pi) 가 위에서 이미 만들어졌어야 함 — 라즈베리에 write-through.
+        self._fixed_service = _FixedCostsService(pi_client=getattr(self, "pi", None))
 
         # ===== 통계 카드 =====
         cards_row = QHBoxLayout()

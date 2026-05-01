@@ -260,6 +260,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
+        elif path == "/fixed-costs":
+            try:
+                rows = db.list_fixed_costs()
+                self._send_json({"items": rows})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -404,6 +411,21 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": "items must be a list"}, 400)
                     return
                 changed = db.upsert_sms_messages(items)
+                self._send_json({"changed": changed, "received": len(items)})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/fixed-costs":
+            try:
+                body = self._read_json_body()
+                items = body.get("items") if isinstance(body, dict) else None
+                if items is None and isinstance(body, dict) and body.get("id") is not None:
+                    items = [body]
+                if not isinstance(items, list):
+                    self._send_json({"error": "items must be a list"}, 400)
+                    return
+                changed = db.upsert_fixed_costs(items)
                 self._send_json({"changed": changed, "received": len(items)})
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
@@ -577,12 +599,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(e)}, 500)
             return
 
+        # /fixed-costs/<id>
+        fc_match = _FIXED_COST_RE.match(path)
+        if fc_match is not None:
+            try:
+                deleted = db.delete_fixed_cost(int(fc_match.group(1)))
+                self._send_json({"deleted": deleted})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
         self._send_json({"error": "not found"}, 404)
 
 
 _MASTER_ID_RE = re.compile(r"^/masters/(\d+)$")
 _MASTER_REP_RE = re.compile(r"^/masters/(\d+)/representative$")
 _CARD_USAGE_RE = re.compile(r"^/card-usages/(.+)$")
+_FIXED_COST_RE = re.compile(r"^/fixed-costs/(\d+)$")
 
 
 def _match_master_id(path: str) -> int | None:

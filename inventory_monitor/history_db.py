@@ -269,6 +269,20 @@ class InventoryHistoryDB:
                 )
                 """
             )
+            # 고정비 (매월 반복) — id 는 클라이언트가 생성한 값을 그대로 PK 로 사용
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS fixed_costs (
+                    id            INTEGER PRIMARY KEY,
+                    name          TEXT NOT NULL,
+                    day_of_month  INTEGER NOT NULL,
+                    amount        INTEGER NOT NULL,
+                    memo          TEXT,
+                    active        INTEGER NOT NULL DEFAULT 1,
+                    updated_at    TEXT NOT NULL
+                )
+                """
+            )
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_sms_sender_received
@@ -1552,6 +1566,74 @@ class InventoryHistoryDB:
                 (str(key), str(value), datetime.now().isoformat()),
             )
             conn.commit()
+
+    # ── 고정비 (매월 반복) ──
+
+    def list_fixed_costs(self) -> List[dict]:
+        with self._guard, self._connection() as conn:
+            cur = conn.execute(
+                "SELECT id, name, day_of_month, amount, memo, active, updated_at "
+                "FROM fixed_costs ORDER BY day_of_month, name"
+            )
+            return [
+                {
+                    "id": int(r[0]),
+                    "name": str(r[1] or ""),
+                    "day_of_month": int(r[2] or 1),
+                    "amount": int(r[3] or 0),
+                    "memo": str(r[4] or ""),
+                    "active": bool(r[5]),
+                    "updated_at": str(r[6] or ""),
+                }
+                for r in cur.fetchall()
+            ]
+
+    def upsert_fixed_costs(self, items: List[dict]) -> int:
+        rows: list[tuple] = []
+        now = datetime.now().isoformat()
+        for it in items:
+            try:
+                iid = int(it.get("id") or 0)
+            except Exception:  # noqa: BLE001
+                continue
+            if iid <= 0:
+                continue
+            rows.append((
+                iid,
+                str(it.get("name") or "").strip() or "(이름 없음)",
+                max(1, min(31, int(it.get("day_of_month") or 1))),
+                int(it.get("amount") or 0),
+                str(it.get("memo") or ""),
+                int(bool(it.get("active", True))),
+                now,
+            ))
+        if not rows:
+            return 0
+        with self._guard, self._connection() as conn:
+            before = conn.total_changes
+            conn.executemany(
+                """
+                INSERT INTO fixed_costs (id, name, day_of_month, amount, memo, active, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name=excluded.name,
+                    day_of_month=excluded.day_of_month,
+                    amount=excluded.amount,
+                    memo=excluded.memo,
+                    active=excluded.active,
+                    updated_at=excluded.updated_at
+                """,
+                rows,
+            )
+            conn.commit()
+            return conn.total_changes - before
+
+    def delete_fixed_cost(self, item_id: int) -> int:
+        with self._guard, self._connection() as conn:
+            before = conn.total_changes
+            conn.execute("DELETE FROM fixed_costs WHERE id = ?", (int(item_id),))
+            conn.commit()
+            return conn.total_changes - before
 
     # ── SMS 수신 내역 ──
 

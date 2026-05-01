@@ -374,5 +374,35 @@ class PiDataClient:
         except PiDataError:
             pass
 
+    # ── 고정비 (매월 반복) ─────────────────────────────────────
+
+    def list_fixed_costs(self) -> List[Dict[str, Any]]:
+        if not self.is_configured:
+            return []
+        try:
+            payload = self._request("GET", "/fixed-costs")
+        except PiDataError:
+            return []
+        items = payload.get("items") or []
+        return items if isinstance(items, list) else []
+
+    def upsert_fixed_costs(self, items: List[Dict[str, Any]]) -> int:
+        if not self.is_configured or not items:
+            return 0
+        try:
+            payload = self._request("POST", "/fixed-costs", json_body={"items": items})
+        except PiDataError:
+            return -1
+        return int(payload.get("changed") or 0)
+
+    def delete_fixed_cost(self, item_id: int) -> bool:
+        if not self.is_configured:
+            return False
+        try:
+            self._request("DELETE", f"/fixed-costs/{int(item_id)}")
+            return True
+        except PiDataError:
+            return False
+
 
 __all__ = ["PiDataClient", "PiDataError"]
