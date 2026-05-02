@@ -3323,11 +3323,14 @@ class SalesDailyTab(QWidget):
     """
 
     image_downloaded = Signal(str, object)
+    # 비동기 결과 시그널 — 워커 스레드에서 메인으로 결과 전달.
+    _dates_ready = Signal(object, object)  # (cleaned_dates_dict_or_None, error_str_or_None)
+    _sales_ready = Signal(str, object, object)  # (date_str, sales_list_or_None, error_str_or_None)
 
     def __init__(
         self,
         monitor_url: str | None = None,
-        timeout: int = 30,
+        timeout: int = 10,
         cache: ChannelProductCache | None = None,
     ) -> None:
         super().__init__()
@@ -3347,10 +3350,15 @@ class SalesDailyTab(QWidget):
         self.render_token = 0
         self.image_executor = ThreadPoolExecutor(max_workers=6)
         self.image_downloaded.connect(self._on_image_downloaded)
+        # 비동기 fetch 결과 슬롯 연결
+        self._dates_ready.connect(self._on_dates_ready)
+        self._sales_ready.connect(self._on_sales_ready)
 
         self._sales_dates: dict[str, int] = {}
         self._highlighted_dates: set[str] = set()
         self._last_master_refresh_ts: float = 0.0  # 30초 내 재조회는 스킵 (판매일보 속도)
+        self._dates_in_flight: bool = False
+        self._sales_in_flight_token: int = 0  # 현재 요청 토큰 — 늦게 도착한 응답 무시
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -3474,34 +3482,53 @@ class SalesDailyTab(QWidget):
             return
 
         selected = self.calendar.selectedDate() if preserve_selection else None
-        try:
-            resp = httpx.get(
-                f"{self.monitor_url.rstrip('/')}/sales/dates",
-                timeout=self.timeout,
-            )
-            resp.raise_for_status()
-            raw_dates = resp.json().get("dates", {})
-            if isinstance(raw_dates, dict):
+        self._pending_dates_selection = selected.toString("yyyy-MM-dd") if selected and selected.isValid() else ""
+
+        if self._dates_in_flight:
+            return  # 이미 진행 중 — 중복 fetch 회피
+        self._dates_in_flight = True
+        self.summary_label.setText("📅 판매일자 조회 중...")
+
+        url = self.monitor_url.rstrip("/")
+        timeout = self.timeout
+
+        def _worker() -> None:
+            try:
+                resp = httpx.get(f"{url}/sales/dates", timeout=timeout)
+                resp.raise_for_status()
+                raw = resp.json().get("dates", {})
                 cleaned: dict[str, int] = {}
-                for key, count in raw_dates.items():
-                    date_key = str(key)
-                    if self._qdate_from_iso(date_key) is None:
-                        continue
-                    try:
-                        cleaned[date_key] = int(count)
-                    except Exception:
-                        cleaned[date_key] = 0
-                self._sales_dates = cleaned
-            else:
-                self._sales_dates = {}
-            self._highlight_calendar()
-        except Exception as e:
+                if isinstance(raw, dict):
+                    for key, count in raw.items():
+                        date_key = str(key)
+                        if self._qdate_from_iso(date_key) is None:
+                            continue
+                        try:
+                            cleaned[date_key] = int(count)
+                        except Exception:
+                            cleaned[date_key] = 0
+                self._dates_ready.emit(cleaned, None)
+            except Exception as exc:  # noqa: BLE001
+                self._dates_ready.emit(None, str(exc))
+
+        import threading
+        threading.Thread(target=_worker, daemon=True, name="sales-dates-fetch").start()
+
+    @Slot(object, object)
+    def _on_dates_ready(self, cleaned: object, error: object) -> None:
+        self._dates_in_flight = False
+        if error:
             self._sales_dates = {}
             self.table.setRowCount(0)
-            self.summary_label.setText(f"판매일보 연결 실패: {e}")
+            self.summary_label.setText(f"판매일보 연결 실패: {error}")
             return
 
+        self._sales_dates = cleaned if isinstance(cleaned, dict) else {}
+        self._highlight_calendar()
+
         target_date: QDate | None = None
+        sel_iso = getattr(self, "_pending_dates_selection", "") or ""
+        selected = self._qdate_from_iso(sel_iso) if sel_iso else None
         if (
             selected
             and selected.isValid()
@@ -3570,18 +3597,38 @@ class SalesDailyTab(QWidget):
             self.summary_label.setText("라즈베리파이 미연결")
             return
 
-        try:
-            resp = httpx.get(
-                f"{self.monitor_url.rstrip('/')}/sales?date={date_str}",
-                timeout=self.timeout,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            self.summary_label.setText(f"조회 실패: {e}")
-            return
+        # 늦게 도착한 응답 무시용 토큰
+        self._sales_in_flight_token += 1
+        token = self._sales_in_flight_token
+        url = self.monitor_url.rstrip("/")
+        timeout = self.timeout
 
-        sales = data.get("sales", [])
+        def _worker() -> None:
+            try:
+                resp = httpx.get(f"{url}/sales?date={date_str}", timeout=timeout)
+                resp.raise_for_status()
+                data = resp.json()
+                self._sales_ready.emit(date_str, (token, data.get("sales", [])), None)
+            except Exception as exc:  # noqa: BLE001
+                self._sales_ready.emit(date_str, (token, None), str(exc))
+
+        import threading
+        threading.Thread(target=_worker, daemon=True, name=f"sales-fetch-{date_str}").start()
+
+    @Slot(str, object, object)
+    def _on_sales_ready(self, date_str: str, payload: object, error: object) -> None:
+        # 토큰 검증 — 사용자가 빠르게 다른 날짜 클릭했으면 stale 응답 무시
+        try:
+            token, sales = payload  # type: ignore[misc]
+        except Exception:  # noqa: BLE001
+            return
+        if token != self._sales_in_flight_token:
+            return
+        if error:
+            self.summary_label.setText(f"조회 실패: {error}")
+            return
+        if not isinstance(sales, list):
+            sales = []
 
         # 마스터/링크 로드 — 30초 내 재조회는 스킵해 판매일보 응답성 확보.
         # (마스터/링크는 자주 변하지 않으므로 짧은 캐시로 충분)
