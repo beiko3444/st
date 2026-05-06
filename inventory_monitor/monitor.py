@@ -98,26 +98,60 @@ def _collect_once(
     cp: CoupangRocketConnector,
     db: InventoryHistoryDB,
     max_items: int,
-) -> None:
+) -> dict:
     now = datetime.now()
+    result = {
+        "recorded_at": now.isoformat(),
+        "naver": {"ok": False, "changed": 0, "total": 0, "error": None},
+        "coupang": {"ok": False, "changed": 0, "total": 0, "error": None},
+    }
 
     # 스마트스토어
     try:
         naver_rows = _fetch_naver(ss, ss_stats, max_items)
         n_naver = db.insert_rows("naver", naver_rows, recorded_at=now)
+        result["naver"].update({"ok": True, "changed": n_naver, "total": len(naver_rows)})
         log.info("스마트스토어: %d개 변동 저장 (전체 %d개)", n_naver, len(naver_rows))
-    except Exception:
+    except Exception as exc:
+        result["naver"]["error"] = str(exc)
         log.exception("스마트스토어 조회 실패")
 
     # 쿠팡
     try:
         coupang_rows = _fetch_coupang(cp, max_items)
         n_coupang = db.insert_rows("coupang", coupang_rows, recorded_at=now)
+        result["coupang"].update({"ok": True, "changed": n_coupang, "total": len(coupang_rows)})
         log.info("쿠팡: %d개 변동 저장 (전체 %d개)", n_coupang, len(coupang_rows))
-    except Exception:
+    except Exception as exc:
+        result["coupang"]["error"] = str(exc)
         log.exception("쿠팡 조회 실패")
 
     log.info("총 DB 레코드 수: %d", db.count_records())
+    return result
+
+
+def collect_inventory_once(db: InventoryHistoryDB | None = None) -> dict:
+    """설정 파일 기준으로 네이버/쿠팡을 1회 수집해 Pi DB에 저장."""
+    cfg = load_config()
+    ss = SmartStoreConnector(
+        client_id=cfg.smartstore_client_id,
+        client_secret=cfg.smartstore_client_secret,
+        token_type=cfg.smartstore_token_type,
+        timeout_seconds=cfg.timeout_seconds,
+    )
+    ss_stats = SmartStoreConnector(
+        client_id=cfg.smartstore_stats_client_id,
+        client_secret=cfg.smartstore_stats_client_secret,
+        token_type=cfg.smartstore_stats_token_type,
+        timeout_seconds=cfg.timeout_seconds,
+    )
+    cp = CoupangRocketConnector(
+        vendor_id=cfg.coupang_vendor_id,
+        access_key=cfg.coupang_access_key,
+        secret_key=cfg.coupang_secret_key,
+        timeout_seconds=cfg.timeout_seconds,
+    )
+    return _collect_once(ss, ss_stats, cp, db or InventoryHistoryDB(), cfg.max_products)
 
 
 def main() -> None:

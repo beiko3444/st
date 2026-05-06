@@ -9,6 +9,8 @@ import json
 import logging
 import re
 import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -28,6 +30,59 @@ logging.basicConfig(
 log = logging.getLogger("inventory-server")
 
 db = InventoryHistoryDB()
+_sync_guard = threading.Lock()
+_sync_state = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "result": None,
+    "error": None,
+}
+
+
+def _run_inventory_sync() -> dict:
+    from inventory_monitor.monitor import collect_inventory_once
+
+    with _sync_guard:
+        if _sync_state["running"]:
+            return {"accepted": False, "running": True, "message": "inventory sync already running"}
+        _sync_state.update(
+            {
+                "running": True,
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "finished_at": None,
+                "result": None,
+                "error": None,
+            }
+        )
+    try:
+        result = collect_inventory_once(db)
+        with _sync_guard:
+            _sync_state.update(
+                {
+                    "running": False,
+                    "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "result": result,
+                    "error": None,
+                }
+            )
+        return {"accepted": True, "running": False, "result": result}
+    except Exception as exc:  # noqa: BLE001
+        with _sync_guard:
+            _sync_state.update(
+                {
+                    "running": False,
+                    "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "result": None,
+                    "error": str(exc),
+                }
+            )
+        raise
+
+
+def _sync_status() -> dict:
+    with _sync_guard:
+        return dict(_sync_state)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -83,6 +138,7 @@ class Handler(BaseHTTPRequestHandler):
                 "coupang_last_updated": db.get_last_updated("coupang"),
                 "naver_collections": db.get_collection_count("naver"),
                 "coupang_collections": db.get_collection_count("coupang"),
+                "inventory_sync": _sync_status(),
             })
 
         elif path == "/sales":
@@ -271,10 +327,35 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "not found"}, 404)
 
     def do_POST(self):
-        from urllib.parse import urlparse
+        from urllib.parse import parse_qs, urlparse
 
         parsed = urlparse(self.path)
         path = parsed.path
+        qs = parse_qs(parsed.query)
+
+        if path == "/sync/inventory":
+            wait = (qs.get("wait", ["0"])[0] in ("1", "true", "True", "yes"))
+            if wait:
+                try:
+                    result = _run_inventory_sync()
+                    status = 200 if result.get("accepted") else 202
+                    self._send_json(result, status)
+                except Exception as e:
+                    self._send_json({"accepted": False, "error": str(e), "state": _sync_status()}, 500)
+                return
+
+            def _worker() -> None:
+                try:
+                    _run_inventory_sync()
+                except Exception:
+                    log.exception("inventory sync failed")
+
+            with _sync_guard:
+                already_running = bool(_sync_state["running"])
+            if not already_running:
+                threading.Thread(target=_worker, daemon=True, name="inventory-sync").start()
+            self._send_json({"accepted": not already_running, "running": True, "state": _sync_status()}, 202)
+            return
 
         if path == "/shared-stock":
             try:

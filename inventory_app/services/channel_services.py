@@ -367,44 +367,9 @@ class NaverChannelService:
             rows = _fetch_from_monitor(self.config.monitor_url, "naver", self.config.timeout_seconds)
             if rows is not None:
                 warnings: List[str] = ["__pi__"]
-                live_product_ids: set[str] | None = None
-                origin_to_channel: Dict[str, str] = {}
-                try:
-                    live_rows = self.smartstore.fetch_products(max_items=self.config.max_products)
-                    live_product_ids = {
-                        str(raw.get("product_id") or "").strip()
-                        for raw in live_rows
-                        if str(raw.get("product_id") or "").strip()
-                    }
-                    for raw in live_rows:
-                        channel_id = str(raw.get("product_id") or "").strip()
-                        origin_id = str(raw.get("origin_product_id") or "").strip()
-                        if channel_id and origin_id:
-                            origin_to_channel[origin_id] = channel_id
-                except Exception:
-                    live_product_ids = None
-
-                if live_product_ids:
-                    rows, hidden_count = _filter_rows_by_live_product_ids(rows, live_product_ids)
-                    if hidden_count > 0:
-                        warnings.append(
-                            f"현재 네이버 실상품 목록에 없는 monitor 잔존 {hidden_count}건을 숨겼습니다."
-                        )
-                # 판매량은 실시간 API에서 직접 조회
-                sales_map = self._fetch_sales_map(warnings)
-                if sales_map is not None:
-                    matched = _apply_naver_sales_map(rows, sales_map, origin_to_channel)
-                    warnings.append(f"30일 판매량 매칭: {matched}/{len(rows)}건")
-                # 오늘 판매량도 실시간 API에서 조회
-                try:
-                    today_map = self.smartstore_stats.fetch_product_sales_counts(days=1)
-                    for row in rows:
-                        if row.today_sales is None:
-                            row.today_sales = today_map.get(row.product_id, 0)
-                except Exception:
-                    for row in rows:
-                        if row.today_sales is None:
-                            row.today_sales = 0
+                for row in rows:
+                    if row.today_sales is None:
+                        row.today_sales = 0
                 # monitor 가 내려준 /main/products/ 형식 URL 을 정상 slug 로 교체
                 _fix_naver_product_urls(rows, naver_base)
                 _assign_serial_by_sales(rows)
@@ -414,6 +379,8 @@ class NaverChannelService:
                 except Exception:  # noqa: BLE001
                     pass
                 return rows, warnings
+            cached, _ = self.fetch_cached()
+            return cached, ["라즈베리파이 DB 조회 실패 — 로컬 캐시를 표시합니다."]
 
         synced_at = datetime.now()
         warnings: List[str] = []
@@ -513,6 +480,8 @@ class CoupangChannelService:
                 except Exception:  # noqa: BLE001
                     pass
                 return rows, ["__pi__"]
+            cached, _ = self.fetch_cached()
+            return cached, ["라즈베리파이 DB 조회 실패 — 로컬 캐시를 표시합니다."]
 
         synced_at = datetime.now()
         warnings: List[str] = []

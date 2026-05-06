@@ -3843,6 +3843,7 @@ class SalesDailyTab(QWidget):
 
 class MainWindow(QMainWindow):
     _on_purchase_pi_done = Signal(bool, int, int, str)
+    _on_inventory_pi_done = Signal(bool, str)
 
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
@@ -3873,6 +3874,7 @@ class MainWindow(QMainWindow):
         self._sync_finished_sources: set[str] = set()
         self._sync_failed_sources: set[str] = set()
         self._sync_session_active = False
+        self._pi_inventory_sync_running = False
 
         sales_days = max(1, int(config.stats_lookback_days))
         self.naver_tab = ChannelTab(
@@ -3971,6 +3973,7 @@ class MainWindow(QMainWindow):
         self.revenue_tab.sync_finished.connect(self._on_sub_sync_finished)
         self.keyword_tab.sync_finished.connect(self._on_sub_sync_finished)
         self._on_purchase_pi_done.connect(self._on_purchase_pi_finished, Qt.QueuedConnection)
+        self._on_inventory_pi_done.connect(self._on_inventory_pi_finished, Qt.QueuedConnection)
         QTimer.singleShot(0, self._load_initial_visible_channel_tab)
         # 자동 동기화는 사용자가 요청할 때만 (F5 또는 동기화 버튼).
         # 시작 시에는 캐시만 표시하고 네트워크 호출 안 함.
@@ -4317,6 +4320,16 @@ class MainWindow(QMainWindow):
                 pass
 
     def sync_now(self) -> None:
+        if self.config.monitor_url:
+            if self._start_inventory_pi_sync():
+                return
+            # Pi 수집을 시작하지 못한 경우에도 Pi DB에 저장된 최신값을 읽는다.
+            self._start_tabs_from_pi_cache()
+            return
+
+        self._start_direct_sync_sources()
+
+    def _start_direct_sync_sources(self) -> None:
         started_sources: set[str] = set()
         if self.naver_tab.sync_now():
             started_sources.add("네이버")
@@ -4332,6 +4345,66 @@ class MainWindow(QMainWindow):
             started_sources.add("구매내역")
 
         self._start_sync_session(started_sources)
+
+    def _start_tabs_from_pi_cache(self) -> None:
+        started_sources: set[str] = set()
+        if self.naver_tab.sync_now():
+            started_sources.add("네이버")
+        if self.coupang_tab.sync_now():
+            started_sources.add("쿠팡")
+
+        # Pi 에서 구매내역 다운로드 (백그라운드)
+        if self._start_purchase_pi_pull():
+            started_sources.add("구매내역")
+
+        self._start_sync_session(started_sources)
+
+    def _start_inventory_pi_sync(self) -> bool:
+        url = str(self.config.monitor_url or "").strip().rstrip("/")
+        if not url or self._pi_inventory_sync_running:
+            return False
+
+        self._pi_inventory_sync_running = True
+        self.sync_all_button.setEnabled(False)
+        self.sync_all_button.setText("라즈베리 수집 중...")
+
+        import threading
+
+        def _worker() -> None:
+            try:
+                timeout = max(180.0, float(self.config.timeout_seconds) * 6.0)
+                resp = httpx.post(f"{url}/sync/inventory?wait=1", timeout=timeout)
+                resp.raise_for_status()
+                data = resp.json()
+                msg = ""
+                if isinstance(data, dict):
+                    result = data.get("result") or {}
+                    if isinstance(result, dict):
+                        naver = result.get("naver") or {}
+                        coupang = result.get("coupang") or {}
+                        msg = (
+                            f"네이버 {int(naver.get('total') or 0):,}건, "
+                            f"쿠팡 {int(coupang.get('total') or 0):,}건"
+                        )
+                self._on_inventory_pi_done.emit(True, msg)
+            except Exception as exc:  # noqa: BLE001
+                self._on_inventory_pi_done.emit(False, str(exc))
+
+        threading.Thread(target=_worker, daemon=True, name="pi-inventory-sync").start()
+        return True
+
+    @Slot(bool, str)
+    def _on_inventory_pi_finished(self, ok: bool, message: str) -> None:
+        self._pi_inventory_sync_running = False
+        self.sync_all_button.setEnabled(True)
+        self.sync_all_button.setText("전체 동기화")
+        if ok:
+            self.naver_tab.status_label.setText(f"📡 라즈베리 수집 완료: {message}")
+            self.coupang_tab.status_label.setText(f"📡 라즈베리 수집 완료: {message}")
+        else:
+            self.naver_tab.status_label.setText(f"⚠ 라즈베리 수집 실패, 기존 DB 값 로드: {message}")
+            self.coupang_tab.status_label.setText(f"⚠ 라즈베리 수집 실패, 기존 DB 값 로드: {message}")
+        self._start_tabs_from_pi_cache()
 
     def _start_purchase_pi_pull(self) -> bool:
         """Pi 에서 구매내역+주문 다운로드 → 로컬 DB 저장. 백그라운드 스레드."""
