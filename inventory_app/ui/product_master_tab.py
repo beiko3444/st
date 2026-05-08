@@ -1260,17 +1260,20 @@ class ProductMasterTab(QWidget):
             sort_value = int(base_value) + max(0, int(inbound_qty))
         elif inbound_qty > 0:
             sort_value = int(inbound_qty)
+        display_text = _format_int(sort_value) if inbound_qty <= 0 else ""
         self.master_table.setItem(
             row_idx,
             col_idx,
-            _number_item(_format_int(sort_value), sort_value),
+            _number_item(display_text, sort_value),
         )
+        if inbound_qty <= 0:
+            self.master_table.removeCellWidget(row_idx, col_idx)
+            return
         label = QLabel()
         label.setTextFormat(Qt.RichText)
         label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         label.setText(_inbound_display_text(base_value, inbound_qty))
-        label.setStyleSheet("padding-right: 6px; background: transparent;")
-        label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        label.setStyleSheet("padding-right: 6px; background: palette(base);")
         self.master_table.setCellWidget(row_idx, col_idx, label)
 
     # ------------------------------------------------------------------
