@@ -5,7 +5,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 
 def _default_db_path() -> Path:
@@ -141,6 +141,27 @@ class InventoryHistoryDB:
                 """
                 CREATE INDEX IF NOT EXISTS idx_channel_master_links_master
                 ON channel_master_links(master_id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS stock_inbounds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    receipt_date TEXT NOT NULL,
+                    master_id INTEGER NOT NULL,
+                    channel TEXT NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(receipt_date, master_id, channel),
+                    FOREIGN KEY (master_id) REFERENCES master_products(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_stock_inbounds_date
+                ON stock_inbounds(receipt_date, channel)
                 """
             )
             # 구매내역(쿠팡/네이버 주문) 캐시
@@ -886,6 +907,19 @@ class InventoryHistoryDB:
             "updated_at": str(updated_at),
         }
 
+    @staticmethod
+    def _row_to_stock_inbound_dict(row: tuple) -> dict:
+        inbound_id, receipt_date, master_id, channel, quantity, created_at, updated_at = row
+        return {
+            "id": int(inbound_id),
+            "receipt_date": str(receipt_date or ""),
+            "master_id": int(master_id),
+            "channel": str(channel or ""),
+            "quantity": int(quantity or 0),
+            "created_at": str(created_at or ""),
+            "updated_at": str(updated_at or ""),
+        }
+
     def list_masters(self) -> List[dict]:
         with self._guard, self._connection() as conn:
             rows = conn.execute(
@@ -1151,6 +1185,104 @@ class InventoryHistoryDB:
             )
             conn.commit()
         return self.get_link(channel_key, item_key)
+
+    def list_stock_inbounds(
+        self,
+        receipt_date: str | None = None,
+        master_id: int | None = None,
+        channel: str | None = None,
+    ) -> List[dict]:
+        where: list[str] = []
+        params: list[object] = []
+        if receipt_date:
+            where.append("receipt_date = ?")
+            params.append(str(receipt_date).strip())
+        if master_id is not None:
+            where.append("master_id = ?")
+            params.append(int(master_id))
+        if channel:
+            where.append("channel = ?")
+            params.append(self._norm_channel(channel))
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        with self._guard, self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, receipt_date, master_id, channel, quantity, created_at, updated_at
+                FROM stock_inbounds
+                {where_sql}
+                ORDER BY receipt_date DESC, updated_at DESC, id DESC
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_stock_inbound_dict(r) for r in rows]
+
+    def add_stock_inbound(
+        self,
+        receipt_date: str,
+        master_id: int,
+        channel: str,
+        quantity: int,
+    ) -> dict:
+        clean_date = str(receipt_date or "").strip()
+        channel_key = self._norm_channel(channel)
+        qty = int(quantity or 0)
+        if not clean_date:
+            raise ValueError("receipt_date is required")
+        if channel_key not in ("naver", "coupang"):
+            raise ValueError("channel must be naver or coupang")
+        if qty <= 0:
+            raise ValueError("quantity must be positive")
+
+        now = datetime.now().isoformat()
+        with self._guard, self._connection() as conn:
+            master_exists = conn.execute(
+                "SELECT 1 FROM master_products WHERE id = ?",
+                (int(master_id),),
+            ).fetchone()
+            if not master_exists:
+                raise ValueError("master not found")
+            existing = conn.execute(
+                """
+                SELECT id, quantity, created_at
+                FROM stock_inbounds
+                WHERE receipt_date = ? AND master_id = ? AND channel = ?
+                """,
+                (clean_date, int(master_id), channel_key),
+            ).fetchone()
+            if existing:
+                inbound_id = int(existing[0])
+                total_qty = int(existing[1] or 0) + qty
+                created_at = str(existing[2] or now)
+                conn.execute(
+                    """
+                    UPDATE stock_inbounds
+                    SET quantity = ?, created_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (total_qty, created_at, now, inbound_id),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO stock_inbounds (
+                        receipt_date, master_id, channel, quantity, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (clean_date, int(master_id), channel_key, qty, now, now),
+                )
+                inbound_id = int(cursor.lastrowid)
+            conn.commit()
+            row = conn.execute(
+                """
+                SELECT id, receipt_date, master_id, channel, quantity, created_at, updated_at
+                FROM stock_inbounds
+                WHERE id = ?
+                """,
+                (inbound_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("stock inbound save failed")
+        return self._row_to_stock_inbound_dict(row)
 
     # ── 구매내역 (쿠팡/네이버 주문) ──
 

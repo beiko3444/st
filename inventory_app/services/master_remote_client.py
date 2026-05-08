@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from inventory_app.models import ChannelMasterLink, MasterProduct
+from inventory_app.models import ChannelMasterLink, MasterProduct, StockInboundEntry
 
 
 class MasterRemoteError(Exception):
@@ -65,6 +65,18 @@ def _row_to_link(row: Dict[str, Any]) -> ChannelMasterLink:
         product_key=str(row.get("product_key") or ""),
         master_id=int(row.get("master_id") or 0),
         multiplier=max(1, int(row.get("multiplier") or 1)),
+        created_at=_parse_datetime(row.get("created_at")),
+        updated_at=_parse_datetime(row.get("updated_at")),
+    )
+
+
+def _row_to_stock_inbound(row: Dict[str, Any]) -> StockInboundEntry:
+    return StockInboundEntry(
+        id=(int(row["id"]) if row.get("id") is not None else None),
+        receipt_date=str(row.get("receipt_date") or ""),
+        master_id=int(row.get("master_id") or 0),
+        channel=str(row.get("channel") or ""),
+        quantity=max(0, int(row.get("quantity") or 0)),
         created_at=_parse_datetime(row.get("created_at")),
         updated_at=_parse_datetime(row.get("updated_at")),
     )
@@ -250,3 +262,41 @@ class MasterRemoteClient:
         data = self._request("PUT", "/master-links/multiplier", json_body=body)
         row = data.get("link") or {}
         return _row_to_link(row)
+
+    # -- stock inbounds ------------------------------------------------
+
+    def list_stock_inbounds(
+        self,
+        *,
+        receipt_date: Optional[str] = None,
+        master_id: Optional[int] = None,
+        channel: Optional[str] = None,
+    ) -> List[StockInboundEntry]:
+        params: Dict[str, Any] = {}
+        if receipt_date:
+            params["date"] = str(receipt_date)
+        if master_id is not None:
+            params["master_id"] = int(master_id)
+        if channel:
+            params["channel"] = str(channel)
+        data = self._request("GET", "/stock-inbounds", params=params or None)
+        rows = data.get("items") or []
+        return [_row_to_stock_inbound(r) for r in rows if isinstance(r, dict)]
+
+    def add_stock_inbound(
+        self,
+        *,
+        receipt_date: str,
+        master_id: int,
+        channel: str,
+        quantity: int,
+    ) -> StockInboundEntry:
+        body = {
+            "receipt_date": str(receipt_date or "").strip(),
+            "master_id": int(master_id),
+            "channel": str(channel or "").strip(),
+            "quantity": int(quantity),
+        }
+        data = self._request("POST", "/stock-inbounds", json_body=body)
+        row = data.get("item") or {}
+        return _row_to_stock_inbound(row)

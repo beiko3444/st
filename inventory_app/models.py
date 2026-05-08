@@ -43,6 +43,17 @@ class ChannelMasterLink:
 
 
 @dataclass
+class StockInboundEntry:
+    id: Optional[int]
+    receipt_date: str
+    master_id: int
+    channel: str
+    quantity: int
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass
 class PurchaseRecord:
     id: Optional[int]
     channel: str

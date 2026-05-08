@@ -228,6 +228,27 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
+        elif path == "/stock-inbounds":
+            receipt_date = (qs.get("date", [None])[0] or "").strip() or None
+            channel = (qs.get("channel", [None])[0] or "").strip().lower() or None
+            raw_master_id = (qs.get("master_id", [None])[0] or "").strip() or None
+            master_id = None
+            if raw_master_id is not None:
+                try:
+                    master_id = int(raw_master_id)
+                except (TypeError, ValueError):
+                    self._send_json({"error": "invalid master_id"}, 400)
+                    return
+            try:
+                rows = db.list_stock_inbounds(
+                    receipt_date=receipt_date,
+                    master_id=master_id,
+                    channel=channel,
+                )
+                self._send_json({"items": rows})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
         elif path == "/purchase-records":
             channel = (qs.get("channel", [None])[0] or "").strip().lower() or None
             try:
@@ -402,6 +423,22 @@ class Handler(BaseHTTPRequestHandler):
                     multiplier=int(body.get("multiplier") or 1),
                 )
                 self._send_json({"link": link}, 201)
+            except (ValueError, TypeError) as e:
+                self._send_json({"error": str(e)}, 400)
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/stock-inbounds":
+            try:
+                body = self._read_json_body()
+                row = db.add_stock_inbound(
+                    receipt_date=str(body.get("receipt_date") or ""),
+                    master_id=int(body.get("master_id") or 0),
+                    channel=str(body.get("channel") or ""),
+                    quantity=int(body.get("quantity") or 0),
+                )
+                self._send_json({"item": row}, 201)
             except (ValueError, TypeError) as e:
                 self._send_json({"error": str(e)}, 400)
             except Exception as e:
