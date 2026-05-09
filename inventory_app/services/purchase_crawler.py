@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import re
 import shutil
+import subprocess
 import sys
 import time
+import importlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -83,15 +85,38 @@ def _profile_dir(channel: str) -> Path:
 
 
 def _ensure_playwright() -> None:
-    if sync_playwright is None:
-        raise PlaywrightUnavailable(
-            "playwright \ud328\ud0a4\uc9c0\uac00 \uc5c6\uc2b5\ub2c8\ub2e4. requirements.txt \uc124\uce58 \ud6c4 \ub2e4\uc2dc \ube4c\ub4dc\ud574\uc8fc\uc138\uc694."
+    global sync_playwright, PlaywrightTimeoutError
+    if sync_playwright is not None:
+        return
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "playwright"],
+            check=True,
+            capture_output=True,
+            text=True,
         )
+        module = importlib.import_module("playwright.sync_api")
+        PlaywrightTimeoutError = module.TimeoutError
+        sync_playwright = module.sync_playwright
+    except Exception as exc:  # noqa: BLE001
+        raise PlaywrightUnavailable(
+            "playwright 패키지 자동 설치에 실패했습니다. 네트워크/권한을 확인하고 다시 시도해주세요."
+        ) from exc
 
 
 def ensure_browser_installed(progress: Optional[CrawlerProgress] = None) -> None:
     progress = progress or CrawlerProgress()
     _ensure_playwright()
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        # Edge/Chrome 채널 사용이 가능한 경우에는 브라우저 번들 설치가 없어도 동작.
+        pass
     # The collector intentionally uses a normal visible browser profile. It does not
     # install evasion scripts or modify browser fingerprints. Edge/Chrome are tried
     # first because they are normally already present on Windows.

@@ -3974,9 +3974,9 @@ class MainWindow(QMainWindow):
         self.keyword_tab.sync_finished.connect(self._on_sub_sync_finished)
         self._on_purchase_pi_done.connect(self._on_purchase_pi_finished, Qt.QueuedConnection)
         self._on_inventory_pi_done.connect(self._on_inventory_pi_finished, Qt.QueuedConnection)
+        self.tabs.setCurrentWidget(self.product_master_tab)
         QTimer.singleShot(0, self._load_initial_visible_channel_tab)
-        # 자동 동기화는 사용자가 요청할 때만 (F5 또는 동기화 버튼).
-        # 시작 시에는 캐시만 표시하고 네트워크 호출 안 함.
+        QTimer.singleShot(150, self._auto_initial_sync)
 
     def _auto_initial_sync(self) -> None:
         """시작 시 자동 동기화 트리거. 이미 동기화 중이면 건너뜀."""
@@ -4002,9 +4002,9 @@ class MainWindow(QMainWindow):
         self.sync_progress.setFormat("대기 중 0%")
         self.sync_progress.setVisible(False)
 
+        self.tabs.addTab(self.product_master_tab, "상품관리")
         self.tabs.addTab(self.naver_tab, "네이버")
         self.tabs.addTab(self.coupang_tab, "쿠팡")
-        self.tabs.addTab(self.product_master_tab, "상품등록")
         self.tabs.addTab(self.sales_daily_tab, "판매일보")
         self.tabs.addTab(self.revenue_tab, "매출비교")
         self.tabs.addTab(self.keyword_tab, "키워드매출")
