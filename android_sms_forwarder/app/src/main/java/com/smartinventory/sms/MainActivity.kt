@@ -1,25 +1,24 @@
 package com.smartinventory.sms
 
-import android.Manifest
 import android.content.Intent
-import android.content.pm.PackageManager
-import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import android.view.View
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.ContextCompat
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
@@ -42,14 +41,6 @@ class MainActivity : AppCompatActivity() {
             .build()
     }
 
-    private val permLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { result ->
-        val granted = result.values.all { it }
-        if (granted) toast("권한 허용 완료") else toast("일부 권한이 거부되었습니다")
-        refreshStatus()
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -66,11 +57,11 @@ class MainActivity : AppCompatActivity() {
 
         urlEdit.setText(cfg.url)
         tokenEdit.setText(cfg.token)
-        filterEdit.setText(cfg.senderFilter)
+        filterEdit.setText(cfg.keywordFilter)
         enabledCheck.isChecked = cfg.enabled
 
-        findViewById<Button>(R.id.saveBtn).setOnClickListener { saveConfig() }
-        findViewById<Button>(R.id.permBtn).setOnClickListener { requestPerms() }
+        findViewById<Button>(R.id.saveBtn).setOnClickListener { saveConfig(showToast = true) }
+        findViewById<Button>(R.id.permBtn).setOnClickListener { openNotificationAccess() }
         findViewById<Button>(R.id.testBtn).setOnClickListener { testConnection() }
         findViewById<Button>(R.id.fetchBtn).setOnClickListener { fetchRecent() }
         findViewById<Button>(R.id.clearLogBtn).setOnClickListener {
@@ -90,43 +81,36 @@ class MainActivity : AppCompatActivity() {
         refreshLog()
     }
 
-    private fun saveConfig() {
+    private fun saveConfig(showToast: Boolean = false) {
         cfg.url = urlEdit.text.toString().trim()
         cfg.token = tokenEdit.text.toString().trim()
-        cfg.senderFilter = filterEdit.text.toString().trim()
+        cfg.keywordFilter = filterEdit.text.toString().trim()
         cfg.enabled = enabledCheck.isChecked
-        toast("저장됨")
+        if (showToast) toast("저장됨")
         refreshStatus()
     }
 
-    private fun requestPerms() {
-        val perms = mutableListOf(
-            Manifest.permission.RECEIVE_SMS,
-            Manifest.permission.READ_SMS,
-        )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            perms += Manifest.permission.POST_NOTIFICATIONS
+    private fun openNotificationAccess() {
+        saveConfig()
+        try {
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        } catch (_: Exception) {
+            startActivity(Intent(Settings.ACTION_SETTINGS))
         }
-        permLauncher.launch(perms.toTypedArray())
     }
 
     private fun openBatteryOptimization() {
         try {
-            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                data = Uri.parse("package:$packageName")
-            }
-            startActivity(intent)
-        } catch (_: Exception) {
             startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        } catch (_: Exception) {
+            startActivity(Intent(Settings.ACTION_SETTINGS))
         }
     }
 
     private fun refreshStatus() {
-        val smsOk = ContextCompat.checkSelfPermission(this, Manifest.permission.RECEIVE_SMS) ==
-            PackageManager.PERMISSION_GRANTED
-        val readOk = ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) ==
-            PackageManager.PERMISSION_GRANTED
+        val notificationAccess = SmsNotificationListenerService.isEnabled(this)
         val urlSet = cfg.url.isNotBlank()
+        val keywordSet = cfg.keywordFilter.isNotBlank()
         val on = cfg.enabled
 
         statusText.text = buildString {
@@ -134,10 +118,10 @@ class MainActivity : AppCompatActivity() {
             append(if (on) "ON" else "OFF")
             append("  ·  URL: ")
             append(if (urlSet) "설정됨" else "미설정")
-            append("\n권한 — 수신: ")
-            append(if (smsOk) "OK" else "필요")
-            append(", 읽기: ")
-            append(if (readOk) "OK" else "필요")
+            append("\n알림 접근: ")
+            append(if (notificationAccess) "OK" else "필요")
+            append("  ·  키워드: ")
+            append(if (keywordSet) "설정됨" else "미설정")
         }
     }
 
@@ -146,23 +130,51 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun testConnection() {
+        saveConfig()
         val base = cfg.url.trim().trimEnd('/')
         if (base.isEmpty()) {
             toast("URL을 먼저 입력하세요")
             return
         }
+        val token = cfg.token.trim()
+        if (token.isEmpty()) {
+            toast("토큰을 먼저 입력하세요")
+            return
+        }
         statusText.text = "테스트 중..."
         thread {
+            val nowMs = System.currentTimeMillis()
+            val fmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).apply {
+                timeZone = TimeZone.getDefault()
+            }
+            val deviceId = try {
+                Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: ""
+            } catch (_: Exception) {
+                ""
+            }
+            val payload = JSONObject().apply {
+                put("msg_key", "sms-test|$deviceId|$nowMs")
+                put("sender", "SMS_FORWARDER_TEST")
+                put("body", "[SMS 포워더 연결 테스트] 라즈베리 DB 저장 확인")
+                put("received_at", fmt.format(Date(nowMs)))
+                put("received_at_ms", nowMs)
+                put("device_id", deviceId)
+                put("raw", JSONObject().apply {
+                    put("source", "android_connection_test")
+                    put("app", packageName)
+                })
+            }
             val req = Request.Builder()
-                .url("$base/sms-messages?limit=1")
+                .url("$base/sms-messages")
+                .post(payload.toString().toRequestBody(JSON))
                 .apply {
-                    val t = cfg.token.trim()
-                    if (t.isNotEmpty()) header("Authorization", "Bearer $t")
+                    header("Authorization", "Bearer $token")
+                    header("X-Api-Token", token)
                 }
                 .build()
             try {
                 httpClient.newCall(req).execute().use { resp ->
-                    val msg = if (resp.isSuccessful) "연결 OK (HTTP ${resp.code})"
+                    val msg = if (resp.isSuccessful) "전송 테스트 OK (HTTP ${resp.code})"
                     else "응답 HTTP ${resp.code}"
                     AppLog.append(this, "테스트: $msg")
                     runOnUiThread {
@@ -184,6 +196,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun fetchRecent() {
+        saveConfig()
         val base = cfg.url.trim().trimEnd('/')
         if (base.isEmpty()) {
             toast("URL을 먼저 입력하세요")
@@ -237,4 +250,8 @@ class MainActivity : AppCompatActivity() {
 
     @Suppress("unused")
     private fun urlEnc(s: String): String = URLEncoder.encode(s, "UTF-8")
+
+    companion object {
+        private val JSON = "application/json; charset=utf-8".toMediaType()
+    }
 }

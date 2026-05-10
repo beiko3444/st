@@ -14,7 +14,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="라즈베리 SMS 포워더"
+            android:text="라즈베리 알림 포워더"
             android:textSize="22sp"
             android:textStyle="bold"
             android:textColor="#0f172a"
@@ -23,7 +23,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="수신 SMS 를 라즈베리 서버로 실시간 전송"
+            android:text="문자앱 알림 중 키워드가 들어간 내용만 라즈베리 서버로 전송"
             android:textSize="13sp"
             android:textColor="#64748b"
             android:paddingBottom="16dp" />
@@ -48,7 +48,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="토큰 (선택 — 사용 시 Authorization: Bearer 로 전송)"
+            android:text="API 토큰 (Authorization: Bearer / X-Api-Token)"
             android:textColor="#334155"
             android:paddingBottom="4dp" />
 
@@ -56,7 +56,7 @@
             android:id="@+id/tokenEdit"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="(없으면 비워둠)"
+            android:hint="라즈베리 서버에 설정한 SMS API 토큰"
             android:inputType="text"
             android:singleLine="true"
             android:autofillHints="off"
@@ -65,7 +65,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="발신자/내용 필터 (콤마 구분, 비우면 전체)"
+            android:text="저장할 문자 키워드 (콤마/줄바꿈 구분)"
             android:textColor="#334155"
             android:paddingBottom="4dp" />
 
@@ -73,7 +73,7 @@
             android:id="@+id/filterEdit"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="예: 신한카드, 1599, 쿠팡"
+            android:hint="예: 승인, 입금, 쿠팡"
             android:inputType="text"
             android:singleLine="true"
             android:autofillHints="off"
@@ -105,7 +105,7 @@
                 android:layout_weight="1"
                 android:layout_height="wrap_content"
                 android:layout_marginStart="8dp"
-                android:text="권한 요청" />
+                android:text="알림 접근 허용" />
 
         </LinearLayout>
 

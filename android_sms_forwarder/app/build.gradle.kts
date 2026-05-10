@@ -8,11 +8,22 @@ android {
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.smartinventory.sms"
-        minSdk = 24
+        applicationId = "com.beiko.raspberry.notifyforwarder"
+        minSdk = 23
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.0.1"
+    }
+
+    setProperty("archivesBaseName", "raspberry-notify-forwarder")
+
+    signingConfigs {
+        getByName("debug") {
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
+            enableV4Signing = false
+        }
     }
 
     buildTypes {
@@ -24,7 +35,6 @@ android {
             )
         }
         debug {
-            applicationIdSuffix = ".debug"
             isDebuggable = true
         }
     }

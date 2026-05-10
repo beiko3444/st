@@ -13,10 +13,10 @@ class Config(ctx: Context) {
         get() = prefs.getString(KEY_TOKEN, "") ?: ""
         set(v) { prefs.edit().putString(KEY_TOKEN, v).apply() }
 
-    /** comma-separated allow-list. empty = all. */
-    var senderFilter: String
-        get() = prefs.getString(KEY_FILTER, "") ?: ""
-        set(v) { prefs.edit().putString(KEY_FILTER, v).apply() }
+    /** comma/semicolon/newline-separated body keyword allow-list. empty = do not forward. */
+    var keywordFilter: String
+        get() = prefs.getString(KEY_KEYWORDS, prefs.getString(KEY_LEGACY_FILTER, "") ?: "") ?: ""
+        set(v) { prefs.edit().putString(KEY_KEYWORDS, v).apply() }
 
     var enabled: Boolean
         get() = prefs.getBoolean(KEY_ENABLED, true)
@@ -26,7 +26,8 @@ class Config(ctx: Context) {
         private const val PREF = "sms_forwarder"
         private const val KEY_URL = "url"
         private const val KEY_TOKEN = "token"
-        private const val KEY_FILTER = "filter"
+        private const val KEY_KEYWORDS = "keywords"
+        private const val KEY_LEGACY_FILTER = "filter"
         private const val KEY_ENABLED = "enabled"
     }
 }

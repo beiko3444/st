@@ -9,6 +9,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONException
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -60,26 +61,16 @@ class ForwardWorker(
         }
         val receivedAtMs = inputData.getLong("received_at_ms", System.currentTimeMillis())
 
-        // 발신자 필터 (allow-list)
-        val filter = cfg.senderFilter.trim()
-        if (filter.isNotEmpty()) {
-            val allow = filter.split(',', ';').map { it.trim() }.filter { it.isNotEmpty() }
-            val matched = allow.any { needle ->
-                sender.contains(needle, ignoreCase = true) || body.contains(needle, ignoreCase = true)
-            }
-            if (!matched) {
-                AppLog.append(ctx, "필터 제외: $sender")
-                return Result.success()
-            }
-        }
-
         val deviceId = try {
             Settings.Secure.getString(ctx.contentResolver, Settings.Secure.ANDROID_ID) ?: ""
         } catch (_: Exception) {
             ""
         }
 
-        val msgKey = "sms|$sender|$receivedAtMs"
+        val msgKey = inputData.getString("msg_key").orEmpty().ifBlank {
+            "sms|$sender|$receivedAtMs"
+        }
+        val rawText = inputData.getString("raw").orEmpty()
 
         val payload = JSONObject().apply {
             put("msg_key", msgKey)
@@ -88,7 +79,17 @@ class ForwardWorker(
             put("received_at", receivedAt)
             put("received_at_ms", receivedAtMs)
             put("device_id", deviceId)
-            put("device_model", Build.MODEL ?: "")
+            put("raw", JSONObject().apply {
+                put("device_model", Build.MODEL ?: "")
+                put("android_sdk", Build.VERSION.SDK_INT)
+                if (rawText.isNotBlank()) {
+                    try {
+                        put("sms", JSONObject(rawText))
+                    } catch (_: JSONException) {
+                        put("sms", rawText)
+                    }
+                }
+            })
         }
 
         val req = Request.Builder()
@@ -96,7 +97,10 @@ class ForwardWorker(
             .post(payload.toString().toRequestBody(JSON))
             .apply {
                 val token = cfg.token.trim()
-                if (token.isNotEmpty()) header("Authorization", "Bearer $token")
+                if (token.isNotEmpty()) {
+                    header("Authorization", "Bearer $token")
+                    header("X-Api-Token", token)
+                }
             }
             .build()
 

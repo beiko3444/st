@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sys
+import hmac
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -38,6 +40,41 @@ _sync_state = {
     "result": None,
     "error": None,
 }
+
+
+def _load_sms_api_token() -> str:
+    token = os.environ.get("SMARTINVENTORY_SMS_API_TOKEN", "").strip()
+    if token:
+        return token
+    config_path = _PROJECT_ROOT / "config" / "credentials.json"
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except Exception:  # noqa: BLE001
+        return ""
+    if not isinstance(raw, dict):
+        return ""
+    candidates = [
+        raw.get("sms_api_token"),
+        raw.get("sms_token"),
+    ]
+    monitor = raw.get("monitor")
+    if isinstance(monitor, dict):
+        candidates.extend([
+            monitor.get("sms_api_token"),
+            monitor.get("sms_token"),
+        ])
+    for value in candidates:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+SMS_API_TOKEN = _load_sms_api_token()
+
+
+def _constant_time_eq(left: str, right: str) -> bool:
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
 
 
 def _run_inventory_sync() -> dict:
@@ -112,6 +149,17 @@ class Handler(BaseHTTPRequestHandler):
             return payload
         return {}
 
+    def _authorized_sms_post(self) -> bool:
+        if not SMS_API_TOKEN:
+            return True
+        auth = self.headers.get("Authorization", "").strip()
+        provided = ""
+        if auth.lower().startswith("bearer "):
+            provided = auth[7:].strip()
+        if not provided:
+            provided = self.headers.get("X-Api-Token", "").strip()
+        return bool(provided) and _constant_time_eq(provided, SMS_API_TOKEN)
+
     def do_GET(self):
         from urllib.parse import urlparse, parse_qs
 
@@ -139,6 +187,7 @@ class Handler(BaseHTTPRequestHandler):
                 "naver_collections": db.get_collection_count("naver"),
                 "coupang_collections": db.get_collection_count("coupang"),
                 "inventory_sync": _sync_status(),
+                "sms_auth_enabled": bool(SMS_API_TOKEN),
             })
 
         elif path == "/sales":
@@ -520,6 +569,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/sms-messages":
             try:
+                if not self._authorized_sms_post():
+                    self._send_json({"error": "unauthorized"}, 401)
+                    return
                 body = self._read_json_body()
                 items = body.get("items")
                 if items is None and ("sender" in body or "body" in body or "received_at" in body):
