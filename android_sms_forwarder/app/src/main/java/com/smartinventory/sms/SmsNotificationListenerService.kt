@@ -28,6 +28,8 @@ class SmsNotificationListenerService : NotificationListenerService() {
         val body = extractBody(sbn.notification.extras).trim()
         if (body.isEmpty()) return
 
+        val sender = extractSender(sbn.notification.extras, sbn.packageName)
+        val fullText = "$sender\n$body"
         val keywords = cfg.keywordFilter
             .split(',', ';', '\n')
             .map { it.trim() }
@@ -36,12 +38,11 @@ class SmsNotificationListenerService : NotificationListenerService() {
             AppLog.append(ctx, "키워드 미설정 — 알림 무시")
             return
         }
-        val matchedKeyword = keywords.firstOrNull { body.contains(it, ignoreCase = true) } ?: run {
+        val matchedKeyword = keywords.firstOrNull { fullText.contains(it, ignoreCase = true) } ?: run {
             AppLog.append(ctx, "키워드 제외 알림: ${sbn.packageName}")
             return
         }
 
-        val sender = extractSender(sbn.notification.extras, sbn.packageName)
         val tsMs = if (sbn.postTime > 0) sbn.postTime else System.currentTimeMillis()
         val iso = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).apply {
             timeZone = TimeZone.getDefault()

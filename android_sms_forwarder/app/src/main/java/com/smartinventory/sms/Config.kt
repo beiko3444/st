@@ -6,16 +6,19 @@ class Config(ctx: Context) {
     private val prefs = ctx.applicationContext.getSharedPreferences(PREF, Context.MODE_PRIVATE)
 
     var url: String
-        get() = prefs.getString(KEY_URL, "") ?: ""
+        get() = prefs.getString(KEY_URL, DEFAULT_URL) ?: DEFAULT_URL
         set(v) { prefs.edit().putString(KEY_URL, v).apply() }
 
     var token: String
-        get() = prefs.getString(KEY_TOKEN, "") ?: ""
+        get() = prefs.getString(KEY_TOKEN, DEFAULT_TOKEN) ?: DEFAULT_TOKEN
         set(v) { prefs.edit().putString(KEY_TOKEN, v).apply() }
 
     /** comma/semicolon/newline-separated body keyword allow-list. empty = do not forward. */
     var keywordFilter: String
-        get() = prefs.getString(KEY_KEYWORDS, prefs.getString(KEY_LEGACY_FILTER, "") ?: "") ?: ""
+        get() = prefs.getString(
+            KEY_KEYWORDS,
+            prefs.getString(KEY_LEGACY_FILTER, DEFAULT_KEYWORDS) ?: DEFAULT_KEYWORDS,
+        ) ?: DEFAULT_KEYWORDS
         set(v) { prefs.edit().putString(KEY_KEYWORDS, v).apply() }
 
     var enabled: Boolean
@@ -29,6 +32,9 @@ class Config(ctx: Context) {
         private const val KEY_KEYWORDS = "keywords"
         private const val KEY_LEGACY_FILTER = "filter"
         private const val KEY_ENABLED = "enabled"
+        private const val DEFAULT_URL = "https://attempts-beer-chester-regulatory.trycloudflare.com"
+        private const val DEFAULT_TOKEN = "ebe75e0d01b5d19406403f5efd0ea349c010e61759633888"
+        private const val DEFAULT_KEYWORDS = "입금,승인,결제,취소,100"
     }
 }
 
