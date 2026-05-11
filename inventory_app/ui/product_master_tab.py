@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Tuple
 
 import httpx
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from PySide6.QtCharts import (
     QBarCategoryAxis,
@@ -28,13 +28,15 @@ from PySide6.QtCharts import (
     QStackedBarSeries,
     QValueAxis,
 )
-from PySide6.QtCore import QDateTime, QObject, Qt, QTime, Signal, Slot
+from PySide6.QtCore import QDate, QDateTime, QObject, Qt, QTime, Signal, Slot
 from PySide6.QtGui import QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
     QDialogButtonBox,
+    QDateEdit,
     QFrame,
+    QFormLayout,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -43,6 +45,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -145,7 +148,7 @@ def _stock_cell_html(
         parts.append(
             f"<span style='color:#16a34a; font-weight:700'>+{pending_qty:,}</span>"
         )
-    body = " ".join(parts)
+    body = "<br>".join(parts)
     consumed_text = _format_consumed_date(consumed_at)
     if not consumed_text:
         return body
@@ -153,6 +156,55 @@ def _stock_cell_html(
         f"{body}<br>"
         f"<span style='color:#64748b; font-size:11px'>차감 {consumed_text}</span>"
     )
+
+
+class InboundInputDialog(QDialog):
+    def __init__(
+        self,
+        product_name: str,
+        channel_label: str,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("입고 수량")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        title = QLabel(f"{product_name}\n{channel_label} 재고에 몇 개를 입고시킬까요?")
+        title.setWordWrap(True)
+        root.addWidget(title)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(8)
+
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.date_edit.setDate(QDate.currentDate())
+
+        self.quantity_spin = QSpinBox()
+        self.quantity_spin.setRange(1, 1_000_000)
+        self.quantity_spin.setValue(1)
+
+        form.addRow("입고 날짜", self.date_edit)
+        form.addRow("입고 수량", self.quantity_spin)
+        root.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    @property
+    def receipt_date(self) -> str:
+        return self.date_edit.date().toString("yyyy-MM-dd")
+
+    @property
+    def quantity(self) -> int:
+        return int(self.quantity_spin.value())
 
 
 class _ImageSignals(QObject):
@@ -1397,22 +1449,15 @@ class ProductMasterTab(QWidget):
             return
         channel = "naver" if col_idx == _COL_NAVER_STOCK else "coupang"
         channel_label = "네이버" if channel == "naver" else "쿠팡"
-        qty, ok = QInputDialog.getInt(
-            self,
-            "입고 수량",
-            f"{master_row.master.name}\n{channel_label} 재고에 몇 개를 입고시킬까요?",
-            1,
-            1,
-            1000000,
-            1,
-        )
-        if not ok:
+        dlg = InboundInputDialog(master_row.master.name, channel_label, self)
+        if dlg.exec() != QDialog.Accepted:
             return
         try:
             self.service.remote.add_stock_inbound(
                 master_id=master_id,
                 channel=channel,
-                quantity=int(qty),
+                quantity=dlg.quantity,
+                receipt_date=dlg.receipt_date,
             )
         except MasterRemoteError as exc:
             msg = "Pi 통신 실패" if exc.status == 0 else f"Pi 저장 실패 (HTTP {exc.status})"

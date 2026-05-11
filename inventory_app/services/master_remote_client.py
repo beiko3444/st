@@ -322,9 +322,10 @@ class MasterRemoteClient:
         master_id: int,
         channel: str,
         quantity: int,
+        receipt_date: Optional[str] = None,
     ) -> StockInboundEntry:
         body = {
-            "receipt_date": date.today().isoformat(),
+            "receipt_date": str(receipt_date or date.today().isoformat()).strip(),
             "master_id": int(master_id),
             "channel": str(channel or "").strip(),
             "quantity": int(quantity),
