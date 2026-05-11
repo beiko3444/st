@@ -57,6 +57,7 @@ class StockInboundEntry:
 
 @dataclass
 class StockInboundSummary:
+    master_id: int
     channel: str
     pending_qty: int
     last_consumed_at: Optional[datetime]
