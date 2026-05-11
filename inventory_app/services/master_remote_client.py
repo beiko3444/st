@@ -6,12 +6,17 @@ Pi 의 /masters, /master-links 엔드포인트를 호출해 MasterProduct/Channe
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
 
-from inventory_app.models import ChannelMasterLink, MasterProduct, StockInboundEntry
+from inventory_app.models import (
+    ChannelMasterLink,
+    MasterProduct,
+    StockInboundEntry,
+    StockInboundSummary,
+)
 
 
 class MasterRemoteError(Exception):
@@ -76,8 +81,24 @@ def _row_to_stock_inbound(row: Dict[str, Any]) -> StockInboundEntry:
         receipt_date=str(row.get("receipt_date") or ""),
         master_id=int(row.get("master_id") or 0),
         channel=str(row.get("channel") or ""),
-        quantity=max(0, int(row.get("quantity") or 0)),
+        input_qty=max(0, int(row.get("input_qty") or 0)),
+        remaining_qty=max(0, int(row.get("remaining_qty") or 0)),
+        last_consumed_at=_parse_datetime(row.get("last_consumed_at"))
+        if row.get("last_consumed_at")
+        else None,
         created_at=_parse_datetime(row.get("created_at")),
+        updated_at=_parse_datetime(row.get("updated_at")),
+    )
+
+
+def _row_to_stock_inbound_summary(row: Dict[str, Any]) -> StockInboundSummary:
+    return StockInboundSummary(
+        master_id=int(row.get("master_id") or 0),
+        channel=str(row.get("channel") or ""),
+        pending_qty=max(0, int(row.get("pending_qty") or 0)),
+        last_consumed_at=_parse_datetime(row.get("last_consumed_at"))
+        if row.get("last_consumed_at")
+        else None,
         updated_at=_parse_datetime(row.get("updated_at")),
     )
 
@@ -268,13 +289,10 @@ class MasterRemoteClient:
     def list_stock_inbounds(
         self,
         *,
-        receipt_date: Optional[str] = None,
         master_id: Optional[int] = None,
         channel: Optional[str] = None,
     ) -> List[StockInboundEntry]:
         params: Dict[str, Any] = {}
-        if receipt_date:
-            params["date"] = str(receipt_date)
         if master_id is not None:
             params["master_id"] = int(master_id)
         if channel:
@@ -283,16 +301,30 @@ class MasterRemoteClient:
         rows = data.get("items") or []
         return [_row_to_stock_inbound(r) for r in rows if isinstance(r, dict)]
 
+    def list_stock_inbound_summaries(
+        self,
+        *,
+        master_id: Optional[int] = None,
+        channel: Optional[str] = None,
+    ) -> List[StockInboundSummary]:
+        params: Dict[str, Any] = {}
+        if master_id is not None:
+            params["master_id"] = int(master_id)
+        if channel:
+            params["channel"] = str(channel)
+        data = self._request("GET", "/stock-inbounds", params=params or None)
+        rows = data.get("summaries") or []
+        return [_row_to_stock_inbound_summary(r) for r in rows if isinstance(r, dict)]
+
     def add_stock_inbound(
         self,
         *,
-        receipt_date: str,
         master_id: int,
         channel: str,
         quantity: int,
     ) -> StockInboundEntry:
         body = {
-            "receipt_date": str(receipt_date or "").strip(),
+            "receipt_date": date.today().isoformat(),
             "master_id": int(master_id),
             "channel": str(channel or "").strip(),
             "quantity": int(quantity),
@@ -300,3 +332,12 @@ class MasterRemoteClient:
         data = self._request("POST", "/stock-inbounds", json_body=body)
         row = data.get("item") or {}
         return _row_to_stock_inbound(row)
+
+    def reconcile_stock_inbounds(self, items: List[Dict[str, Any]]) -> List[StockInboundSummary]:
+        data = self._request(
+            "POST",
+            "/stock-inbounds/reconcile",
+            json_body={"items": items},
+        )
+        rows = data.get("summaries") or []
+        return [_row_to_stock_inbound_summary(r) for r in rows if isinstance(r, dict)]

@@ -28,13 +28,12 @@ from PySide6.QtCharts import (
     QStackedBarSeries,
     QValueAxis,
 )
-from PySide6.QtCore import QDate, QDateTime, QObject, Qt, QTime, Signal, Slot
+from PySide6.QtCore import QDateTime, QObject, Qt, QTime, Signal, Slot
 from PySide6.QtGui import QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
     QDialogButtonBox,
-    QDateEdit,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -50,7 +49,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from inventory_app.models import ChannelProduct, MasterProduct, StockInboundEntry
+from inventory_app.models import ChannelProduct, MasterProduct, StockInboundSummary
 from inventory_app.services.image_cache import get_image_bytes
 from inventory_app.services.local_cache import ChannelProductCache
 from inventory_app.services.master_product_service import (
@@ -128,13 +127,31 @@ def _number_item(text: str, sort_value) -> QTableWidgetItem:
     return item
 
 
-def _inbound_display_text(base_value: Optional[int], inbound_qty: int) -> str:
-    base_text = _format_int(base_value)
-    if inbound_qty <= 0:
-        return base_text
+def _format_consumed_date(value: Optional[date | datetime]) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    return value.isoformat()
+
+
+def _stock_cell_html(
+    base_value: Optional[int],
+    pending_qty: int,
+    consumed_at: Optional[datetime],
+) -> str:
+    parts = [f"<span>{_format_int(base_value)}</span>"]
+    if pending_qty > 0:
+        parts.append(
+            f"<span style='color:#16a34a; font-weight:700'>+{pending_qty:,}</span>"
+        )
+    body = " ".join(parts)
+    consumed_text = _format_consumed_date(consumed_at)
+    if not consumed_text:
+        return body
     return (
-        f"<span>{base_text}</span> "
-        f"<span style='color:#16a34a; font-weight:700'>+{inbound_qty:,}</span>"
+        f"{body}<br>"
+        f"<span style='color:#64748b; font-size:11px'>차감 {consumed_text}</span>"
     )
 
 
@@ -975,8 +992,7 @@ class ProductMasterTab(QWidget):
         )
         self._remote_refresh_warning: str = ""
         self._current_aggregation: MasterAggregation | None = None
-        self._inbound_mode_enabled = False
-        self._inbound_rows: Dict[tuple[int, str], StockInboundEntry] = {}
+        self._inbound_summaries: Dict[tuple[int, str], StockInboundSummary] = {}
 
         self._loader = _ImageLoader()
         self._loader.signals.loaded.connect(self._on_image_loaded)
@@ -998,22 +1014,11 @@ class ProductMasterTab(QWidget):
         self.detail_button = QPushButton("상세")
         self.detail_button.setToolTip("선택된 마스터 상품 상세 편집 (행 더블클릭으로도 가능)")
         self.detail_button.clicked.connect(self._on_detail_button_clicked)
-        self.inbound_mode_button = QPushButton("입고모드")
-        self.inbound_mode_button.setCheckable(True)
-        self.inbound_mode_button.toggled.connect(self._on_inbound_mode_toggled)
-        self.inbound_date_edit = QDateEdit()
-        self.inbound_date_edit.setCalendarPopup(True)
-        self.inbound_date_edit.setDisplayFormat("yyyy-MM-dd")
-        self.inbound_date_edit.setDate(QDate.currentDate())
-        self.inbound_date_edit.setVisible(False)
-        self.inbound_date_edit.dateChanged.connect(self._on_inbound_date_changed)
         self.summary_label = QLabel("")
         self.summary_label.setStyleSheet("color: #475569;")
         toolbar.addWidget(self.new_master_button)
         toolbar.addWidget(self.detail_button)
         toolbar.addWidget(self.refresh_button)
-        toolbar.addWidget(self.inbound_mode_button)
-        toolbar.addWidget(self.inbound_date_edit)
         toolbar.addStretch(1)
         toolbar.addWidget(self.summary_label)
         root_layout.addLayout(toolbar)
@@ -1038,7 +1043,7 @@ class ProductMasterTab(QWidget):
         }
         for col, w in _col_widths.items():
             self.master_table.setColumnWidth(col, w)
-        self.master_table.verticalHeader().setDefaultSectionSize(48)
+        self.master_table.verticalHeader().setDefaultSectionSize(58)
         for total_col in (7, 11, 12, 15):
             header_item = self.master_table.horizontalHeaderItem(total_col)
             if header_item is not None:
@@ -1075,35 +1080,79 @@ class ProductMasterTab(QWidget):
             elif not self._remote_refresh_warning:
                 self._remote_refresh_warning = "판매 집계 미동기화 (Pi /sales/totals 실패)"
         self._current_aggregation = self.service.aggregate(rows_by_channel)
-        self._reload_inbound_rows()
+        self._reconcile_stock_inbounds()
+        self._reload_inbound_summaries()
         self._render_master_table()
         self._render_summary()
 
-    def _reload_inbound_rows(self) -> None:
-        self._inbound_rows = {}
-        if not self._inbound_mode_enabled:
+    def _reconcile_stock_inbounds(self) -> None:
+        remote = self.service.remote
+        if remote is None:
+            self._remote_refresh_warning = "Pi 미연결: 입고 기능 비활성"
+            return
+        if self._current_aggregation is None:
+            return
+        items: List[Dict[str, int | str]] = []
+        for row in self._current_aggregation.masters:
+            if row.naver_stock is not None:
+                items.append(
+                    {
+                        "master_id": int(row.master.id),
+                        "channel": "naver",
+                        "current_stock": int(row.naver_stock),
+                    }
+                )
+            if row.coupang_stock is not None:
+                items.append(
+                    {
+                        "master_id": int(row.master.id),
+                        "channel": "coupang",
+                        "current_stock": int(row.coupang_stock),
+                    }
+                )
+        try:
+            summaries = remote.reconcile_stock_inbounds(items)
+        except MasterRemoteError as exc:
+            if exc.status == 0:
+                self._remote_refresh_warning = "Pi 오프라인: 입고 자동 차감 실패"
+            else:
+                self._remote_refresh_warning = f"Pi 입고 차감 실패 (HTTP {exc.status})"
+            return
+        self._inbound_summaries = {
+            (int(row.master_id), str(row.channel).strip().lower()): row
+            for row in summaries
+        }
+
+    def _reload_inbound_summaries(self) -> None:
+        if self._inbound_summaries:
             return
         remote = self.service.remote
         if remote is None:
-            self._remote_refresh_warning = "Pi 미연결: 입고모드는 라즈베리파이 저장이 필요합니다."
             return
         try:
-            rows = remote.list_stock_inbounds(
-                receipt_date=self.inbound_date_edit.date().toString("yyyy-MM-dd")
-            )
+            rows = remote.list_stock_inbound_summaries()
         except MasterRemoteError as exc:
             if exc.status == 0:
                 self._remote_refresh_warning = "Pi 오프라인: 입고내역을 불러오지 못했습니다."
             else:
                 self._remote_refresh_warning = f"Pi 입고 조회 실패 (HTTP {exc.status})"
             return
-        self._inbound_rows = {
-            (int(row.master_id), str(row.channel).strip().lower()): row for row in rows
+        self._inbound_summaries = {
+            (int(row.master_id), str(row.channel).strip().lower()): row
+            for row in rows
         }
 
-    def _inbound_quantity(self, master_id: int, channel: str) -> int:
-        row = self._inbound_rows.get((int(master_id), str(channel).strip().lower()))
-        return int(row.quantity) if row is not None else 0
+    def _inbound_pending_qty(self, master_id: int, channel: str) -> int:
+        row = self._inbound_summaries.get((int(master_id), str(channel).strip().lower()))
+        return int(row.pending_qty) if row is not None else 0
+
+    def _inbound_last_consumed_at(
+        self,
+        master_id: int,
+        channel: str,
+    ) -> Optional[datetime]:
+        row = self._inbound_summaries.get((int(master_id), str(channel).strip().lower()))
+        return row.last_consumed_at if row is not None else None
 
     def _render_summary(self) -> None:
         if self._current_aggregation is None:
@@ -1120,8 +1169,8 @@ class ProductMasterTab(QWidget):
             unit_cost = mr.master.unit_cost
             stock = mr.total_stock
             if stock is not None:
-                stock += self._inbound_quantity(mr.master.id, "naver")
-                stock += self._inbound_quantity(mr.master.id, "coupang")
+                stock += self._inbound_pending_qty(mr.master.id, "naver")
+                stock += self._inbound_pending_qty(mr.master.id, "coupang")
             if unit_cost is None or stock is None:
                 continue
             total_stock_cost += int(unit_cost) * int(stock)
@@ -1143,16 +1192,15 @@ class ProductMasterTab(QWidget):
             f"= {total_today_revenue:,}원"
         )
         cost_text = f"재고원가 합계 {total_stock_cost:,}원"
-        inbound_total = sum(int(row.quantity) for row in self._inbound_rows.values())
+        inbound_total = sum(int(row.pending_qty) for row in self._inbound_summaries.values())
         warn = self._remote_refresh_warning or ""
         base = (
             f"{revenue_text}  |  {cost_text}  |  "
             f"마스터 {total_masters}개 · 미연결 채널상품 {unlinked_count}개"
         )
-        if self._inbound_mode_enabled:
+        if inbound_total > 0:
             base += (
-                f"  |  입고기준일 {self.inbound_date_edit.date().toString('yyyy-MM-dd')}"
-                f" · 입고합계 {inbound_total:,}개"
+                f"  |  입고대기 합계 {inbound_total:,}개"
             )
         self.summary_label.setText(f"{base}  |  ⚠ {warn}" if warn else base)
 
@@ -1169,9 +1217,12 @@ class ProductMasterTab(QWidget):
 
     def _populate_master_row(self, row_idx: int, master_row: MasterProductRow) -> None:
         master = master_row.master
-        naver_inbound = self._inbound_quantity(master.id, "naver")
-        coupang_inbound = self._inbound_quantity(master.id, "coupang")
+        naver_inbound = self._inbound_pending_qty(master.id, "naver")
+        coupang_inbound = self._inbound_pending_qty(master.id, "coupang")
+        naver_consumed_at = self._inbound_last_consumed_at(master.id, "naver")
+        coupang_consumed_at = self._inbound_last_consumed_at(master.id, "coupang")
         total_inbound = naver_inbound + coupang_inbound
+        total_consumed_at = self._latest_consumed_at(naver_consumed_at, coupang_consumed_at)
 
         image_label = QLabel()
         image_label.setAlignment(Qt.AlignCenter)
@@ -1192,13 +1243,13 @@ class ProductMasterTab(QWidget):
             row_idx, 4, _number_item(_format_price(master_row.coupang_price), master_row.coupang_price)
         )
         self._set_stock_display_cell(
-            row_idx, _COL_NAVER_STOCK, master_row.naver_stock, naver_inbound
+            row_idx, _COL_NAVER_STOCK, master_row.naver_stock, naver_inbound, naver_consumed_at
         )
         self._set_stock_display_cell(
-            row_idx, _COL_COUPANG_STOCK, master_row.coupang_stock, coupang_inbound
+            row_idx, _COL_COUPANG_STOCK, master_row.coupang_stock, coupang_inbound, coupang_consumed_at
         )
         self._set_stock_display_cell(
-            row_idx, _COL_TOTAL_STOCK, master_row.total_stock, total_inbound
+            row_idx, _COL_TOTAL_STOCK, master_row.total_stock, total_inbound, total_consumed_at
         )
         total_stock_for_cost = master_row.total_stock
         if total_stock_for_cost is not None:
@@ -1254,27 +1305,32 @@ class ProductMasterTab(QWidget):
         col_idx: int,
         base_value: Optional[int],
         inbound_qty: int,
+        consumed_at: Optional[datetime],
     ) -> None:
         sort_value: Optional[int] = None
         if base_value is not None:
             sort_value = int(base_value) + max(0, int(inbound_qty))
         elif inbound_qty > 0:
             sort_value = int(inbound_qty)
-        display_text = _format_int(sort_value) if inbound_qty <= 0 else ""
         self.master_table.setItem(
             row_idx,
             col_idx,
-            _number_item(display_text, sort_value),
+            _number_item("", sort_value),
         )
-        if inbound_qty <= 0:
-            self.master_table.removeCellWidget(row_idx, col_idx)
-            return
         label = QLabel()
         label.setTextFormat(Qt.RichText)
         label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        label.setText(_inbound_display_text(base_value, inbound_qty))
-        label.setStyleSheet("padding-right: 6px; background: palette(base);")
+        label.setText(_stock_cell_html(base_value, inbound_qty, consumed_at))
+        label.setStyleSheet("padding-right: 6px; background: transparent;")
+        label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.master_table.setCellWidget(row_idx, col_idx, label)
+
+    @staticmethod
+    def _latest_consumed_at(*values: Optional[datetime]) -> Optional[datetime]:
+        present = [value for value in values if value is not None]
+        if not present:
+            return None
+        return max(present)
 
     # ------------------------------------------------------------------
     # Table interaction
@@ -1291,11 +1347,7 @@ class ProductMasterTab(QWidget):
         return int(data) if data is not None else None
 
     def _on_row_double_clicked(self, index) -> None:
-        if (
-            self._inbound_mode_enabled
-            and index is not None
-            and index.column() in (_COL_NAVER_STOCK, _COL_COUPANG_STOCK)
-        ):
+        if index is not None and index.column() in (_COL_NAVER_STOCK, _COL_COUPANG_STOCK):
             self._open_inbound_input(index.row(), index.column())
             return
         master_id = self._selected_master_id()
@@ -1328,28 +1380,6 @@ class ProductMasterTab(QWidget):
     def _on_dialog_changed(self) -> None:
         self.masters_changed.emit()
 
-    def _on_inbound_mode_toggled(self, checked: bool) -> None:
-        self._inbound_mode_enabled = bool(checked)
-        self.inbound_date_edit.setVisible(self._inbound_mode_enabled)
-        if self._inbound_mode_enabled:
-            self.inbound_date_edit.setDate(QDate.currentDate())
-            if self.service.remote is None:
-                QMessageBox.warning(
-                    self,
-                    "Pi 연결 필요",
-                    "입고모드는 라즈베리파이 DB에 저장됩니다. monitor_url 연결 상태를 확인하세요.",
-                )
-        self._reload_inbound_rows()
-        self._render_master_table()
-        self._render_summary()
-
-    def _on_inbound_date_changed(self, _date: QDate) -> None:
-        if not self._inbound_mode_enabled:
-            return
-        self._reload_inbound_rows()
-        self._render_master_table()
-        self._render_summary()
-
     def _open_inbound_input(self, row_idx: int, col_idx: int) -> None:
         if self._current_aggregation is None or self.service.remote is None:
             QMessageBox.warning(
@@ -1380,7 +1410,6 @@ class ProductMasterTab(QWidget):
             return
         try:
             self.service.remote.add_stock_inbound(
-                receipt_date=self.inbound_date_edit.date().toString("yyyy-MM-dd"),
                 master_id=master_id,
                 channel=channel,
                 quantity=int(qty),
@@ -1389,7 +1418,8 @@ class ProductMasterTab(QWidget):
             msg = "Pi 통신 실패" if exc.status == 0 else f"Pi 저장 실패 (HTTP {exc.status})"
             QMessageBox.critical(self, "입고 저장 실패", msg)
             return
-        self._reload_inbound_rows()
+        self._inbound_summaries = {}
+        self._reload_inbound_summaries()
         self._render_master_table()
         self._render_summary()
 

@@ -48,8 +48,18 @@ class StockInboundEntry:
     receipt_date: str
     master_id: int
     channel: str
-    quantity: int
+    input_qty: int
+    remaining_qty: int
+    last_consumed_at: Optional[datetime]
     created_at: datetime
+    updated_at: datetime
+
+
+@dataclass
+class StockInboundSummary:
+    channel: str
+    pending_qty: int
+    last_consumed_at: Optional[datetime]
     updated_at: datetime
 
 

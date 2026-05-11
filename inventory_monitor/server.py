@@ -278,7 +278,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(e)}, 500)
 
         elif path == "/stock-inbounds":
-            receipt_date = (qs.get("date", [None])[0] or "").strip() or None
             channel = (qs.get("channel", [None])[0] or "").strip().lower() or None
             raw_master_id = (qs.get("master_id", [None])[0] or "").strip() or None
             master_id = None
@@ -289,12 +288,18 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": "invalid master_id"}, 400)
                     return
             try:
-                rows = db.list_stock_inbounds(
-                    receipt_date=receipt_date,
-                    master_id=master_id,
-                    channel=channel,
+                self._send_json(
+                    {
+                        "items": db.list_stock_inbounds(
+                            master_id=master_id,
+                            channel=channel,
+                        ),
+                        "summaries": db.list_stock_inbound_summaries(
+                            master_id=master_id,
+                            channel=channel,
+                        ),
+                    }
                 )
-                self._send_json({"items": rows})
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
@@ -490,6 +495,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"item": row}, 201)
             except (ValueError, TypeError) as e:
                 self._send_json({"error": str(e)}, 400)
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/stock-inbounds/reconcile":
+            try:
+                body = self._read_json_body()
+                items = body.get("items") or []
+                if not isinstance(items, list):
+                    self._send_json({"error": "items must be a list"}, 400)
+                    return
+                self._send_json(db.reconcile_stock_inbounds(items))
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
             return

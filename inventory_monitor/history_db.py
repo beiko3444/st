@@ -150,10 +150,11 @@ class InventoryHistoryDB:
                     receipt_date TEXT NOT NULL,
                     master_id INTEGER NOT NULL,
                     channel TEXT NOT NULL,
-                    quantity INTEGER NOT NULL,
+                    input_qty INTEGER NOT NULL,
+                    remaining_qty INTEGER NOT NULL,
+                    last_consumed_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    UNIQUE(receipt_date, master_id, channel),
                     FOREIGN KEY (master_id) REFERENCES master_products(id) ON DELETE CASCADE
                 )
                 """
@@ -164,6 +165,25 @@ class InventoryHistoryDB:
                 ON stock_inbounds(receipt_date, channel)
                 """
             )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_stock_inbounds_pending
+                ON stock_inbounds(master_id, channel, receipt_date, id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS stock_inbound_snapshots (
+                    master_id INTEGER NOT NULL,
+                    channel TEXT NOT NULL,
+                    last_stock INTEGER NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    PRIMARY KEY (master_id, channel),
+                    FOREIGN KEY (master_id) REFERENCES master_products(id) ON DELETE CASCADE
+                )
+                """
+            )
+            self._migrate_stock_inbounds_schema(conn)
             # 구매내역(쿠팡/네이버 주문) 캐시
             conn.execute(
                 """
@@ -909,14 +929,37 @@ class InventoryHistoryDB:
 
     @staticmethod
     def _row_to_stock_inbound_dict(row: tuple) -> dict:
-        inbound_id, receipt_date, master_id, channel, quantity, created_at, updated_at = row
+        (
+            inbound_id,
+            receipt_date,
+            master_id,
+            channel,
+            input_qty,
+            remaining_qty,
+            last_consumed_at,
+            created_at,
+            updated_at,
+        ) = row
         return {
             "id": int(inbound_id),
             "receipt_date": str(receipt_date or ""),
             "master_id": int(master_id),
             "channel": str(channel or ""),
-            "quantity": int(quantity or 0),
+            "input_qty": int(input_qty or 0),
+            "remaining_qty": int(remaining_qty or 0),
+            "last_consumed_at": (str(last_consumed_at) if last_consumed_at else None),
             "created_at": str(created_at or ""),
+            "updated_at": str(updated_at or ""),
+        }
+
+    @staticmethod
+    def _row_to_stock_inbound_summary_dict(row: tuple) -> dict:
+        master_id, channel, pending_qty, last_consumed_at, updated_at = row
+        return {
+            "master_id": int(master_id),
+            "channel": str(channel or ""),
+            "pending_qty": int(pending_qty or 0),
+            "last_consumed_at": (str(last_consumed_at) if last_consumed_at else None),
             "updated_at": str(updated_at or ""),
         }
 
@@ -1186,6 +1229,82 @@ class InventoryHistoryDB:
             conn.commit()
         return self.get_link(channel_key, item_key)
 
+    @staticmethod
+    def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+        return {
+            str(row[1]).strip().lower()
+            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+
+    def _migrate_stock_inbounds_schema(self, conn: sqlite3.Connection) -> None:
+        cols = self._table_columns(conn, "stock_inbounds")
+        if not cols or ("input_qty" in cols and "remaining_qty" in cols):
+            return
+
+        conn.execute("ALTER TABLE stock_inbounds RENAME TO stock_inbounds_legacy")
+        conn.execute(
+            """
+            CREATE TABLE stock_inbounds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                receipt_date TEXT NOT NULL,
+                master_id INTEGER NOT NULL,
+                channel TEXT NOT NULL,
+                input_qty INTEGER NOT NULL,
+                remaining_qty INTEGER NOT NULL,
+                last_consumed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (master_id) REFERENCES master_products(id) ON DELETE CASCADE
+            )
+            """
+        )
+
+        legacy_cols = self._table_columns(conn, "stock_inbounds_legacy")
+        if "quantity" in legacy_cols:
+            conn.execute(
+                """
+                INSERT INTO stock_inbounds (
+                    id, receipt_date, master_id, channel,
+                    input_qty, remaining_qty, last_consumed_at,
+                    created_at, updated_at
+                )
+                SELECT id, receipt_date, master_id, channel,
+                       quantity, quantity, NULL, created_at, updated_at
+                FROM stock_inbounds_legacy
+                """
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO stock_inbounds (
+                    id, receipt_date, master_id, channel,
+                    input_qty, remaining_qty, last_consumed_at,
+                    created_at, updated_at
+                )
+                SELECT id, receipt_date, master_id, channel,
+                       input_qty,
+                       remaining_qty,
+                       last_consumed_at,
+                       created_at,
+                       updated_at
+                FROM stock_inbounds_legacy
+                """
+            )
+
+        conn.execute("DROP TABLE stock_inbounds_legacy")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_stock_inbounds_date
+            ON stock_inbounds(receipt_date, channel)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_stock_inbounds_pending
+            ON stock_inbounds(master_id, channel, receipt_date, id)
+            """
+        )
+
     def list_stock_inbounds(
         self,
         receipt_date: str | None = None,
@@ -1207,14 +1326,49 @@ class InventoryHistoryDB:
         with self._guard, self._connection() as conn:
             rows = conn.execute(
                 f"""
-                SELECT id, receipt_date, master_id, channel, quantity, created_at, updated_at
+                SELECT
+                    id, receipt_date, master_id, channel,
+                    input_qty, remaining_qty, last_consumed_at,
+                    created_at, updated_at
                 FROM stock_inbounds
                 {where_sql}
-                ORDER BY receipt_date DESC, updated_at DESC, id DESC
+                ORDER BY receipt_date DESC, created_at DESC, id DESC
                 """,
                 params,
             ).fetchall()
         return [self._row_to_stock_inbound_dict(r) for r in rows]
+
+    def list_stock_inbound_summaries(
+        self,
+        master_id: int | None = None,
+        channel: str | None = None,
+    ) -> List[dict]:
+        where: list[str] = []
+        params: list[object] = []
+        if master_id is not None:
+            where.append("master_id = ?")
+            params.append(int(master_id))
+        if channel:
+            where.append("channel = ?")
+            params.append(self._norm_channel(channel))
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        with self._guard, self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    master_id,
+                    channel,
+                    SUM(remaining_qty) AS pending_qty,
+                    MAX(last_consumed_at) AS last_consumed_at,
+                    MAX(updated_at) AS updated_at
+                FROM stock_inbounds
+                {where_sql}
+                GROUP BY master_id, channel
+                ORDER BY master_id ASC, channel ASC
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_stock_inbound_summary_dict(r) for r in rows]
 
     def add_stock_inbound(
         self,
@@ -1241,40 +1395,24 @@ class InventoryHistoryDB:
             ).fetchone()
             if not master_exists:
                 raise ValueError("master not found")
-            existing = conn.execute(
+            cursor = conn.execute(
                 """
-                SELECT id, quantity, created_at
-                FROM stock_inbounds
-                WHERE receipt_date = ? AND master_id = ? AND channel = ?
+                INSERT INTO stock_inbounds (
+                    receipt_date, master_id, channel,
+                    input_qty, remaining_qty, last_consumed_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
                 """,
-                (clean_date, int(master_id), channel_key),
-            ).fetchone()
-            if existing:
-                inbound_id = int(existing[0])
-                total_qty = int(existing[1] or 0) + qty
-                created_at = str(existing[2] or now)
-                conn.execute(
-                    """
-                    UPDATE stock_inbounds
-                    SET quantity = ?, created_at = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (total_qty, created_at, now, inbound_id),
-                )
-            else:
-                cursor = conn.execute(
-                    """
-                    INSERT INTO stock_inbounds (
-                        receipt_date, master_id, channel, quantity, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (clean_date, int(master_id), channel_key, qty, now, now),
-                )
-                inbound_id = int(cursor.lastrowid)
+                (clean_date, int(master_id), channel_key, qty, qty, now, now),
+            )
+            inbound_id = int(cursor.lastrowid)
             conn.commit()
             row = conn.execute(
                 """
-                SELECT id, receipt_date, master_id, channel, quantity, created_at, updated_at
+                SELECT
+                    id, receipt_date, master_id, channel,
+                    input_qty, remaining_qty, last_consumed_at,
+                    created_at, updated_at
                 FROM stock_inbounds
                 WHERE id = ?
                 """,
@@ -1283,6 +1421,100 @@ class InventoryHistoryDB:
         if row is None:
             raise ValueError("stock inbound save failed")
         return self._row_to_stock_inbound_dict(row)
+
+    def reconcile_stock_inbounds(self, observations: List[dict]) -> dict:
+        now = datetime.now().isoformat()
+        consumed: List[dict] = []
+        baselines = 0
+        reconciled = 0
+
+        with self._guard, self._connection() as conn:
+            for raw in observations:
+                try:
+                    master_id = int(raw.get("master_id") or 0)
+                    channel = self._norm_channel(raw.get("channel"))
+                    current_stock = int(raw.get("current_stock"))
+                except (TypeError, ValueError):
+                    continue
+                if master_id <= 0 or channel not in ("naver", "coupang") or current_stock < 0:
+                    continue
+
+                previous = conn.execute(
+                    """
+                    SELECT last_stock
+                    FROM stock_inbound_snapshots
+                    WHERE master_id = ? AND channel = ?
+                    """,
+                    (master_id, channel),
+                ).fetchone()
+                if previous is None:
+                    conn.execute(
+                        """
+                        INSERT INTO stock_inbound_snapshots (
+                            master_id, channel, last_stock, observed_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (master_id, channel, current_stock, now),
+                    )
+                    baselines += 1
+                    continue
+
+                previous_stock = int(previous[0] or 0)
+                delta = current_stock - previous_stock
+                if delta > 0:
+                    pending_rows = conn.execute(
+                        """
+                        SELECT id, remaining_qty
+                        FROM stock_inbounds
+                        WHERE master_id = ? AND channel = ? AND remaining_qty > 0
+                        ORDER BY receipt_date ASC, id ASC
+                        """,
+                        (master_id, channel),
+                    ).fetchall()
+                    remaining_delta = delta
+                    for inbound_id, remaining_qty in pending_rows:
+                        if remaining_delta <= 0:
+                            break
+                        available = int(remaining_qty or 0)
+                        use_qty = min(remaining_delta, available)
+                        next_remaining = available - use_qty
+                        conn.execute(
+                            """
+                            UPDATE stock_inbounds
+                            SET remaining_qty = ?, last_consumed_at = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (next_remaining, now, now, int(inbound_id)),
+                        )
+                        consumed.append(
+                            {
+                                "id": int(inbound_id),
+                                "master_id": master_id,
+                                "channel": channel,
+                                "consumed_qty": use_qty,
+                                "remaining_qty": next_remaining,
+                            }
+                        )
+                        remaining_delta -= use_qty
+
+                conn.execute(
+                    """
+                    UPDATE stock_inbound_snapshots
+                    SET last_stock = ?, observed_at = ?
+                    WHERE master_id = ? AND channel = ?
+                    """,
+                    (current_stock, now, master_id, channel),
+                )
+                reconciled += 1
+
+            conn.commit()
+
+        return {
+            "baselines": baselines,
+            "reconciled": reconciled,
+            "consumed": consumed,
+            "summaries": self.list_stock_inbound_summaries(),
+        }
 
     # ── 구매내역 (쿠팡/네이버 주문) ──
 
