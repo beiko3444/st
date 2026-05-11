@@ -1422,6 +1422,13 @@ class InventoryHistoryDB:
             raise ValueError("stock inbound save failed")
         return self._row_to_stock_inbound_dict(row)
 
+    def delete_stock_inbound(self, inbound_id: int) -> int:
+        with self._guard, self._connection() as conn:
+            before = conn.total_changes
+            conn.execute("DELETE FROM stock_inbounds WHERE id = ?", (int(inbound_id),))
+            conn.commit()
+            return conn.total_changes - before
+
     def reconcile_stock_inbounds(self, observations: List[dict]) -> dict:
         now = datetime.now().isoformat()
         consumed: List[dict] = []

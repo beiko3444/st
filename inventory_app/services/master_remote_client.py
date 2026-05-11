@@ -334,6 +334,10 @@ class MasterRemoteClient:
         row = data.get("item") or {}
         return _row_to_stock_inbound(row)
 
+    def delete_stock_inbound(self, inbound_id: int) -> int:
+        data = self._request("DELETE", f"/stock-inbounds/{int(inbound_id)}")
+        return int(data.get("deleted") or 0)
+
     def reconcile_stock_inbounds(self, items: List[Dict[str, Any]]) -> List[StockInboundSummary]:
         data = self._request(
             "POST",

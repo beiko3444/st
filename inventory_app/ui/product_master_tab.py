@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
+    QGroupBox,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -52,7 +53,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from inventory_app.models import ChannelProduct, MasterProduct, StockInboundSummary
+from inventory_app.models import ChannelProduct, MasterProduct, StockInboundEntry, StockInboundSummary
 from inventory_app.services.image_cache import get_image_bytes
 from inventory_app.services.local_cache import ChannelProductCache
 from inventory_app.services.master_product_service import (
@@ -158,23 +159,34 @@ def _stock_cell_html(
     )
 
 
-class InboundInputDialog(QDialog):
+class InboundManageDialog(QDialog):
     def __init__(
         self,
         product_name: str,
         channel_label: str,
+        entries: List[StockInboundEntry],
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("입고 수량")
+        self.setWindowTitle("입고 관리")
+        self._entries: List[StockInboundEntry] = list(entries)
+        self.delete_requested_id: Optional[int] = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(10)
 
-        title = QLabel(f"{product_name}\n{channel_label} 재고에 몇 개를 입고시킬까요?")
+        title = QLabel(f"{product_name}\n{channel_label} 입고 추가 및 삭제")
         title.setWordWrap(True)
         root.addWidget(title)
+
+        content = QHBoxLayout()
+        content.setSpacing(12)
+        root.addLayout(content, 1)
+
+        input_box = QGroupBox("입고 추가")
+        input_layout = QVBoxLayout(input_box)
+        input_layout.setSpacing(10)
 
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
@@ -191,12 +203,82 @@ class InboundInputDialog(QDialog):
 
         form.addRow("입고 날짜", self.date_edit)
         form.addRow("입고 수량", self.quantity_spin)
-        root.addLayout(form)
+        input_layout.addLayout(form)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
+        add_btn = QPushButton("입고 추가")
+        add_btn.clicked.connect(self.accept)
+        input_layout.addWidget(add_btn)
+        input_layout.addStretch(1)
+        content.addWidget(input_box, 0)
+
+        list_box = QGroupBox("입고 리스트")
+        list_layout = QVBoxLayout(list_box)
+        list_layout.setSpacing(10)
+
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["ID", "입고일", "입고", "잔여", "차감일", "수정일"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        list_layout.addWidget(self.table, 1)
+        self._fill_entries()
+
+        delete_btn = QPushButton("선택 입고 삭제")
+        delete_btn.clicked.connect(self._request_delete)
+        list_layout.addWidget(delete_btn)
+        content.addWidget(list_box, 1)
+
+        row = QHBoxLayout()
+        close_btn = QPushButton("닫기")
+        close_btn.clicked.connect(self.reject)
+        row.addStretch(1)
+        row.addWidget(close_btn)
+        root.addLayout(row)
+
+        self.resize(920, 500)
+
+    def _fill_entries(self) -> None:
+        self.table.setRowCount(0)
+        for entry in sorted(
+            self._entries,
+            key=lambda it: (str(it.receipt_date), int(it.id or 0)),
+            reverse=True,
+        ):
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            values = [
+                str(entry.id or ""),
+                str(entry.receipt_date or ""),
+                f"{int(entry.input_qty):,}",
+                f"{int(entry.remaining_qty):,}",
+                _format_consumed_date(entry.last_consumed_at),
+                entry.updated_at.strftime("%Y-%m-%d %H:%M") if entry.updated_at else "",
+            ]
+            for c, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if c == 0:
+                    item.setData(Qt.UserRole, int(entry.id or 0))
+                self.table.setItem(r, c, item)
+
+    def _request_delete(self) -> None:
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            QMessageBox.information(self, "선택 필요", "삭제할 입고 행을 선택하세요.")
+            return
+        item = self.table.item(rows[0].row(), 0)
+        inbound_id = int(item.data(Qt.UserRole) or 0) if item is not None else 0
+        if inbound_id <= 0:
+            return
+        if QMessageBox.question(
+            self,
+            "입고 삭제",
+            f"선택한 입고 #{inbound_id}를 삭제할까요?",
+        ) != QMessageBox.Yes:
+            return
+        self.delete_requested_id = inbound_id
+        self.done(2)
 
     @property
     def receipt_date(self) -> str:
@@ -1449,8 +1531,31 @@ class ProductMasterTab(QWidget):
             return
         channel = "naver" if col_idx == _COL_NAVER_STOCK else "coupang"
         channel_label = "네이버" if channel == "naver" else "쿠팡"
-        dlg = InboundInputDialog(master_row.master.name, channel_label, self)
-        if dlg.exec() != QDialog.Accepted:
+        try:
+            entries = self.service.remote.list_stock_inbounds(
+                master_id=master_id,
+                channel=channel,
+            )
+        except MasterRemoteError as exc:
+            msg = "Pi 통신 실패" if exc.status == 0 else f"Pi 입고 조회 실패 (HTTP {exc.status})"
+            QMessageBox.critical(self, "입고 조회 실패", msg)
+            return
+
+        dlg = InboundManageDialog(master_row.master.name, channel_label, entries, self)
+        result = dlg.exec()
+        if result == 2 and dlg.delete_requested_id:
+            try:
+                self.service.remote.delete_stock_inbound(dlg.delete_requested_id)
+            except MasterRemoteError as exc:
+                msg = "Pi 통신 실패" if exc.status == 0 else f"Pi 삭제 실패 (HTTP {exc.status})"
+                QMessageBox.critical(self, "입고 삭제 실패", msg)
+                return
+            self._inbound_summaries = {}
+            self._reload_inbound_summaries()
+            self._render_master_table()
+            self._render_summary()
+            return
+        if result != QDialog.Accepted:
             return
         try:
             self.service.remote.add_stock_inbound(

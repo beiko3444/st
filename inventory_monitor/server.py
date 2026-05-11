@@ -728,6 +728,18 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         qs = parse_qs(parsed.query)
 
+        inbound_match = _STOCK_INBOUND_RE.match(path)
+        if inbound_match is not None:
+            try:
+                deleted = db.delete_stock_inbound(int(inbound_match.group(1)))
+                if deleted <= 0:
+                    self._send_json({"error": "not found"}, 404)
+                else:
+                    self._send_json({"deleted": deleted})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
         if path == "/shared-stock":
             try:
                 channel = str((qs.get("channel", [None])[0] or "")).strip().lower()
@@ -801,6 +813,7 @@ class Handler(BaseHTTPRequestHandler):
 
 _MASTER_ID_RE = re.compile(r"^/masters/(\d+)$")
 _MASTER_REP_RE = re.compile(r"^/masters/(\d+)/representative$")
+_STOCK_INBOUND_RE = re.compile(r"^/stock-inbounds/(\d+)$")
 _CARD_USAGE_RE = re.compile(r"^/card-usages/(.+)$")
 _FIXED_COST_RE = re.compile(r"^/fixed-costs/(\d+)$")
 
