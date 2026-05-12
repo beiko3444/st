@@ -78,7 +78,7 @@ _SETTINGS_APP = "SmartInventory"
 _FASSTO_LAST_IN_WAY_KEY = "fassto/last_in_way"
 _FASSTO_LAST_WH_CD_KEY = "fassto/last_wh_cd"
 _FASSTO_LAST_SUP_CD_KEY = "fassto/last_sup_cd"
-_FASSTO_DEFAULT_IN_WAY = ("02", "차량")
+_FASSTO_DEFAULT_IN_WAY = ("01", "택배")
 _FASSTO_DEFAULT_WH = ("YI21", "용인2센터 1층")
 _FASSTO_DEFAULT_SUP = ("99999999", "미지정 공급사")
 
@@ -610,7 +610,7 @@ class _WarehousingWriteDialog(_FasstoWriteDialog):
         )
         self.in_way_combo = _combo_with_options(
             _merge_options([_FASSTO_DEFAULT_IN_WAY], in_way_options),
-            initial_in_way or saved_in_way or _FASSTO_DEFAULT_IN_WAY[0],
+            initial_in_way or _FASSTO_DEFAULT_IN_WAY[0],
         )
         if saved_wh_cd:
             _select_or_add_combo_value(self.wh_cd_combo, saved_wh_cd, "최근 사용")
