@@ -70,6 +70,7 @@ from inventory_app.connectors.fassto import (
     normalize_fassto_stocks,
     normalize_fassto_warehousings,
     summarize_delivery_good_details,
+    warehousing_status_name,
 )
 
 
@@ -2107,10 +2108,11 @@ class _WarehousingSubTab(QWidget):
                 self.header_view.setPlainText("데이터가 없습니다.")
                 return
             header = rows[0] if isinstance(rows[0], dict) else {}
+            status_name = warehousing_status_name(header.get("wrkStat"), header.get("wrkStatNm"))
             header_lines = [
                 f"전표: {header.get('slipNo', '')} / 발주번호: {header.get('ordNo') or '-'}",
                 f"일자: {_fmt_yyyymmdd(header.get('ordDt'))} / 창고: {header.get('whNm', '')} ({header.get('whCd', '')})",
-                f"공급사: {header.get('supNm', '')} / 입고방식: {header.get('inWayNm', '')} / 상태: {header.get('wrkStatNm', '')}",
+                f"공급사: {header.get('supNm', '')} / 입고방식: {header.get('inWayNm', '')} / 상태: {status_name or '-'}",
                 f"수량(주문/입고/타겟): {_fmt_num(header.get('ordQty'))} / {_fmt_num(header.get('inQty'))} / {_fmt_num(header.get('tarQty'))} · SKU: {_fmt_num(header.get('sku'))}",
                 f"택배: {header.get('parcelComp', '')} / 송장: {header.get('parcelInvoiceNo') or '-'}",
             ]

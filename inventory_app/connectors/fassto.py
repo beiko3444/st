@@ -670,6 +670,23 @@ class FasstoDeliveryGoodDetailRow:
     raw: Any = field(default=None, repr=False)
 
 
+WAREHOUSING_STATUS_NAMES = {
+    "1": "입고요청",
+    "2": "검수중",
+    "3": "검수완료",
+    "4": "입고완료",
+    "5": "입고취소",
+}
+
+
+def warehousing_status_name(status_code: Any, status_name: Any = None) -> Optional[str]:
+    name = _to_text(status_name)
+    if name:
+        return name
+    code = _to_text(status_code)
+    return WAREHOUSING_STATUS_NAMES.get(code) if code else None
+
+
 def _serial_to_text(value: Any) -> Optional[str]:
     """goodsSerialNo 가 list로 오는 케이스 대응."""
     if value is None:
@@ -876,10 +893,10 @@ def normalize_fassto_warehousings(
                 parcelInvoiceNo=_to_text(row.get("parcelInvoiceNo")) or None,
                 wrkStat=_to_text(_first_defined(row.get("wrkStat"), row.get("status"), row.get("crgSt")))
                 or None,
-                wrkStatNm=_to_text(
-                    _first_defined(row.get("wrkStatNm"), row.get("statusNm"), row.get("crgStNm"))
-                )
-                or None,
+                wrkStatNm=warehousing_status_name(
+                    _first_defined(row.get("wrkStat"), row.get("status"), row.get("crgSt")),
+                    _first_defined(row.get("wrkStatNm"), row.get("statusNm"), row.get("crgStNm")),
+                ),
                 remark=_to_text(row.get("remark")) or None,
                 raw=row,
             )
@@ -1560,6 +1577,7 @@ __all__ = [
     "normalize_fassto_delivery_parcels",
     "normalize_fassto_delivery_good_details",
     "summarize_delivery_good_details",
+    "warehousing_status_name",
     "normalize_product_code",
     "build_goods_payload",
     "build_warehousing_payload",
