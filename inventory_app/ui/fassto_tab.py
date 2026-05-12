@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import csv
 import json
+from html import escape as _html_escape
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from PySide6.QtCore import QDate, QObject, QSettings, QThread, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtCore import QDate, QObject, QSettings, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtGui import QColor, QTextDocument
+from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -61,6 +63,7 @@ from inventory_app.connectors.fassto import (
     FasstoStockRow,
     FasstoWarehousingRow,
     build_warehousing_payload,
+    build_warehousing_statement_rows,
     extract_fassto_list,
     normalize_fassto_deliveries,
     normalize_fassto_delivery_good_details,
@@ -70,8 +73,6 @@ from inventory_app.connectors.fassto import (
     normalize_fassto_stocks,
     normalize_fassto_warehousings,
     summarize_delivery_good_details,
-    warehousing_cancel_check,
-    warehousing_status_name,
 )
 
 
@@ -83,7 +84,6 @@ _FASSTO_LAST_SUP_CD_KEY = "fassto/last_sup_cd"
 _FASSTO_DEFAULT_IN_WAY = ("01", "택배")
 _FASSTO_DEFAULT_WH = ("YI21", "용인2센터 1층")
 _FASSTO_DEFAULT_SUP = ("99999999", "미지정 공급사")
-_FASSTO_WEB_URL = "https://fms.fassto.ai"
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +345,138 @@ def _export_table_to_csv(
 
 def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2)
+
+
+def _trim_for_json_preview(
+    value: Any,
+    *,
+    max_depth: int = 4,
+    max_items: int = 40,
+    max_string: int = 300,
+) -> Any:
+    if max_depth <= 0:
+        return "..."
+    if isinstance(value, str):
+        return value[:max_string] + ("..." if len(value) > max_string else "")
+    if isinstance(value, Mapping):
+        out: Dict[str, Any] = {}
+        for idx, (k, v) in enumerate(value.items()):
+            if idx >= max_items:
+                out["..."] = f"{len(value) - max_items} more keys"
+                break
+            out[str(k)] = _trim_for_json_preview(
+                v,
+                max_depth=max_depth - 1,
+                max_items=max_items,
+                max_string=max_string,
+            )
+        return out
+    if isinstance(value, list):
+        items = [
+            _trim_for_json_preview(
+                v,
+                max_depth=max_depth - 1,
+                max_items=max_items,
+                max_string=max_string,
+            )
+            for v in value[:max_items]
+        ]
+        if len(value) > max_items:
+            items.append(f"... {len(value) - max_items} more items")
+        return items
+    return value
+
+
+def _json_preview_text(value: Any, max_chars: int = 8000) -> str:
+    text = _json_text(_trim_for_json_preview(value))
+    if len(text) > max_chars:
+        return text[:max_chars] + "\n..."
+    return text
+
+
+def _statement_cell(value: Any) -> str:
+    return _html_escape(str(value or "").strip())
+
+
+def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
+    mapped = build_warehousing_statement_rows(header)
+    items = mapped.get("items") if isinstance(mapped, Mapping) else []
+    total_qty = int(mapped.get("total_qty") or 0) if isinstance(mapped, Mapping) else 0
+    rows_html: List[str] = []
+    if isinstance(items, list):
+        for row in items:
+            if not isinstance(row, Mapping):
+                continue
+            rows_html.append(
+                "<tr>"
+                f"<td>{_statement_cell(row.get('no'))}</td>"
+                f"<td>{_statement_cell(row.get('code'))}</td>"
+                f"<td>{_statement_cell(row.get('barcode'))}</td>"
+                f"<td>{_statement_cell(row.get('name'))}</td>"
+                f"<td style='text-align:right'>{_statement_cell(row.get('qty'))}</td>"
+                "</tr>"
+            )
+    rows_blob = "".join(rows_html) or (
+        "<tr><td colspan='5' style='text-align:center'>No items</td></tr>"
+    )
+
+    slip_no = _statement_cell(header.get("slipNo"))
+    ord_no = _statement_cell(header.get("ordNo"))
+    ord_dt = _statement_cell(_fmt_yyyymmdd(header.get("ordDt")))
+    in_way = _statement_cell(header.get("inWayNm") or header.get("inWay"))
+    remark = _statement_cell(header.get("remark"))
+
+    supplier_name = _statement_cell(cfg.statement_supplier_name)
+    supplier_biz = _statement_cell(cfg.statement_supplier_biz_no)
+    supplier_ceo = _statement_cell(cfg.statement_supplier_ceo)
+    supplier_addr = _statement_cell(cfg.statement_supplier_addr)
+    supplier_tel = _statement_cell(cfg.statement_supplier_tel)
+    buyer_name = _statement_cell(cfg.statement_buyer_name or header.get("supNm"))
+    buyer_biz = _statement_cell(cfg.statement_buyer_biz_no)
+    buyer_ceo = _statement_cell(cfg.statement_buyer_ceo)
+    buyer_addr = _statement_cell(cfg.statement_buyer_addr)
+    buyer_tel = _statement_cell(cfg.statement_buyer_tel)
+    customer_name = _statement_cell(header.get("supNm") or cfg.statement_buyer_name or "-")
+
+    return f"""
+<html>
+<head>
+  <style>
+    body {{ font-family: 'Malgun Gothic', sans-serif; font-size: 11pt; color:#111; }}
+    .title {{ text-align:center; font-size: 20pt; font-weight: 700; margin-bottom: 6px; }}
+    .sub {{ margin-bottom: 10px; font-size: 12pt; font-weight: 600; }}
+    .bar {{ text-align:right; font-family: 'Consolas', monospace; letter-spacing: 1px; margin-bottom: 8px; }}
+    table {{ border-collapse: collapse; width: 100%; margin-bottom: 10px; }}
+    th, td {{ border: 1px solid #333; padding: 4px 6px; }}
+    th {{ background: #f3f3f3; }}
+    .num {{ text-align:right; }}
+  </style>
+</head>
+<body>
+  <div class="title">거래명세표</div>
+  <div class="sub">고객사명: {customer_name}</div>
+  <div class="bar">||| {slip_no} |||</div>
+  <table>
+    <tr><th colspan="4">공급자</th><th colspan="4">공급받는자</th></tr>
+    <tr><th>사업자번호</th><td colspan="3">{supplier_biz}</td><th>사업자번호</th><td colspan="3">{buyer_biz}</td></tr>
+    <tr><th>상호</th><td>{supplier_name}</td><th>성명</th><td>{supplier_ceo}</td><th>상호</th><td>{buyer_name}</td><th>성명</th><td>{buyer_ceo}</td></tr>
+    <tr><th>사업장주소</th><td colspan="3">{supplier_addr}</td><th>사업장주소</th><td colspan="3">{buyer_addr}</td></tr>
+    <tr><th>전화번호</th><td colspan="3">{supplier_tel}</td><th>전화번호</th><td colspan="3">{buyer_tel}</td></tr>
+  </table>
+  <table>
+    <tr><th>전표번호</th><td>{slip_no}</td><th>발주번호</th><td>{ord_no}</td><th>입고예정일</th><td>{ord_dt}</td><th>입고경로</th><td>{in_way}</td></tr>
+  </table>
+  <table>
+    <tr><th style="width:50px">No</th><th style="width:170px">상품코드</th><th style="width:220px">상품바코드</th><th>상품명</th><th style="width:90px">수량</th></tr>
+    {rows_blob}
+    <tr><td colspan="4" class="num"><b>합계</b></td><td class="num"><b>{total_qty:,}</b></td></tr>
+  </table>
+  <table>
+    <tr><th style="width:90px">비고</th><td>{remark}</td></tr>
+  </table>
+</body>
+</html>
+"""
 
 
 def _date_to_api_yyyymmdd(edit: QDateEdit) -> str:
@@ -1078,10 +1210,14 @@ class _DeliveryCancelDialog(QDialog):
         super().accept()
 
 
+class _WarehousingCancelDialog(_DeliveryCancelDialog):
+    def __init__(self, parent: QWidget, initial: Optional[Mapping[str, Any]] = None) -> None:
+        super().__init__(parent, initial=initial)
+        self.setWindowTitle("입고 취소")
+
+
 def _show_write_result(parent: QWidget, title: str, data: Any) -> None:
-    detail = _json_text(data)
-    if len(detail) > 12000:
-        detail = detail[:12000] + "\n..."
+    detail = _json_preview_text(data)
     message = _fassto_write_error(data)
     if not message and isinstance(data, Mapping):
         header = data.get("header")
@@ -1824,6 +1960,8 @@ class _WarehousingSubTab(QWidget):
         self.update_btn.clicked.connect(self._update_warehousing)
         self.cancel_btn = QPushButton("입고 취소")
         self.cancel_btn.clicked.connect(self._cancel_warehousing)
+        self.statement_btn = QPushButton("거래명세표 출력")
+        self.statement_btn.clicked.connect(self._print_statement)
         self.export_btn = QPushButton("CSV 저장")
         self.export_btn.clicked.connect(
             lambda: _export_table_to_csv(self.table, self, "fassto_warehousing")
@@ -1838,6 +1976,7 @@ class _WarehousingSubTab(QWidget):
         top.addWidget(self.create_btn)
         top.addWidget(self.update_btn)
         top.addWidget(self.cancel_btn)
+        top.addWidget(self.statement_btn)
         top.addWidget(self.export_btn)
 
         detail_row = QHBoxLayout()
@@ -1857,6 +1996,9 @@ class _WarehousingSubTab(QWidget):
         self.table.setSortingEnabled(True)
         self.table.cellClicked.connect(self._on_row_clicked)
         self._rows: List[FasstoWarehousingRow] = []
+        self._active_write_id: Optional[int] = None
+        self._write_seq = 0
+        self._write_watchdog: Optional[QTimer] = None
 
         splitter = QSplitter(Qt.Vertical)
         splitter.addWidget(self.table)
@@ -1953,64 +2095,6 @@ class _WarehousingSubTab(QWidget):
             payload["slipNo"] = slip
         return payload
 
-    def _selected_row(self) -> Optional[FasstoWarehousingRow]:
-        slip = self.slip_edit.text().strip()
-        if not slip:
-            return None
-        for row in self._rows:
-            if row.slipNo == slip:
-                return row
-        return None
-
-    def _cancel_warehousing(self) -> None:
-        row = self._selected_row()
-        if row is None:
-            QMessageBox.information(self, "입고 취소", "취소할 입고 전표를 선택하세요.")
-            return
-
-        allowed, reason = warehousing_cancel_check(row.wrkStat, row.wrkStatNm)
-        status_name = warehousing_status_name(row.wrkStat, row.wrkStatNm) or "-"
-        if not allowed:
-            QMessageBox.information(
-                self,
-                "입고 취소 불가",
-                "\n".join(
-                    [
-                        f"전표번호: {row.slipNo or '-'}",
-                        f"작업상태: {status_name}",
-                        reason,
-                    ]
-                ),
-            )
-            return
-
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Warning)
-        box.setWindowTitle("입고 취소")
-        box.setText("선택한 입고 전표는 파스토 웹에서 취소해야 합니다.")
-        box.setInformativeText(
-            "\n".join(
-                [
-                    "공개 OpenAPI에는 입고취소 endpoint가 없어 앱에서 직접 취소 전송은 하지 않습니다.",
-                    "파스토 웹에서 아래 전표를 검색한 뒤 입고취소를 진행하세요.",
-                    "",
-                    f"전표번호: {row.slipNo or '-'}",
-                    f"입고예정일: {_fmt_yyyymmdd(row.ordDt)}",
-                    f"작업상태: {status_name}",
-                    f"SKU: {_fmt_num(row.sku)}",
-                    f"요청수량: {_fmt_num(row.ordQty)}",
-                    f"입고수량: {_fmt_num(row.inQty)}",
-                    f"검수수량: {_fmt_num(row.tarQty)}",
-                ]
-            )
-        )
-        open_btn = box.addButton("파스토 웹 열기", QMessageBox.AcceptRole)
-        box.addButton("닫기", QMessageBox.RejectRole)
-        box.exec()
-        if box.clickedButton() == open_btn:
-            QDesktopServices.openUrl(QUrl(_FASSTO_WEB_URL))
-            self.status.setText(f"입고취소: 파스토 웹에서 {row.slipNo or ''} 전표를 취소하세요.")
-
     def _run_write(
         self,
         *,
@@ -2018,26 +2102,57 @@ class _WarehousingSubTab(QWidget):
         payload: Dict[str, Any],
         call: Callable[[List[Dict[str, Any]]], Any],
     ) -> None:
-        self.status.setText(f"{title} 요청 중...")
+        if self._active_write_id is not None:
+            QMessageBox.information(self, "??", "?? ??? ?? ?? ????.")
+            return
+        self._write_seq += 1
+        write_id = self._write_seq
+        self._active_write_id = write_id
+        self.status.setText(f"{title} ?? ?...")
         self.create_btn.setEnabled(False)
         self.update_btn.setEnabled(False)
         self.cancel_btn.setEnabled(False)
+        timeout_ms = max(15000, int(self._tab._config.timeout_seconds) * 1000 + 5000)
+        self._write_watchdog = QTimer(self)
+        self._write_watchdog.setSingleShot(True)
+
+        def on_timeout() -> None:
+            if self._active_write_id != write_id:
+                return
+            self._active_write_id = None
+            self.create_btn.setEnabled(True)
+            self.update_btn.setEnabled(True)
+            self.cancel_btn.setEnabled(True)
+            if self._write_watchdog is not None:
+                self._write_watchdog.deleteLater()
+                self._write_watchdog = None
+            self.status.setText(f"{title} ???? - ?? ??? ???.")
+
+        self._write_watchdog.timeout.connect(on_timeout)
+        self._write_watchdog.start(timeout_ms)
 
         def done(result: JobResult) -> None:
+            if self._active_write_id != write_id:
+                return
+            self._active_write_id = None
+            if self._write_watchdog is not None:
+                self._write_watchdog.stop()
+                self._write_watchdog.deleteLater()
+                self._write_watchdog = None
             self.create_btn.setEnabled(True)
             self.update_btn.setEnabled(True)
             self.cancel_btn.setEnabled(True)
             if not result.ok:
-                self.status.setText(f"❌ {title} 실패: {result.error}")
+                self.status.setText(f"?{title} ??: {result.error}")
                 return
             write_error = _fassto_write_error(result.data)
             if write_error:
-                self.status.setText(f"❌ {title} 실패: {write_error}")
-                _show_write_result(self, f"{title} 실패 응답", result.data)
+                self.status.setText(f"?{title} ??: {write_error}")
+                _show_write_result(self, f"{title} ?? ??", result.data)
                 return
             _save_fassto_warehousing_defaults(payload)
-            self.status.setText(f"✅ {title} 완료")
-            _show_write_result(self, f"{title} 응답", result.data)
+            self.status.setText(f"?{title} ??")
+            _show_write_result(self, f"{title} ??", result.data)
             self._refresh_list()
 
         _run_async(self, lambda: call([payload]), done)
@@ -2149,6 +2264,69 @@ class _WarehousingSubTab(QWidget):
 
         _run_async(self, work, done)
 
+
+    def _cancel_warehousing(self) -> None:
+        if not self._tab.require_configured(self):
+            return
+        selected = self._selected_payload()
+        dialog = _WarehousingCancelDialog(
+            self, selected or {"slipNo": self.slip_edit.text().strip()}
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        payload = dialog.payload()
+        if payload is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "?? ?? ??",
+            "? ?? ?? ??? ???? ??????",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._run_write(
+            title="?? ??",
+            payload=payload,
+            call=self._tab.connector.cancel_warehousing,
+        )
+
+    def _print_statement(self) -> None:
+        if not self._tab.require_configured(self):
+            return
+        slip = self.slip_edit.text().strip()
+        if not slip:
+            QMessageBox.information(self, "??", "????? ?????.")
+            return
+        self.status.setText("??? ??? ?? ?...")
+        self.statement_btn.setEnabled(False)
+
+        def work() -> Any:
+            return self._tab.connector.get_warehousing_detail(slip)
+
+        def done(result: JobResult) -> None:
+            self.statement_btn.setEnabled(True)
+            if not result.ok:
+                self.status.setText(f"??? ?? ??: {result.error}")
+                return
+            rows = extract_fassto_list(result.data)
+            if not rows:
+                QMessageBox.information(self, "??", "??? ?? ?? ???? ????.")
+                self.status.setText("??? ?? ??")
+                return
+            header = rows[0] if isinstance(rows[0], Mapping) else {}
+            html = _statement_table_html(header, self._tab._config)
+            document = QTextDocument(self)
+            document.setHtml(html)
+            printer = QPrinter(QPrinter.HighResolution)
+            dlg = QPrintDialog(printer, self)
+            if dlg.exec() != QDialog.Accepted:
+                self.status.setText("??? ?? ??")
+                return
+            document.print(printer)
+            self.status.setText("??? ?? ??")
+
+        _run_async(self, work, done)
+
     def _refresh_detail(self) -> None:
         if not self._tab.require_configured(self):
             return
@@ -2173,11 +2351,10 @@ class _WarehousingSubTab(QWidget):
                 self.header_view.setPlainText("데이터가 없습니다.")
                 return
             header = rows[0] if isinstance(rows[0], dict) else {}
-            status_name = warehousing_status_name(header.get("wrkStat"), header.get("wrkStatNm"))
             header_lines = [
                 f"전표: {header.get('slipNo', '')} / 발주번호: {header.get('ordNo') or '-'}",
                 f"일자: {_fmt_yyyymmdd(header.get('ordDt'))} / 창고: {header.get('whNm', '')} ({header.get('whCd', '')})",
-                f"공급사: {header.get('supNm', '')} / 입고방식: {header.get('inWayNm', '')} / 상태: {status_name or '-'}",
+                f"공급사: {header.get('supNm', '')} / 입고방식: {header.get('inWayNm', '')} / 상태: {header.get('wrkStatNm', '')}",
                 f"수량(주문/입고/타겟): {_fmt_num(header.get('ordQty'))} / {_fmt_num(header.get('inQty'))} / {_fmt_num(header.get('tarQty'))} · SKU: {_fmt_num(header.get('sku'))}",
                 f"택배: {header.get('parcelComp', '')} / 송장: {header.get('parcelInvoiceNo') or '-'}",
             ]
@@ -2296,6 +2473,9 @@ class _DeliverySubTab(QWidget):
         self.table.setSortingEnabled(True)
         self.table.cellClicked.connect(self._on_row_clicked)
         self._rows: List[FasstoDeliveryRow] = []
+        self._active_write_id: Optional[int] = None
+        self._write_seq = 0
+        self._write_watchdog: Optional[QTimer] = None
 
         splitter = QSplitter(Qt.Vertical)
         splitter.addWidget(self.table)
@@ -2404,23 +2584,53 @@ class _DeliverySubTab(QWidget):
         payload: Dict[str, Any],
         call: Callable[[List[Dict[str, Any]]], Any],
     ) -> None:
-        self.status.setText(f"{title} 요청 중...")
+        if self._active_write_id is not None:
+            QMessageBox.information(self, "??", "?? ??? ?? ?? ????.")
+            return
+        self._write_seq += 1
+        write_id = self._write_seq
+        self._active_write_id = write_id
+        self.status.setText(f"{title} ?? ?...")
         for button in (self.create_btn, self.update_btn, self.cancel_btn):
             button.setEnabled(False)
+        timeout_ms = max(15000, int(self._tab._config.timeout_seconds) * 1000 + 5000)
+        self._write_watchdog = QTimer(self)
+        self._write_watchdog.setSingleShot(True)
+
+        def on_timeout() -> None:
+            if self._active_write_id != write_id:
+                return
+            self._active_write_id = None
+            for button in (self.create_btn, self.update_btn, self.cancel_btn):
+                button.setEnabled(True)
+            if self._write_watchdog is not None:
+                self._write_watchdog.deleteLater()
+                self._write_watchdog = None
+            self.status.setText(f"{title} ???? - ?? ??? ???.")
+
+        self._write_watchdog.timeout.connect(on_timeout)
+        self._write_watchdog.start(timeout_ms)
 
         def done(result: JobResult) -> None:
+            if self._active_write_id != write_id:
+                return
+            self._active_write_id = None
+            if self._write_watchdog is not None:
+                self._write_watchdog.stop()
+                self._write_watchdog.deleteLater()
+                self._write_watchdog = None
             for button in (self.create_btn, self.update_btn, self.cancel_btn):
                 button.setEnabled(True)
             if not result.ok:
-                self.status.setText(f"❌ {title} 실패: {result.error}")
+                self.status.setText(f"?{title} ??: {result.error}")
                 return
             write_error = _fassto_write_error(result.data)
             if write_error:
-                self.status.setText(f"❌ {title} 실패: {write_error}")
-                _show_write_result(self, f"{title} 실패 응답", result.data)
+                self.status.setText(f"?{title} ??: {write_error}")
+                _show_write_result(self, f"{title} ?? ??", result.data)
                 return
-            self.status.setText(f"✅ {title} 완료")
-            _show_write_result(self, f"{title} 응답", result.data)
+            self.status.setText(f"?{title} ??")
+            _show_write_result(self, f"{title} ??", result.data)
             self._refresh()
 
         _run_async(self, lambda: call([payload]), done)

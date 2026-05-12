@@ -36,6 +36,17 @@ class AppConfig:
     barobill_corp_num: str = ""              # 사업자번호 ('-' 제거)
     barobill_user_id: str = ""               # 바로빌 계정 ID
     barobill_use_test: bool = False          # 테스트 서버 사용 여부
+    # 거래명세표(고정 출력 정보)
+    statement_supplier_biz_no: str = ""
+    statement_supplier_name: str = ""
+    statement_supplier_ceo: str = ""
+    statement_supplier_addr: str = ""
+    statement_supplier_tel: str = ""
+    statement_buyer_biz_no: str = ""
+    statement_buyer_name: str = ""
+    statement_buyer_ceo: str = ""
+    statement_buyer_addr: str = ""
+    statement_buyer_tel: str = ""
 
 
 def _get(config: Dict[str, Any], *keys: str) -> Any:
@@ -153,4 +164,34 @@ def load_config(path: Path | None = None) -> AppConfig:
         barobill_corp_num=str(_get_optional(raw, "", "barobill", "corp_num")).strip(),
         barobill_user_id=str(_get_optional(raw, "", "barobill", "id")).strip(),
         barobill_use_test=bool(_get_optional(raw, False, "barobill", "use_test")),
+        statement_supplier_biz_no=str(
+            _get_optional(raw, "", "statement", "supplier", "biz_no")
+        ).strip(),
+        statement_supplier_name=str(
+            _get_optional(raw, "", "statement", "supplier", "name")
+        ).strip(),
+        statement_supplier_ceo=str(
+            _get_optional(raw, "", "statement", "supplier", "ceo")
+        ).strip(),
+        statement_supplier_addr=str(
+            _get_optional(raw, "", "statement", "supplier", "addr")
+        ).strip(),
+        statement_supplier_tel=str(
+            _get_optional(raw, "", "statement", "supplier", "tel")
+        ).strip(),
+        statement_buyer_biz_no=str(
+            _get_optional(raw, "", "statement", "buyer", "biz_no")
+        ).strip(),
+        statement_buyer_name=str(
+            _get_optional(raw, "", "statement", "buyer", "name")
+        ).strip(),
+        statement_buyer_ceo=str(
+            _get_optional(raw, "", "statement", "buyer", "ceo")
+        ).strip(),
+        statement_buyer_addr=str(
+            _get_optional(raw, "", "statement", "buyer", "addr")
+        ).strip(),
+        statement_buyer_tel=str(
+            _get_optional(raw, "", "statement", "buyer", "tel")
+        ).strip(),
     )

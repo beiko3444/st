@@ -340,6 +340,12 @@ class FasstoConnector:
     def update_warehousing(self, items: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         return self.request("PATCH", f"/api/v1/warehousing/{self.cst_cd}", body=list(items))
 
+    def cancel_warehousing(self, items: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+        """PATCH /api/v1/warehousing/cancel/{cstCd} — 입고 요청 취소(가정 규격)."""
+        return self.request(
+            "PATCH", f"/api/v1/warehousing/cancel/{self.cst_cd}", body=list(items)
+        )
+
     def get_warehousing_list(self, start: str, end: str) -> Dict[str, Any]:
         return self.request("GET", f"/api/v1/warehousing/{self.cst_cd}/{start}/{end}")
 
@@ -1179,6 +1185,33 @@ def build_warehousing_payload(source: Mapping[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def build_warehousing_statement_rows(source: Mapping[str, Any]) -> Dict[str, Any]:
+    """입고 상세 payload에서 거래명세표 출력용 품목/합계를 추출한다."""
+    goods = source.get("goods")
+    if not isinstance(goods, list):
+        goods = []
+
+    rows: List[Dict[str, Any]] = []
+    total_qty = 0
+    for index, item in enumerate(goods, start=1):
+        if not isinstance(item, Mapping):
+            continue
+        qty = int(_to_number(_first_defined(item.get("ordQty"), item.get("inQty"), 0)))
+        total_qty += qty
+        rows.append(
+            {
+                "no": index,
+                "code": _to_text(item.get("cstGodCd")),
+                "barcode": _to_text(
+                    _first_defined(item.get("godBarcd"), item.get("barcode"), item.get("barCd"))
+                ),
+                "name": _to_text(item.get("godNm")),
+                "qty": qty,
+            }
+        )
+    return {"items": rows, "total_qty": total_qty}
+
+
 @dataclass
 class GoodsSyncDecision:
     product: Mapping[str, Any]
@@ -1598,6 +1631,7 @@ __all__ = [
     "normalize_product_code",
     "build_goods_payload",
     "build_warehousing_payload",
+    "build_warehousing_statement_rows",
     "decide_goods_sync",
     "summarize_goods_sync",
     "compare_stock",
