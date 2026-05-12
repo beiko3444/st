@@ -1557,9 +1557,7 @@ class ProductMasterTab(QWidget):
                 QMessageBox.critical(self, "입고 삭제 실패", msg)
                 return
             self._inbound_summaries = {}
-            self._reload_inbound_summaries()
-            self._render_master_table()
-            self._render_summary()
+            self.refresh()
             return
         if result != QDialog.Accepted:
             return
@@ -1575,9 +1573,7 @@ class ProductMasterTab(QWidget):
             QMessageBox.critical(self, "입고 저장 실패", msg)
             return
         self._inbound_summaries = {}
-        self._reload_inbound_summaries()
-        self._render_master_table()
-        self._render_summary()
+        self.refresh()
 
     # ------------------------------------------------------------------
     # Create master
