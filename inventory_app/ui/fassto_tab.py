@@ -60,6 +60,7 @@ from inventory_app.connectors.fassto import (
     FasstoGoodsRow,
     FasstoStockRow,
     FasstoWarehousingRow,
+    build_warehousing_payload,
     extract_fassto_list,
     normalize_fassto_deliveries,
     normalize_fassto_delivery_good_details,
@@ -75,6 +76,11 @@ from inventory_app.connectors.fassto import (
 _SETTINGS_ORG = "SmartInventory"
 _SETTINGS_APP = "SmartInventory"
 _FASSTO_LAST_IN_WAY_KEY = "fassto/last_in_way"
+_FASSTO_LAST_WH_CD_KEY = "fassto/last_wh_cd"
+_FASSTO_LAST_SUP_CD_KEY = "fassto/last_sup_cd"
+_FASSTO_DEFAULT_IN_WAY = ("02", "차량")
+_FASSTO_DEFAULT_WH = ("YI21", "용인2센터 1층")
+_FASSTO_DEFAULT_SUP = ("99999999", "미지정 공급사")
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +387,19 @@ def _unique_options(rows: Sequence[Any], code_attr: str, name_attr: str) -> List
     return options
 
 
+def _merge_options(*groups: Sequence[tuple[str, str]]) -> List[tuple[str, str]]:
+    seen: set[str] = set()
+    options: List[tuple[str, str]] = []
+    for group in groups:
+        for code, name in group:
+            code = _clean_text(code)
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            options.append((code, _clean_text(name)))
+    return options
+
+
 def _combo_with_options(options: Sequence[tuple[str, str]], current: str = "") -> QComboBox:
     combo = QComboBox()
     combo.setEditable(True)
@@ -405,6 +424,16 @@ def _combo_value(combo: QComboBox) -> str:
     if text.endswith(")") and "(" in text:
         return text.rsplit("(", 1)[1][:-1].strip()
     return text
+
+
+def _combo_display(combo: QComboBox) -> str:
+    value = _combo_value(combo)
+    text = combo.currentText().strip()
+    if text.endswith(")") and "(" in text:
+        name = text.rsplit("(", 1)[0].strip()
+        if name:
+            return f"{name} ({value})"
+    return value or "-"
 
 
 def _default_request_no(prefix: str) -> str:
@@ -439,10 +468,30 @@ def _saved_fassto_in_way() -> str:
     return str(_settings().value(_FASSTO_LAST_IN_WAY_KEY, "", type=str) or "").strip()
 
 
+def _saved_fassto_wh_cd() -> str:
+    return str(_settings().value(_FASSTO_LAST_WH_CD_KEY, "", type=str) or "").strip()
+
+
+def _saved_fassto_sup_cd() -> str:
+    return str(_settings().value(_FASSTO_LAST_SUP_CD_KEY, "", type=str) or "").strip()
+
+
 def _save_fassto_in_way(value: str) -> None:
     value = value.strip()
     if value:
         _settings().setValue(_FASSTO_LAST_IN_WAY_KEY, value)
+
+
+def _save_fassto_warehousing_defaults(payload: Mapping[str, Any]) -> None:
+    settings = _settings()
+    for key, setting_key in (
+        ("inWay", _FASSTO_LAST_IN_WAY_KEY),
+        ("whCd", _FASSTO_LAST_WH_CD_KEY),
+        ("supCd", _FASSTO_LAST_SUP_CD_KEY),
+    ):
+        value = _clean_text(payload.get(key))
+        if value:
+            settings.setValue(setting_key, value)
 
 
 class _FasstoWriteDialog(QDialog):
@@ -519,9 +568,12 @@ class _WarehousingWriteDialog(_FasstoWriteDialog):
         supplier_options: Sequence[tuple[str, str]] = (),
         in_way_options: Sequence[tuple[str, str]] = (),
         saved_in_way: str = "",
+        saved_wh_cd: str = "",
+        saved_sup_cd: str = "",
     ) -> None:
         super().__init__(parent, title, goods)
         self._update_mode = update_mode
+        self._goods_by_code = {row.cstGodCd.upper(): row for row in self._goods if row.cstGodCd}
         initial = initial or {}
 
         layout = QVBoxLayout(self)
@@ -542,15 +594,36 @@ class _WarehousingWriteDialog(_FasstoWriteDialog):
         else:
             today = date.today()
             self.ord_dt_edit.setDate(QDate(today.year, today.month, today.day))
-        self.wh_cd_combo = _combo_with_options(warehouse_options, _clean_text(initial.get("whCd")))
-        self.sup_cd_combo = _combo_with_options(supplier_options, _clean_text(initial.get("supCd")))
+        saved_wh_cd = _clean_text(saved_wh_cd)
+        saved_sup_cd = _clean_text(saved_sup_cd)
         saved_in_way = _clean_text(saved_in_way)
-        initial_in_way = _clean_text(initial.get("inWay")) or saved_in_way
-        self.in_way_combo = _combo_with_options(in_way_options, initial_in_way)
+        initial_wh_cd = _clean_text(initial.get("whCd"))
+        initial_sup_cd = _clean_text(initial.get("supCd"))
+        initial_in_way = _clean_text(initial.get("inWay"))
+        self.wh_cd_combo = _combo_with_options(
+            _merge_options([_FASSTO_DEFAULT_WH], warehouse_options),
+            initial_wh_cd or saved_wh_cd or _FASSTO_DEFAULT_WH[0],
+        )
+        self.sup_cd_combo = _combo_with_options(
+            _merge_options([_FASSTO_DEFAULT_SUP], supplier_options),
+            initial_sup_cd or saved_sup_cd or _FASSTO_DEFAULT_SUP[0],
+        )
+        self.in_way_combo = _combo_with_options(
+            _merge_options([_FASSTO_DEFAULT_IN_WAY], in_way_options),
+            initial_in_way or saved_in_way or _FASSTO_DEFAULT_IN_WAY[0],
+        )
+        if saved_wh_cd:
+            _select_or_add_combo_value(self.wh_cd_combo, saved_wh_cd, "최근 사용")
+        if saved_sup_cd:
+            _select_or_add_combo_value(self.sup_cd_combo, saved_sup_cd, "최근 사용")
         if saved_in_way:
             _select_or_add_combo_value(self.in_way_combo, saved_in_way, "최근 사용")
-            if initial_in_way and initial_in_way != saved_in_way:
-                _select_or_add_combo_value(self.in_way_combo, initial_in_way, "")
+        if initial_wh_cd:
+            _select_or_add_combo_value(self.wh_cd_combo, initial_wh_cd, _clean_text(initial.get("whNm")))
+        if initial_sup_cd:
+            _select_or_add_combo_value(self.sup_cd_combo, initial_sup_cd, _clean_text(initial.get("supNm")))
+        if initial_in_way:
+            _select_or_add_combo_value(self.in_way_combo, initial_in_way, _clean_text(initial.get("inWayNm")))
         self.in_way_combo.setPlaceholderText("예: 파스토 입고 방식 코드")
         if self.in_way_combo.lineEdit() is not None:
             self.in_way_combo.lineEdit().setPlaceholderText("파스토 입고 방식 코드를 입력하세요")
@@ -566,13 +639,13 @@ class _WarehousingWriteDialog(_FasstoWriteDialog):
         form.addRow("입고 방식(필수)", self.in_way_combo)
         layout.addWidget(form_box)
 
-        self.in_way_hint = QLabel(
-            "입고 방식은 파스토가 요구하는 코드입니다. 목록이 비어 있으면 코드를 직접 입력하세요. "
-            "성공한 코드는 다음 입고 생성 때 자동으로 불러옵니다."
-        )
-        self.in_way_hint.setWordWrap(True)
-        self.in_way_hint.setStyleSheet("color:#64748b;")
-        layout.addWidget(self.in_way_hint)
+        self.defaults_summary = QLabel("")
+        self.defaults_summary.setWordWrap(True)
+        self.defaults_summary.setStyleSheet("color:#475569;")
+        layout.addWidget(self.defaults_summary)
+        for combo in (self.in_way_combo, self.wh_cd_combo, self.sup_cd_combo):
+            combo.currentTextChanged.connect(self._update_defaults_summary)
+        self._update_defaults_summary()
 
         self.advanced_toggle = QPushButton("상세 옵션 보이기")
         self.advanced_toggle.setCheckable(True)
@@ -590,18 +663,33 @@ class _WarehousingWriteDialog(_FasstoWriteDialog):
         self._toggle_advanced(update_mode)
         layout.addWidget(self.advanced_box)
 
+        search_box = QGroupBox("상품 검색")
+        search_layout = QVBoxLayout(search_box)
         picker_row = QHBoxLayout()
-        self.goods_combo, add_btn = self._make_goods_picker()
-        self.goods_combo.setPlaceholderText("상품명/상품코드/바코드 검색")
+        self.goods_search_edit = QLineEdit()
+        self.goods_search_edit.setPlaceholderText("상품명/상품코드/바코드 입력")
+        self.goods_search_edit.textChanged.connect(self._render_goods_results)
+        self.goods_search_edit.returnPressed.connect(self._add_selected_goods)
+        add_btn = QPushButton("선택 상품 입고 품목 추가")
         add_btn.clicked.connect(self._add_selected_goods)
         remove_btn = QPushButton("선택 삭제")
         remove_btn.clicked.connect(self._remove_selected_rows)
-        picker_row.addWidget(QLabel("상품 검색"))
-        picker_row.addWidget(self.goods_combo, 1)
-        add_btn.setText("입고 품목 추가")
+        picker_row.addWidget(QLabel("검색어"))
+        picker_row.addWidget(self.goods_search_edit, 1)
         picker_row.addWidget(add_btn)
         picker_row.addWidget(remove_btn)
-        layout.addLayout(picker_row)
+        search_layout.addLayout(picker_row)
+
+        self.goods_result_table = QTableWidget(0, 3)
+        self.goods_result_table.setHorizontalHeaderLabels(["상품코드", "상품명", "바코드"])
+        self.goods_result_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.goods_result_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.goods_result_table.verticalHeader().setVisible(False)
+        self.goods_result_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.goods_result_table.horizontalHeader().setStretchLastSection(True)
+        self.goods_result_table.itemDoubleClicked.connect(lambda _item: self._add_selected_goods())
+        search_layout.addWidget(self.goods_result_table, 1)
+        layout.addWidget(search_box, 1)
 
         self.table = QTableWidget(0, len(self.COLS))
         self.table.setHorizontalHeaderLabels(self.COLS)
@@ -619,8 +707,7 @@ class _WarehousingWriteDialog(_FasstoWriteDialog):
                     if isinstance(item.get("goodsSerialNo"), list)
                     else _clean_text(item.get("goodsSerialNo")),
                 )
-        if not update_mode and self.table.rowCount() == 0:
-            self._add_selected_goods(silent=True)
+        self._render_goods_results()
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -631,6 +718,55 @@ class _WarehousingWriteDialog(_FasstoWriteDialog):
         self.advanced_box.setVisible(checked)
         self.advanced_toggle.setText("상세 옵션 숨기기" if checked else "상세 옵션 보이기")
 
+    def _update_defaults_summary(self) -> None:
+        extra = ""
+        if _combo_value(self.in_way_combo) == "01":
+            extra = " / 택배 입고는 택배사와 송장번호가 필요합니다."
+        self.defaults_summary.setText(
+            "기본값: "
+            f"입고방식 {_combo_display(self.in_way_combo)} / "
+            f"창고 {_combo_display(self.wh_cd_combo)} / "
+            f"공급사 {_combo_display(self.sup_cd_combo)}"
+            f"{extra}"
+        )
+
+    def _goods_matches_query(self, row: FasstoGoodsRow, query: str) -> bool:
+        if not query:
+            return True
+        q = query.lower()
+        return any(
+            q in value.lower()
+            for value in (row.cstGodCd, row.godNm or "", row.barcode or "")
+            if value
+        )
+
+    def _render_goods_results(self, _text: str = "") -> None:
+        query = self.goods_search_edit.text().strip()
+        matched = [row for row in self._goods if self._goods_matches_query(row, query)]
+        self.goods_result_table.setRowCount(0)
+        for row in matched[:200]:
+            r = self.goods_result_table.rowCount()
+            self.goods_result_table.insertRow(r)
+            values = [row.cstGodCd, row.godNm or "", row.barcode or ""]
+            for c, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if c == 0:
+                    item.setData(Qt.UserRole, row.cstGodCd)
+                self.goods_result_table.setItem(r, c, item)
+        self.goods_result_table.clearSelection()
+        if len(matched) == 1:
+            self.goods_result_table.selectRow(0)
+
+    def _selected_result_goods(self) -> Optional[FasstoGoodsRow]:
+        selected = self.goods_result_table.selectionModel().selectedRows()
+        if not selected and self.goods_result_table.rowCount() == 1:
+            selected = [self.goods_result_table.model().index(0, 0)]
+        if not selected:
+            return None
+        item = self.goods_result_table.item(selected[0].row(), 0)
+        code = _clean_text(item.data(Qt.UserRole) if item is not None else "")
+        return self._goods_by_code.get(code.upper())
+
     def _append_item(self, code: str, name: str, qty: Any = 1, serial: str = "") -> None:
         row = self.table.rowCount()
         self.table.insertRow(row)
@@ -640,15 +776,23 @@ class _WarehousingWriteDialog(_FasstoWriteDialog):
         _set_item(self.table, row, 3, serial)
 
     def _add_selected_goods(self, silent: bool = False) -> None:
-        code, name = self._selected_goods(self.goods_combo)
-        if not code:
+        goods = self._selected_result_goods()
+        if goods is None:
             if not silent:
-                QMessageBox.information(self, "상품 선택", "추가할 상품을 선택하거나 상품코드를 입력하세요.")
+                QMessageBox.information(self, "상품 선택", "검색 결과에서 입고할 상품을 선택하세요.")
             return
-        self._append_item(code, name, 1, "")
-        data = self.goods_combo.currentData()
-        if isinstance(data, FasstoGoodsRow):
-            _select_or_add_combo_value(self.sup_cd_combo, data.supCd or "", data.supNm or "")
+        code = goods.cstGodCd
+        for row in range(self.table.rowCount()):
+            if _item_text(self.table, row, 0).upper() == code.upper():
+                try:
+                    qty = int(float(_item_text(self.table, row, 2) or "0"))
+                except ValueError:
+                    qty = 0
+                _set_item(self.table, row, 2, qty + 1)
+                self.table.selectRow(row)
+                return
+        self._append_item(code, goods.godNm or "", 1, "")
+        _select_or_add_combo_value(self.sup_cd_combo, goods.supCd or "", goods.supNm or "")
 
     def _remove_selected_rows(self) -> None:
         for idx in sorted(self.table.selectionModel().selectedRows(), key=lambda i: i.row(), reverse=True):
@@ -660,6 +804,9 @@ class _WarehousingWriteDialog(_FasstoWriteDialog):
             code = _item_text(self.table, row, 0)
             if not code:
                 continue
+            if code.upper() not in self._goods_by_code:
+                QMessageBox.warning(self, "입력 오류", f"{row + 1}행 상품코드가 파스토 상품 목록에 없습니다: {code}")
+                return None
             try:
                 qty = int(float(_item_text(self.table, row, 2) or "0"))
             except ValueError:
@@ -680,33 +827,41 @@ class _WarehousingWriteDialog(_FasstoWriteDialog):
         if not in_way:
             QMessageBox.warning(self, "입력 오류", "입고 방식을 선택하거나 파스토 입고 방식 코드를 직접 입력하세요.")
             return None
+        ord_no = self.ord_no_edit.text().strip()
+        if not ord_no:
+            QMessageBox.warning(self, "입력 오류", "발주번호가 필요합니다.")
+            return None
+        parcel_comp = self.parcel_comp_edit.text().strip()
+        parcel_invoice_no = self.invoice_edit.text().strip()
+        if in_way == "01" and (not parcel_comp or not parcel_invoice_no):
+            QMessageBox.warning(
+                self,
+                "입력 오류",
+                "택배 입고 방식은 택배사와 송장번호가 필요합니다. 송장이 없으면 입고 방식을 차량(02)으로 선택하세요.",
+            )
+            return None
 
         body: Dict[str, Any] = {
+            "ordNo": ord_no,
             "ordDt": _date_to_api_yyyymmdd(self.ord_dt_edit),
             "goods": goods,
             "inWay": in_way,
         }
         for key, widget in (
             ("slipNo", self.slip_edit),
-            ("ordNo", self.ord_no_edit),
-            ("parcelComp", self.parcel_comp_edit),
-            ("parcelInvoiceNo", self.invoice_edit),
             ("remark", self.remark_edit),
         ):
             value = widget.text().strip()
             if value:
                 body[key] = value
-        for key, combo in (
-            ("whCd", self.wh_cd_combo),
-            ("supCd", self.sup_cd_combo),
-        ):
-            value = _combo_value(combo)
-            if value:
-                body[key] = value
+        if parcel_comp:
+            body["parcelComp"] = parcel_comp
+        if parcel_invoice_no:
+            body["parcelInvoiceNo"] = parcel_invoice_no
         if self._update_mode and not body.get("slipNo"):
             QMessageBox.warning(self, "입력 오류", "입고 수정에는 전표번호가 필요합니다.")
             return None
-        return body
+        return build_warehousing_payload(body)
 
     def accept(self) -> None:
         if self.payload() is None:
@@ -921,10 +1076,24 @@ class _DeliveryCancelDialog(QDialog):
 
 
 def _show_write_result(parent: QWidget, title: str, data: Any) -> None:
-    text = _json_text(data)
-    if len(text) > 4000:
-        text = text[:4000] + "\n..."
-    QMessageBox.information(parent, title, text)
+    detail = _json_text(data)
+    if len(detail) > 12000:
+        detail = detail[:12000] + "\n..."
+    message = _fassto_write_error(data)
+    if not message and isinstance(data, Mapping):
+        header = data.get("header")
+        if isinstance(header, Mapping):
+            header_msg = _clean_text(header.get("msg")) or "요청 처리 완료"
+            count = _clean_text(header.get("dataCount"))
+            message = f"{header_msg}" + (f" · dataCount {count}" if count else "")
+    if not message:
+        message = "요청 처리 완료"
+    box = QMessageBox(parent)
+    box.setWindowTitle(title)
+    box.setIcon(QMessageBox.Warning if "실패" in title or _fassto_write_error(data) else QMessageBox.Information)
+    box.setText(message)
+    box.setDetailedText(detail)
+    box.exec()
 
 
 def _fassto_write_error(data: Any) -> Optional[str]:
@@ -1800,7 +1969,7 @@ class _WarehousingSubTab(QWidget):
                 self.status.setText(f"❌ {title} 실패: {write_error}")
                 _show_write_result(self, f"{title} 실패 응답", result.data)
                 return
-            _save_fassto_in_way(str(payload.get("inWay") or ""))
+            _save_fassto_warehousing_defaults(payload)
             self.status.setText(f"✅ {title} 완료")
             _show_write_result(self, f"{title} 응답", result.data)
             self._refresh_list()
@@ -1843,6 +2012,8 @@ class _WarehousingSubTab(QWidget):
                 supplier_options=_unique_options(option_rows, "supCd", "supNm"),
                 in_way_options=_unique_options(option_rows, "inWay", "inWayNm"),
                 saved_in_way=_saved_fassto_in_way(),
+                saved_wh_cd=_saved_fassto_wh_cd(),
+                saved_sup_cd=_saved_fassto_sup_cd(),
             )
             if dialog.exec() != QDialog.Accepted:
                 return
@@ -1896,6 +2067,8 @@ class _WarehousingSubTab(QWidget):
                 supplier_options=_unique_options(option_rows, "supCd", "supNm"),
                 in_way_options=_unique_options(option_rows, "inWay", "inWayNm"),
                 saved_in_way=_saved_fassto_in_way(),
+                saved_wh_cd=_saved_fassto_wh_cd(),
+                saved_sup_cd=_saved_fassto_sup_cd(),
             )
             if dialog.exec() != QDialog.Accepted:
                 return

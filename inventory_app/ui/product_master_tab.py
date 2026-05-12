@@ -139,24 +139,32 @@ def _format_consumed_date(value: Optional[date | datetime]) -> str:
     return value.isoformat()
 
 
-def _stock_cell_html(
-    base_value: Optional[int],
-    pending_qty: int,
-    consumed_at: Optional[datetime],
-) -> str:
-    parts = [f"<span>{_format_int(base_value)}</span>"]
-    if pending_qty > 0:
-        parts.append(
-            f"<span style='color:#16a34a; font-weight:700'>+{pending_qty:,}</span>"
-        )
-    body = "<br>".join(parts)
-    consumed_text = _format_consumed_date(consumed_at)
-    if not consumed_text:
-        return body
-    return (
-        f"{body}<br>"
-        f"<span style='color:#64748b; font-size:11px'>차감 {consumed_text}</span>"
+def _make_stock_cell_widget(base_value: Optional[int], pending_qty: int) -> QWidget:
+    cell = QWidget()
+    cell.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+    cell.setStyleSheet("background: transparent;")
+
+    layout = QVBoxLayout(cell)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(0)
+
+    base_label = QLabel(_format_int(base_value))
+    base_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    base_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+    base_label.setStyleSheet(
+        "padding-right: 6px; border-bottom: 1px solid #e5e7eb; color: #111827;"
     )
+
+    inbound_label = QLabel(f"+{int(pending_qty):,}" if pending_qty > 0 else "")
+    inbound_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    inbound_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+    inbound_label.setStyleSheet(
+        "padding-right: 6px; color: #16a34a; font-weight: 700;"
+    )
+
+    layout.addWidget(base_label, 1)
+    layout.addWidget(inbound_label, 1)
+    return cell
 
 
 class InboundManageDialog(QDialog):
@@ -1439,7 +1447,7 @@ class ProductMasterTab(QWidget):
         col_idx: int,
         base_value: Optional[int],
         inbound_qty: int,
-        consumed_at: Optional[datetime],
+        _consumed_at: Optional[datetime],
     ) -> None:
         sort_value: Optional[int] = None
         if base_value is not None:
@@ -1451,13 +1459,11 @@ class ProductMasterTab(QWidget):
             col_idx,
             _number_item("", sort_value),
         )
-        label = QLabel()
-        label.setTextFormat(Qt.RichText)
-        label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        label.setText(_stock_cell_html(base_value, inbound_qty, consumed_at))
-        label.setStyleSheet("padding-right: 6px; background: transparent;")
-        label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.master_table.setCellWidget(row_idx, col_idx, label)
+        self.master_table.setCellWidget(
+            row_idx,
+            col_idx,
+            _make_stock_cell_widget(base_value, inbound_qty),
+        )
 
     @staticmethod
     def _latest_consumed_at(*values: Optional[datetime]) -> Optional[datetime]:

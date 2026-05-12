@@ -1104,6 +1104,48 @@ def build_goods_payload(product: Mapping[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def build_warehousing_payload(source: Mapping[str, Any]) -> Dict[str, Any]:
+    """입고 UI payload -> 파스토 WarehousingParam payload."""
+    payload: Dict[str, Any] = {}
+    for key in (
+        "ordDt",
+        "ordNo",
+        "inWay",
+        "slipNo",
+        "parcelComp",
+        "parcelInvoiceNo",
+        "remark",
+        "cstSupCd",
+        "distTermDt",
+        "makeDt",
+        "preArv",
+    ):
+        value = source.get(key)
+        if value not in (None, ""):
+            payload[key] = value
+
+    raw_goods = source.get("godCds")
+    if raw_goods is None:
+        raw_goods = source.get("goods")
+    god_cds: List[Dict[str, Any]] = []
+    if isinstance(raw_goods, Iterable) and not isinstance(raw_goods, (str, bytes, Mapping)):
+        for item in raw_goods:
+            if not isinstance(item, Mapping):
+                continue
+            cst_god_cd = str(item.get("cstGodCd") or "").strip()
+            if not cst_god_cd:
+                continue
+            god_item: Dict[str, Any] = {"cstGodCd": cst_god_cd}
+            if item.get("ordQty") not in (None, ""):
+                god_item["ordQty"] = int(float(item.get("ordQty")))
+            if item.get("distTermDt") not in (None, ""):
+                god_item["distTermDt"] = item.get("distTermDt")
+            god_cds.append(god_item)
+    if god_cds:
+        payload["godCds"] = god_cds
+    return payload
+
+
 @dataclass
 class GoodsSyncDecision:
     product: Mapping[str, Any]
@@ -1520,6 +1562,7 @@ __all__ = [
     "summarize_delivery_good_details",
     "normalize_product_code",
     "build_goods_payload",
+    "build_warehousing_payload",
     "decide_goods_sync",
     "summarize_goods_sync",
     "compare_stock",
