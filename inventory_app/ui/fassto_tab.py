@@ -22,8 +22,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from PySide6.QtCore import QDate, QObject, QSettings, QThread, Qt, Signal, Slot
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QDate, QObject, QSettings, QThread, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -70,6 +70,7 @@ from inventory_app.connectors.fassto import (
     normalize_fassto_stocks,
     normalize_fassto_warehousings,
     summarize_delivery_good_details,
+    warehousing_cancel_check,
     warehousing_status_name,
 )
 
@@ -82,6 +83,7 @@ _FASSTO_LAST_SUP_CD_KEY = "fassto/last_sup_cd"
 _FASSTO_DEFAULT_IN_WAY = ("01", "택배")
 _FASSTO_DEFAULT_WH = ("YI21", "용인2센터 1층")
 _FASSTO_DEFAULT_SUP = ("99999999", "미지정 공급사")
+_FASSTO_WEB_URL = "https://fms.fassto.ai"
 
 
 # ---------------------------------------------------------------------------
@@ -1820,6 +1822,8 @@ class _WarehousingSubTab(QWidget):
         self.create_btn.clicked.connect(self._create_warehousing)
         self.update_btn = QPushButton("입고 수정")
         self.update_btn.clicked.connect(self._update_warehousing)
+        self.cancel_btn = QPushButton("입고 취소")
+        self.cancel_btn.clicked.connect(self._cancel_warehousing)
         self.export_btn = QPushButton("CSV 저장")
         self.export_btn.clicked.connect(
             lambda: _export_table_to_csv(self.table, self, "fassto_warehousing")
@@ -1833,6 +1837,7 @@ class _WarehousingSubTab(QWidget):
         top.addWidget(self.refresh_btn)
         top.addWidget(self.create_btn)
         top.addWidget(self.update_btn)
+        top.addWidget(self.cancel_btn)
         top.addWidget(self.export_btn)
 
         detail_row = QHBoxLayout()
@@ -1948,6 +1953,64 @@ class _WarehousingSubTab(QWidget):
             payload["slipNo"] = slip
         return payload
 
+    def _selected_row(self) -> Optional[FasstoWarehousingRow]:
+        slip = self.slip_edit.text().strip()
+        if not slip:
+            return None
+        for row in self._rows:
+            if row.slipNo == slip:
+                return row
+        return None
+
+    def _cancel_warehousing(self) -> None:
+        row = self._selected_row()
+        if row is None:
+            QMessageBox.information(self, "입고 취소", "취소할 입고 전표를 선택하세요.")
+            return
+
+        allowed, reason = warehousing_cancel_check(row.wrkStat, row.wrkStatNm)
+        status_name = warehousing_status_name(row.wrkStat, row.wrkStatNm) or "-"
+        if not allowed:
+            QMessageBox.information(
+                self,
+                "입고 취소 불가",
+                "\n".join(
+                    [
+                        f"전표번호: {row.slipNo or '-'}",
+                        f"작업상태: {status_name}",
+                        reason,
+                    ]
+                ),
+            )
+            return
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("입고 취소")
+        box.setText("선택한 입고 전표는 파스토 웹에서 취소해야 합니다.")
+        box.setInformativeText(
+            "\n".join(
+                [
+                    "공개 OpenAPI에는 입고취소 endpoint가 없어 앱에서 직접 취소 전송은 하지 않습니다.",
+                    "파스토 웹에서 아래 전표를 검색한 뒤 입고취소를 진행하세요.",
+                    "",
+                    f"전표번호: {row.slipNo or '-'}",
+                    f"입고예정일: {_fmt_yyyymmdd(row.ordDt)}",
+                    f"작업상태: {status_name}",
+                    f"SKU: {_fmt_num(row.sku)}",
+                    f"요청수량: {_fmt_num(row.ordQty)}",
+                    f"입고수량: {_fmt_num(row.inQty)}",
+                    f"검수수량: {_fmt_num(row.tarQty)}",
+                ]
+            )
+        )
+        open_btn = box.addButton("파스토 웹 열기", QMessageBox.AcceptRole)
+        box.addButton("닫기", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() == open_btn:
+            QDesktopServices.openUrl(QUrl(_FASSTO_WEB_URL))
+            self.status.setText(f"입고취소: 파스토 웹에서 {row.slipNo or ''} 전표를 취소하세요.")
+
     def _run_write(
         self,
         *,
@@ -1958,10 +2021,12 @@ class _WarehousingSubTab(QWidget):
         self.status.setText(f"{title} 요청 중...")
         self.create_btn.setEnabled(False)
         self.update_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(False)
 
         def done(result: JobResult) -> None:
             self.create_btn.setEnabled(True)
             self.update_btn.setEnabled(True)
+            self.cancel_btn.setEnabled(True)
             if not result.ok:
                 self.status.setText(f"❌ {title} 실패: {result.error}")
                 return

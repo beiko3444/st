@@ -687,6 +687,22 @@ def warehousing_status_name(status_code: Any, status_name: Any = None) -> Option
     return WAREHOUSING_STATUS_NAMES.get(code) if code else None
 
 
+def warehousing_cancel_check(status_code: Any, status_name: Any = None) -> Tuple[bool, str]:
+    """Return whether an inbound slip is safe to send through the cancel flow."""
+    code = _to_text(status_code)
+    name = warehousing_status_name(code, status_name) or _to_text(status_name) or code or ""
+
+    if code == "5" or "취소" in name:
+        return False, "이미 입고취소 상태입니다."
+    if code == "4" or "입고완료" in name:
+        return False, "입고완료 상태는 취소할 수 없습니다."
+    if code in {"2", "3"} or "검수" in name:
+        return False, "검수 진행/완료 상태는 취소할 수 없습니다."
+    if code == "1" or any(token in name for token in ("입고요청", "센터도착", "검수 전", "검수전")):
+        return True, ""
+    return False, f"현재 상태({name or '-'})는 앱에서 취소 가능 여부를 판단할 수 없습니다."
+
+
 def _serial_to_text(value: Any) -> Optional[str]:
     """goodsSerialNo 가 list로 오는 케이스 대응."""
     if value is None:
@@ -1577,6 +1593,7 @@ __all__ = [
     "normalize_fassto_delivery_parcels",
     "normalize_fassto_delivery_good_details",
     "summarize_delivery_good_details",
+    "warehousing_cancel_check",
     "warehousing_status_name",
     "normalize_product_code",
     "build_goods_payload",
