@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import csv
 import json
+from urllib.parse import quote as _url_quote
 from html import escape as _html_escape
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from PySide6.QtCore import QDate, QObject, QSettings, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QTextDocument
+from PySide6.QtCore import QDate, QMarginsF, QObject, QSettings, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtGui import QColor, QPageLayout, QPageSize, QTextDocument
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -398,10 +399,59 @@ def _statement_cell(value: Any) -> str:
     return _html_escape(str(value or "").strip())
 
 
+_CODE128_PATTERNS = [
+    "212222", "222122", "222221", "121223", "121322", "131222", "122213", "122312",
+    "132212", "221213", "221312", "231212", "112232", "122132", "122231", "113222",
+    "123122", "123221", "223211", "221132", "221231", "213212", "223112", "312131",
+    "311222", "321122", "321221", "312212", "322112", "322211", "212123", "212321",
+    "232121", "111323", "131123", "131321", "112313", "132113", "132311", "211313",
+    "231113", "231311", "112133", "112331", "132131", "113123", "113321", "133121",
+    "313121", "211331", "231131", "213113", "213311", "213131", "311123", "311321",
+    "331121", "312113", "312311", "332111", "314111", "221411", "431111", "111224",
+    "111422", "121124", "121421", "141122", "141221", "112214", "112412", "122114",
+    "122411", "142112", "142211", "241211", "221114", "413111", "241112", "134111",
+    "111242", "121142", "121241", "114212", "124112", "124211", "411212", "421112",
+    "421211", "212141", "214121", "412121", "111143", "111341", "131141", "114113",
+    "114311", "411113", "411311", "113141", "114131", "311141", "411131", "211412",
+    "211214", "211232", "2331112",
+]
+
+
+def _code128_svg_data_uri(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if any(ord(ch) < 32 or ord(ch) > 126 for ch in text):
+        return ""
+
+    codes = [104] + [ord(ch) - 32 for ch in text]
+    checksum = codes[0] + sum(code * index for index, code in enumerate(codes[1:], start=1))
+    codes.extend([checksum % 103, 106])
+
+    unit = 2
+    height = 56
+    x = 0
+    rects: List[str] = []
+    for code in codes:
+        pattern = _CODE128_PATTERNS[code]
+        for index, width_char in enumerate(pattern):
+            width = int(width_char) * unit
+            if index % 2 == 0:
+                rects.append(f'<rect x="{x}" y="0" width="{width}" height="{height}"/>')
+            x += width
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{x}" height="{height}" '
+        f'viewBox="0 0 {x} {height}"><rect width="100%" height="100%" fill="white"/>'
+        f'<g fill="black">{"".join(rects)}</g></svg>'
+    )
+    return f"data:image/svg+xml;utf8,{_url_quote(svg)}"
+
+
 def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
     mapped = build_warehousing_statement_rows(header)
     items = mapped.get("items") if isinstance(mapped, Mapping) else []
     total_qty = int(mapped.get("total_qty") or 0) if isinstance(mapped, Mapping) else 0
+
     rows_html: List[str] = []
     if isinstance(items, list):
         for row in items:
@@ -409,75 +459,135 @@ def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
                 continue
             rows_html.append(
                 "<tr>"
-                f"<td>{_statement_cell(row.get('no'))}</td>"
-                f"<td>{_statement_cell(row.get('code'))}</td>"
-                f"<td>{_statement_cell(row.get('barcode'))}</td>"
+                f"<td class='center'>{_statement_cell(row.get('no'))}</td>"
+                f"<td class='center'>{_statement_cell(row.get('code'))}</td>"
+                f"<td class='center'>{_statement_cell(row.get('barcode'))}</td>"
                 f"<td>{_statement_cell(row.get('name'))}</td>"
-                f"<td style='text-align:right'>{_statement_cell(row.get('qty'))}</td>"
+                f"<td class='center'>{_statement_cell(row.get('dist_term_mgt_yn') or 'N')}</td>"
+                f"<td class='center'>{_statement_cell(_fmt_yyyymmdd(row.get('dist_term_dt')))}</td>"
+                f"<td class='num'>{_statement_cell(row.get('qty'))}</td>"
                 "</tr>"
             )
     rows_blob = "".join(rows_html) or (
-        "<tr><td colspan='5' style='text-align:center'>No items</td></tr>"
+        "<tr><td colspan='7' class='center empty'>출력할 품목이 없습니다.</td></tr>"
     )
 
-    slip_no = _statement_cell(header.get("slipNo"))
-    ord_no = _statement_cell(header.get("ordNo"))
-    ord_dt = _statement_cell(_fmt_yyyymmdd(header.get("ordDt")))
-    in_way = _statement_cell(header.get("inWayNm") or header.get("inWay"))
+    slip_no_raw = str(header.get("slipNo") or "").strip()
+    slip_no = _statement_cell(slip_no_raw)
     remark = _statement_cell(header.get("remark"))
+    customer_name = _statement_cell(
+        cfg.statement_customer_name
+        or cfg.statement_buyer_name
+        or header.get("supNm")
+        or "-"
+    )
+    barcode_uri = _code128_svg_data_uri(slip_no_raw)
+    barcode_html = (
+        f"<img class='barcode-img' src='{barcode_uri}'/><div class='barcode-text'>{slip_no}</div>"
+        if barcode_uri
+        else f"<div class='barcode-text'>{slip_no}</div>"
+    )
 
-    supplier_name = _statement_cell(cfg.statement_supplier_name)
     supplier_biz = _statement_cell(cfg.statement_supplier_biz_no)
+    supplier_name = _statement_cell(cfg.statement_supplier_name or "미지정 공급사")
     supplier_ceo = _statement_cell(cfg.statement_supplier_ceo)
     supplier_addr = _statement_cell(cfg.statement_supplier_addr)
     supplier_tel = _statement_cell(cfg.statement_supplier_tel)
-    buyer_name = _statement_cell(cfg.statement_buyer_name or header.get("supNm"))
-    buyer_biz = _statement_cell(cfg.statement_buyer_biz_no)
-    buyer_ceo = _statement_cell(cfg.statement_buyer_ceo)
-    buyer_addr = _statement_cell(cfg.statement_buyer_addr)
-    buyer_tel = _statement_cell(cfg.statement_buyer_tel)
-    customer_name = _statement_cell(header.get("supNm") or cfg.statement_buyer_name or "-")
+
+    buyer_biz = _statement_cell(cfg.statement_buyer_biz_no or "372-81-00976")
+    buyer_name = _statement_cell(cfg.statement_buyer_name or "주식회사 파스토")
+    buyer_ceo = _statement_cell(cfg.statement_buyer_ceo or "홍종욱")
+    buyer_addr = _statement_cell(
+        cfg.statement_buyer_addr
+        or "경기 용인시 처인구 백암면 원설로 691 (고안리) 용인2센터 1층"
+    )
+    buyer_tel = _statement_cell(cfg.statement_buyer_tel or "02-1566-3033")
 
     return f"""
 <html>
 <head>
+  <meta charset="utf-8">
   <style>
-    body {{ font-family: 'Malgun Gothic', sans-serif; font-size: 11pt; color:#111; }}
-    .title {{ text-align:center; font-size: 20pt; font-weight: 700; margin-bottom: 6px; }}
-    .sub {{ margin-bottom: 10px; font-size: 12pt; font-weight: 600; }}
-    .bar {{ text-align:right; font-family: 'Consolas', monospace; letter-spacing: 1px; margin-bottom: 8px; }}
-    table {{ border-collapse: collapse; width: 100%; margin-bottom: 10px; }}
-    th, td {{ border: 1px solid #333; padding: 4px 6px; }}
-    th {{ background: #f3f3f3; }}
-    .num {{ text-align:right; }}
+    @page {{ size: A4 landscape; margin: 10mm 9mm; }}
+    body {{ font-family: 'Malgun Gothic', sans-serif; font-size: 9pt; color: #000; }}
+    .sheet {{ width: 100%; }}
+    .top {{ position: relative; height: 58px; }}
+    .title {{ text-align: center; font-size: 18pt; font-weight: 700; padding-top: 12px; letter-spacing: 2px; }}
+    .barcode {{ position: absolute; right: 8px; top: 0; text-align: center; width: 230px; }}
+    .barcode-img {{ width: 210px; height: 42px; }}
+    .barcode-text {{ font-size: 8pt; line-height: 12px; }}
+    .customer {{ font-size: 20pt; font-weight: 700; margin: 6px 0 8px; }}
+    table {{ border-collapse: collapse; width: 100%; }}
+    th, td {{ border: 1px solid #222; padding: 4px 6px; vertical-align: middle; }}
+    th {{ font-weight: 700; text-align: center; background: #fff; }}
+    .party {{ margin-bottom: 26px; table-layout: fixed; }}
+    .party td, .party th {{ height: 22px; }}
+    .vertical {{ width: 30px; text-align: center; font-weight: 700; line-height: 1.25; }}
+    .label {{ width: 95px; text-align: center; font-weight: 700; }}
+    .person-label {{ width: 70px; text-align: center; font-weight: 700; }}
+    .items {{ table-layout: fixed; font-size: 9pt; }}
+    .items th {{ height: 22px; }}
+    .items td {{ height: 26px; }}
+    .center {{ text-align: center; }}
+    .num {{ text-align: right; }}
+    .empty {{ color: #666; }}
+    .total td {{ height: 26px; }}
+    .note {{ margin-top: 32px; table-layout: fixed; }}
+    .note th {{ height: 28px; }}
+    .note td {{ height: 28px; }}
   </style>
 </head>
 <body>
-  <div class="title">거래명세표</div>
-  <div class="sub">고객사명: {customer_name}</div>
-  <div class="bar">||| {slip_no} |||</div>
-  <table>
-    <tr><th colspan="4">공급자</th><th colspan="4">공급받는자</th></tr>
-    <tr><th>사업자번호</th><td colspan="3">{supplier_biz}</td><th>사업자번호</th><td colspan="3">{buyer_biz}</td></tr>
-    <tr><th>상호</th><td>{supplier_name}</td><th>성명</th><td>{supplier_ceo}</td><th>상호</th><td>{buyer_name}</td><th>성명</th><td>{buyer_ceo}</td></tr>
-    <tr><th>사업장주소</th><td colspan="3">{supplier_addr}</td><th>사업장주소</th><td colspan="3">{buyer_addr}</td></tr>
-    <tr><th>전화번호</th><td colspan="3">{supplier_tel}</td><th>전화번호</th><td colspan="3">{buyer_tel}</td></tr>
-  </table>
-  <table>
-    <tr><th>전표번호</th><td>{slip_no}</td><th>발주번호</th><td>{ord_no}</td><th>입고예정일</th><td>{ord_dt}</td><th>입고경로</th><td>{in_way}</td></tr>
-  </table>
-  <table>
-    <tr><th style="width:50px">No</th><th style="width:170px">상품코드</th><th style="width:220px">상품바코드</th><th>상품명</th><th style="width:90px">수량</th></tr>
-    {rows_blob}
-    <tr><td colspan="4" class="num"><b>합계</b></td><td class="num"><b>{total_qty:,}</b></td></tr>
-  </table>
-  <table>
-    <tr><th style="width:90px">비고</th><td>{remark}</td></tr>
-  </table>
+  <div class="sheet">
+    <div class="top">
+      <div class="title">거래명세표</div>
+      <div class="barcode">{barcode_html}</div>
+    </div>
+    <div class="customer">파스토 고객사명 : &nbsp; {customer_name}</div>
+
+    <table class="party">
+      <tr>
+        <td class="vertical" rowspan="4">공<br>급<br>자</td>
+        <td class="label">사업자번호</td><td colspan="4">{supplier_biz}</td>
+        <td class="vertical" rowspan="4">공<br>급<br>받<br>는<br>자</td>
+        <td class="label">사업자번호</td><td colspan="4">{buyer_biz}</td>
+      </tr>
+      <tr>
+        <td class="label">상호(법인명)</td><td colspan="2" class="center">{supplier_name}</td><td class="person-label">성 명</td><td>{supplier_ceo}</td>
+        <td class="label">상호(법인명)</td><td colspan="2" class="center">{buyer_name}</td><td class="person-label">성 명</td><td class="center">{buyer_ceo}</td>
+      </tr>
+      <tr>
+        <td class="label">사업장주소</td><td colspan="4">{supplier_addr}</td>
+        <td class="label">사업장주소</td><td colspan="4">{buyer_addr}</td>
+      </tr>
+      <tr>
+        <td class="label">담당자</td><td colspan="2"></td><td class="person-label">전화번호</td><td>{supplier_tel}</td>
+        <td class="label">담당자</td><td colspan="2" class="center">{buyer_name}</td><td class="person-label">전화번호</td><td class="center">{buyer_tel}</td>
+      </tr>
+    </table>
+
+    <table class="items">
+      <tr>
+        <th style="width:36px">No</th>
+        <th style="width:140px">상품코드</th>
+        <th style="width:145px">상품바코드</th>
+        <th>상품명</th>
+        <th style="width:64px">유통기한<br>관리</th>
+        <th style="width:116px">유통기한</th>
+        <th style="width:70px">수량</th>
+      </tr>
+      {rows_blob}
+      <tr class="total"><td colspan="6" class="num">합계 :</td><td class="num">{total_qty:,}</td></tr>
+    </table>
+
+    <table class="note">
+      <tr><th>비고</th></tr>
+      <tr><td>{remark}</td></tr>
+    </table>
+  </div>
 </body>
 </html>
 """
-
 
 def _date_to_api_yyyymmdd(edit: QDateEdit) -> str:
     return edit.date().toString("yyyyMMdd")
@@ -2318,6 +2428,14 @@ class _WarehousingSubTab(QWidget):
             document = QTextDocument(self)
             document.setHtml(html)
             printer = QPrinter(QPrinter.HighResolution)
+            printer.setPageLayout(
+                QPageLayout(
+                    QPageSize(QPageSize.A4),
+                    QPageLayout.Landscape,
+                    QMarginsF(9, 10, 9, 10),
+                    QPageLayout.Millimeter,
+                )
+            )
             dlg = QPrintDialog(printer, self)
             if dlg.exec() != QDialog.Accepted:
                 self.status.setText("??? ?? ??")

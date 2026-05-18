@@ -44,8 +44,15 @@ class FasstoCancelAndStatementTests(unittest.TestCase):
         model = build_warehousing_statement_rows(
             {
                 "goods": [
-                    {"cstGodCd": "A1", "godNm": "상품A", "ordQty": 2, "godBarcd": "B-A1"},
-                    {"cstGodCd": "B2", "godNm": "상품B", "inQty": 3, "barcode": "B-B2"},
+                    {
+                        "cstGodCd": "A1",
+                        "godNm": "item A",
+                        "ordQty": 2,
+                        "godBarcd": "B-A1",
+                        "distTermMgtYn": "Y",
+                        "distTermDt": "20260630",
+                    },
+                    {"cstGodCd": "B2", "godNm": "item B", "inQty": 3, "barcode": "B-B2"},
                 ]
             }
         )
@@ -54,10 +61,12 @@ class FasstoCancelAndStatementTests(unittest.TestCase):
         self.assertEqual(len(model["items"]), 2)
         self.assertEqual(model["items"][0]["code"], "A1")
         self.assertEqual(model["items"][0]["barcode"], "B-A1")
+        self.assertEqual(model["items"][0]["dist_term_mgt_yn"], "Y")
+        self.assertEqual(model["items"][0]["dist_term_dt"], "20260630")
         self.assertEqual(model["items"][1]["code"], "B2")
         self.assertEqual(model["items"][1]["barcode"], "B-B2")
+        self.assertEqual(model["items"][1]["dist_term_mgt_yn"], "N")
 
 
 if __name__ == "__main__":
     unittest.main()
-

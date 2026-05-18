@@ -1,6 +1,6 @@
 import unittest
 
-from inventory_app.ui.fassto_tab import _json_preview_text
+from inventory_app.ui.fassto_tab import _code128_svg_data_uri, _json_preview_text
 
 
 class FasstoWritePreviewTests(unittest.TestCase):
@@ -14,6 +14,12 @@ class FasstoWritePreviewTests(unittest.TestCase):
 
         self.assertLessEqual(len(preview), 2004)
         self.assertIn("...", preview)
+
+    def test_code128_svg_data_uri(self) -> None:
+        self.assertEqual(_code128_svg_data_uri(""), "")
+        uri = _code128_svg_data_uri("YI21I0260518000316")
+        self.assertTrue(uri.startswith("data:image/svg+xml;utf8,"))
+        self.assertIn("%3Csvg", uri)
 
 
 if __name__ == "__main__":

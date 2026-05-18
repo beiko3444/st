@@ -1206,6 +1206,17 @@ def build_warehousing_statement_rows(source: Mapping[str, Any]) -> Dict[str, Any
                     _first_defined(item.get("godBarcd"), item.get("barcode"), item.get("barCd"))
                 ),
                 "name": _to_text(item.get("godNm")),
+                "dist_term_mgt_yn": _to_text(
+                    _first_defined(item.get("distTermMgtYn"), item.get("distTermMngYn"), "N")
+                )
+                or "N",
+                "dist_term_dt": _to_text(
+                    _first_defined(
+                        item.get("distTermDt"),
+                        item.get("distTermDate"),
+                        item.get("useTermDt"),
+                    )
+                ),
                 "qty": qty,
             }
         )
