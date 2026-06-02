@@ -2,6 +2,7 @@ import unittest
 
 from inventory_app.config import AppConfig
 import inventory_app.ui.fassto_tab as fassto_tab_module
+from PySide6.QtGui import QTextDocument
 from inventory_app.ui.fassto_tab import (
     _code128_svg_data_uri,
     _json_preview_text,
@@ -135,12 +136,8 @@ class FasstoWritePreviewTests(unittest.TestCase):
             def exec(self) -> int:
                 return fassto_tab_module.QDialog.Accepted
 
-        class _FakeDocument:
-            def print(self, printer: object) -> None:
-                pass
-
         original = fassto_tab_module.QPrintPreviewDialog
-        document = _FakeDocument()
+        document = QTextDocument()
         try:
             fassto_tab_module.QPrintPreviewDialog = _FakePreviewDialog
             ok = _show_statement_print_preview(None, document, object())
@@ -150,7 +147,7 @@ class FasstoWritePreviewTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(created[0].title, "거래명세표 미리보기")
         self.assertIs(calls[0].__self__, document)
-        self.assertIs(calls[0].__func__, _FakeDocument.print)
+        self.assertEqual(calls[0].__name__, "print_")
 
 
 if __name__ == "__main__":

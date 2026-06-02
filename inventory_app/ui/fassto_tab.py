@@ -604,7 +604,7 @@ def _statement_printer() -> QPrinter:
 def _show_statement_print_preview(parent: QWidget, document: QTextDocument, printer: QPrinter) -> bool:
     dialog = QPrintPreviewDialog(printer, parent)
     dialog.setWindowTitle("거래명세표 미리보기")
-    dialog.paintRequested.connect(document.print)
+    dialog.paintRequested.connect(document.print_)
     return dialog.exec() == QDialog.Accepted
 
 
