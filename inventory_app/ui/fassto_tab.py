@@ -477,8 +477,6 @@ def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
     remark = _statement_cell(header.get("remark"))
     customer_name = _statement_cell(
         cfg.statement_customer_name
-        or cfg.statement_buyer_name
-        or header.get("supNm")
         or "-"
     )
     barcode_uri = _code128_svg_data_uri(slip_no_raw)
@@ -2405,9 +2403,9 @@ class _WarehousingSubTab(QWidget):
             return
         slip = self.slip_edit.text().strip()
         if not slip:
-            QMessageBox.information(self, "??", "????? ?????.")
+            QMessageBox.information(self, "안내", "전표번호를 입력하세요.")
             return
-        self.status.setText("??? ??? ?? ?...")
+        self.status.setText("거래명세표 조회 중...")
         self.statement_btn.setEnabled(False)
 
         def work() -> Any:
@@ -2416,12 +2414,12 @@ class _WarehousingSubTab(QWidget):
         def done(result: JobResult) -> None:
             self.statement_btn.setEnabled(True)
             if not result.ok:
-                self.status.setText(f"??? ?? ??: {result.error}")
+                self.status.setText(f"거래명세표 조회 실패: {result.error}")
                 return
             rows = extract_fassto_list(result.data)
             if not rows:
-                QMessageBox.information(self, "??", "??? ?? ?? ???? ????.")
-                self.status.setText("??? ?? ??")
+                QMessageBox.information(self, "안내", "출력할 입고 상세 데이터가 없습니다.")
+                self.status.setText("거래명세표 데이터 없음")
                 return
             header = rows[0] if isinstance(rows[0], Mapping) else {}
             html = _statement_table_html(header, self._tab._config)
@@ -2438,10 +2436,10 @@ class _WarehousingSubTab(QWidget):
             )
             dlg = QPrintDialog(printer, self)
             if dlg.exec() != QDialog.Accepted:
-                self.status.setText("??? ?? ??")
+                self.status.setText("거래명세표 출력 취소")
                 return
             document.print(printer)
-            self.status.setText("??? ?? ??")
+            self.status.setText("거래명세표 출력 완료")
 
         _run_async(self, work, done)
 

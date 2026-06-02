@@ -52,7 +52,14 @@ class FasstoCancelAndStatementTests(unittest.TestCase):
                         "distTermMgtYn": "Y",
                         "distTermDt": "20260630",
                     },
-                    {"cstGodCd": "B2", "godNm": "item B", "inQty": 3, "barcode": "B-B2"},
+                    {
+                        "cstGodCd": "B2",
+                        "goodsNm": "item B",
+                        "tarQty": 3,
+                        "godBarcode": "B-B2",
+                        "distTermYn": "N",
+                        "expirationDt": "20260701",
+                    },
                 ]
             }
         )
@@ -64,8 +71,10 @@ class FasstoCancelAndStatementTests(unittest.TestCase):
         self.assertEqual(model["items"][0]["dist_term_mgt_yn"], "Y")
         self.assertEqual(model["items"][0]["dist_term_dt"], "20260630")
         self.assertEqual(model["items"][1]["code"], "B2")
+        self.assertEqual(model["items"][1]["name"], "item B")
         self.assertEqual(model["items"][1]["barcode"], "B-B2")
         self.assertEqual(model["items"][1]["dist_term_mgt_yn"], "N")
+        self.assertEqual(model["items"][1]["dist_term_dt"], "20260701")
 
 
 if __name__ == "__main__":

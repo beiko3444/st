@@ -1196,18 +1196,46 @@ def build_warehousing_statement_rows(source: Mapping[str, Any]) -> Dict[str, Any
     for index, item in enumerate(goods, start=1):
         if not isinstance(item, Mapping):
             continue
-        qty = int(_to_number(_first_defined(item.get("ordQty"), item.get("inQty"), 0)))
+        qty = int(
+            _to_number(
+                _first_defined(
+                    item.get("ordQty"),
+                    item.get("inQty"),
+                    item.get("tarQty"),
+                    item.get("qty"),
+                    item.get("reqQty"),
+                    0,
+                )
+            )
+        )
         total_qty += qty
         rows.append(
             {
                 "no": index,
                 "code": _to_text(item.get("cstGodCd")),
                 "barcode": _to_text(
-                    _first_defined(item.get("godBarcd"), item.get("barcode"), item.get("barCd"))
+                    _first_defined(
+                        item.get("godBarcd"),
+                        item.get("barcode"),
+                        item.get("barCd"),
+                        item.get("godBarcode"),
+                    )
                 ),
-                "name": _to_text(item.get("godNm")),
+                "name": _to_text(
+                    _first_defined(
+                        item.get("godNm"),
+                        item.get("goodsNm"),
+                        item.get("itemNm"),
+                        item.get("godName"),
+                    )
+                ),
                 "dist_term_mgt_yn": _to_text(
-                    _first_defined(item.get("distTermMgtYn"), item.get("distTermMngYn"), "N")
+                    _first_defined(
+                        item.get("distTermMgtYn"),
+                        item.get("distTermMngYn"),
+                        item.get("distTermYn"),
+                        "N",
+                    )
                 )
                 or "N",
                 "dist_term_dt": _to_text(
@@ -1215,6 +1243,7 @@ def build_warehousing_statement_rows(source: Mapping[str, Any]) -> Dict[str, Any
                         item.get("distTermDt"),
                         item.get("distTermDate"),
                         item.get("useTermDt"),
+                        item.get("expirationDt"),
                     )
                 ),
                 "qty": qty,
