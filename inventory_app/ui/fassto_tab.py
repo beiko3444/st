@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QDate, QMarginsF, QObject, QSettings, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QPageLayout, QPageSize, QTextDocument
-from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+from PySide6.QtPrintSupport import QPrintPreviewDialog, QPrinter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -586,6 +586,27 @@ def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
 </body>
 </html>
 """
+
+
+def _statement_printer() -> QPrinter:
+    printer = QPrinter(QPrinter.HighResolution)
+    printer.setPageLayout(
+        QPageLayout(
+            QPageSize(QPageSize.A4),
+            QPageLayout.Landscape,
+            QMarginsF(9, 10, 9, 10),
+            QPageLayout.Millimeter,
+        )
+    )
+    return printer
+
+
+def _show_statement_print_preview(parent: QWidget, document: QTextDocument, printer: QPrinter) -> bool:
+    dialog = QPrintPreviewDialog(printer, parent)
+    dialog.setWindowTitle("거래명세표 미리보기")
+    dialog.paintRequested.connect(document.print)
+    return dialog.exec() == QDialog.Accepted
+
 
 def _date_to_api_yyyymmdd(edit: QDateEdit) -> str:
     return edit.date().toString("yyyyMMdd")
@@ -2425,20 +2446,10 @@ class _WarehousingSubTab(QWidget):
             html = _statement_table_html(header, self._tab._config)
             document = QTextDocument(self)
             document.setHtml(html)
-            printer = QPrinter(QPrinter.HighResolution)
-            printer.setPageLayout(
-                QPageLayout(
-                    QPageSize(QPageSize.A4),
-                    QPageLayout.Landscape,
-                    QMarginsF(9, 10, 9, 10),
-                    QPageLayout.Millimeter,
-                )
-            )
-            dlg = QPrintDialog(printer, self)
-            if dlg.exec() != QDialog.Accepted:
+            printer = _statement_printer()
+            if not _show_statement_print_preview(self, document, printer):
                 self.status.setText("거래명세표 출력 취소")
                 return
-            document.print(printer)
             self.status.setText("거래명세표 출력 완료")
 
         _run_async(self, work, done)

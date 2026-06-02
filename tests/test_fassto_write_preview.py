@@ -1,9 +1,11 @@
 import unittest
 
 from inventory_app.config import AppConfig
+import inventory_app.ui.fassto_tab as fassto_tab_module
 from inventory_app.ui.fassto_tab import (
     _code128_svg_data_uri,
     _json_preview_text,
+    _show_statement_print_preview,
     _statement_table_html,
 )
 
@@ -110,6 +112,45 @@ class FasstoWritePreviewTests(unittest.TestCase):
 
         self.assertIn("파스토 고객사명 : &nbsp; -", html)
         self.assertNotIn("파스토 고객사명 : &nbsp; 상세응답 공급사", html)
+
+    def test_statement_print_preview_connects_document_print(self) -> None:
+        calls: list[object] = []
+        created: list["_FakePreviewDialog"] = []
+
+        class _FakeSignal:
+            def connect(self, callback: object) -> None:
+                calls.append(callback)
+
+        class _FakePreviewDialog:
+            def __init__(self, printer: object, parent: object) -> None:
+                self.printer = printer
+                self.parent = parent
+                self.paintRequested = _FakeSignal()
+                self.title = ""
+                created.append(self)
+
+            def setWindowTitle(self, title: str) -> None:
+                self.title = title
+
+            def exec(self) -> int:
+                return fassto_tab_module.QDialog.Accepted
+
+        class _FakeDocument:
+            def print(self, printer: object) -> None:
+                pass
+
+        original = fassto_tab_module.QPrintPreviewDialog
+        document = _FakeDocument()
+        try:
+            fassto_tab_module.QPrintPreviewDialog = _FakePreviewDialog
+            ok = _show_statement_print_preview(None, document, object())
+        finally:
+            fassto_tab_module.QPrintPreviewDialog = original
+
+        self.assertTrue(ok)
+        self.assertEqual(created[0].title, "거래명세표 미리보기")
+        self.assertIs(calls[0].__self__, document)
+        self.assertIs(calls[0].__func__, _FakeDocument.print)
 
 
 if __name__ == "__main__":
