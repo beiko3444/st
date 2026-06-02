@@ -1,12 +1,16 @@
 import unittest
+from urllib.parse import unquote
 
 from inventory_app.config import AppConfig
 import inventory_app.ui.fassto_tab as fassto_tab_module
 from PySide6.QtGui import QTextDocument
+from PySide6.QtPrintSupport import QPrinter
+from PySide6.QtWidgets import QApplication
 from inventory_app.ui.fassto_tab import (
     _code128_svg_data_uri,
     _json_preview_text,
     _show_statement_print_preview,
+    _statement_printer,
     _statement_table_html,
 )
 
@@ -58,6 +62,10 @@ class FasstoWritePreviewTests(unittest.TestCase):
         uri = _code128_svg_data_uri("YI21I0260518000316")
         self.assertTrue(uri.startswith("data:image/svg+xml;utf8,"))
         self.assertIn("%3Csvg", uri)
+        svg = unquote(uri.split(",", 1)[1])
+        self.assertIn('width="233"', svg)
+        self.assertIn('height="42"', svg)
+        self.assertIn('shape-rendering="crispEdges"', svg)
 
     def test_statement_table_html_matches_fassto_print_form(self) -> None:
         html = _statement_table_html(
@@ -85,11 +93,11 @@ class FasstoWritePreviewTests(unittest.TestCase):
         )
 
         self.assertIn('<table class="statement-head" width="100%"', html)
-        self.assertIn('class="head-side" width="230"', html)
-        self.assertIn('class="head-barcode" width="230"', html)
+        self.assertIn('class="head-side" width="260"', html)
+        self.assertIn('class="head-barcode" width="260"', html)
         self.assertIn('class="head-title"', html)
         self.assertIn(">거래명세표</td>", html)
-        self.assertIn('width="210" height="42"', html)
+        self.assertIn('width="233" height="42"', html)
         self.assertNotIn("position: absolute", html)
         self.assertIn("파스토 고객사명 : &nbsp; 엑스트래커", html)
         self.assertIn("공<br>급<br>자", html)
@@ -113,6 +121,15 @@ class FasstoWritePreviewTests(unittest.TestCase):
         self.assertIn("합계 :</td><td class=\"num\">397</td>", html)
         self.assertIn("입고 전 &lt;검수&gt; 필요", html)
         self.assertNotIn("입고 전 <검수> 필요", html)
+
+    def test_statement_printer_uses_grayscale_high_resolution_output(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        self.assertIsNotNone(app)
+
+        printer = _statement_printer()
+
+        self.assertEqual(printer.colorMode(), QPrinter.ColorMode.GrayScale)
+        self.assertGreaterEqual(printer.resolution(), 600)
 
     def test_statement_customer_name_does_not_fall_back_to_supplier_name(self) -> None:
         html = _statement_table_html(

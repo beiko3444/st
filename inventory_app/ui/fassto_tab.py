@@ -417,19 +417,19 @@ _CODE128_PATTERNS = [
 ]
 
 
-def _code128_svg_data_uri(value: Any) -> str:
+def _code128_svg_data(value: Any) -> Tuple[str, int, int]:
     text = str(value or "").strip()
     if not text:
-        return ""
+        return "", 0, 0
     if any(ord(ch) < 32 or ord(ch) > 126 for ch in text):
-        return ""
+        return "", 0, 0
 
     codes = [104] + [ord(ch) - 32 for ch in text]
     checksum = codes[0] + sum(code * index for index, code in enumerate(codes[1:], start=1))
     codes.extend([checksum % 103, 106])
 
-    unit = 2
-    height = 56
+    unit = 1
+    height = 42
     x = 0
     rects: List[str] = []
     for code in codes:
@@ -441,10 +441,15 @@ def _code128_svg_data_uri(value: Any) -> str:
             x += width
     svg = (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{x}" height="{height}" '
-        f'viewBox="0 0 {x} {height}"><rect width="100%" height="100%" fill="white"/>'
-        f'<g fill="black">{"".join(rects)}</g></svg>'
+        f'viewBox="0 0 {x} {height}" shape-rendering="crispEdges">'
+        f'<rect width="100%" height="100%" fill="white"/>'
+        f'<g fill="black" shape-rendering="crispEdges">{"".join(rects)}</g></svg>'
     )
-    return f"data:image/svg+xml;utf8,{_url_quote(svg)}"
+    return f"data:image/svg+xml;utf8,{_url_quote(svg)}", x, height
+
+
+def _code128_svg_data_uri(value: Any) -> str:
+    return _code128_svg_data(value)[0]
 
 
 def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
@@ -476,9 +481,9 @@ def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
     slip_no = _statement_cell(slip_no_raw)
     remark = _statement_cell(header.get("remark"))
     customer_name = _statement_cell(cfg.statement_customer_name or "엑스트래커")
-    barcode_uri = _code128_svg_data_uri(slip_no_raw)
+    barcode_uri, barcode_width, barcode_height = _code128_svg_data(slip_no_raw)
     barcode_html = (
-        f'<img class="barcode-img" src="{barcode_uri}" width="210" height="42"/>'
+        f'<img class="barcode-img" src="{barcode_uri}" width="{barcode_width}" height="{barcode_height}"/>'
         f'<div class="barcode-text">{slip_no}</div>'
         if barcode_uri
         else f'<div class="barcode-text">{slip_no}</div>'
@@ -509,9 +514,9 @@ def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
     .sheet {{ width: 100%; }}
     .statement-head {{ border: 0; margin-bottom: 2px; table-layout: fixed; width: 100%; }}
     .statement-head td {{ border: 0; padding: 0; height: 58px; vertical-align: top; }}
-    .head-side {{ width: 230px; }}
+    .head-side {{ width: 260px; }}
     .head-title {{ text-align: center; font-size: 18pt; font-weight: 700; padding-top: 12px; letter-spacing: 2px; }}
-    .head-barcode {{ width: 230px; text-align: center; }}
+    .head-barcode {{ width: 260px; text-align: center; }}
     .barcode-img {{ border: 0; margin: 0 auto; }}
     .barcode-text {{ font-size: 8pt; line-height: 12px; text-align: center; }}
     .customer {{ font-size: 20pt; font-weight: 700; margin: 6px 0 8px; }}
@@ -538,9 +543,9 @@ def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
   <div class="sheet">
     <table class="statement-head" width="100%" border="0" cellspacing="0" cellpadding="0">
       <tr>
-        <td class="head-side" width="230" valign="top" style="border:0; padding:0;">&nbsp;</td>
+        <td class="head-side" width="260" valign="top" style="border:0; padding:0;">&nbsp;</td>
         <td class="head-title" align="center" valign="top" style="border:0; padding:12px 0 0 0;">거래명세표</td>
-        <td class="head-barcode" width="230" align="center" valign="top" style="border:0; padding:0; text-align:center;">{barcode_html}</td>
+        <td class="head-barcode" width="260" align="center" valign="top" style="border:0; padding:0; text-align:center;">{barcode_html}</td>
       </tr>
     </table>
     <div class="customer">파스토 고객사명 : &nbsp; {customer_name}</div>
@@ -592,6 +597,8 @@ def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
 
 def _statement_printer() -> QPrinter:
     printer = QPrinter(QPrinter.HighResolution)
+    printer.setColorMode(QPrinter.ColorMode.GrayScale)
+    printer.setResolution(600)
     printer.setPageLayout(
         QPageLayout(
             QPageSize(QPageSize.A4),
