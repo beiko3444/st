@@ -481,9 +481,10 @@ def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
     )
     barcode_uri = _code128_svg_data_uri(slip_no_raw)
     barcode_html = (
-        f"<img class='barcode-img' src='{barcode_uri}'/><div class='barcode-text'>{slip_no}</div>"
+        f'<img class="barcode-img" src="{barcode_uri}" width="210" height="42"/>'
+        f'<div class="barcode-text">{slip_no}</div>'
         if barcode_uri
-        else f"<div class='barcode-text'>{slip_no}</div>"
+        else f'<div class="barcode-text">{slip_no}</div>'
     )
 
     supplier_biz = _statement_cell(cfg.statement_supplier_biz_no)
@@ -509,11 +510,13 @@ def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
     @page {{ size: A4 landscape; margin: 10mm 9mm; }}
     body {{ font-family: 'Malgun Gothic', sans-serif; font-size: 9pt; color: #000; }}
     .sheet {{ width: 100%; }}
-    .top {{ position: relative; height: 58px; }}
-    .title {{ text-align: center; font-size: 18pt; font-weight: 700; padding-top: 12px; letter-spacing: 2px; }}
-    .barcode {{ position: absolute; right: 8px; top: 0; text-align: center; width: 230px; }}
-    .barcode-img {{ width: 210px; height: 42px; }}
-    .barcode-text {{ font-size: 8pt; line-height: 12px; }}
+    .statement-head {{ border: 0; margin-bottom: 2px; table-layout: fixed; width: 100%; }}
+    .statement-head td {{ border: 0; padding: 0; height: 58px; vertical-align: top; }}
+    .head-side {{ width: 230px; }}
+    .head-title {{ text-align: center; font-size: 18pt; font-weight: 700; padding-top: 12px; letter-spacing: 2px; }}
+    .head-barcode {{ width: 230px; text-align: center; }}
+    .barcode-img {{ border: 0; margin: 0 auto; }}
+    .barcode-text {{ font-size: 8pt; line-height: 12px; text-align: center; }}
     .customer {{ font-size: 20pt; font-weight: 700; margin: 6px 0 8px; }}
     table {{ border-collapse: collapse; width: 100%; }}
     th, td {{ border: 1px solid #222; padding: 4px 6px; vertical-align: middle; }}
@@ -537,13 +540,16 @@ def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
 </head>
 <body>
   <div class="sheet">
-    <div class="top">
-      <div class="title">거래명세표</div>
-      <div class="barcode">{barcode_html}</div>
-    </div>
+    <table class="statement-head" width="100%" border="0" cellspacing="0" cellpadding="0">
+      <tr>
+        <td class="head-side" width="230" valign="top" style="border:0; padding:0;">&nbsp;</td>
+        <td class="head-title" align="center" valign="top" style="border:0; padding:12px 0 0 0;">거래명세표</td>
+        <td class="head-barcode" width="230" align="center" valign="top" style="border:0; padding:0; text-align:center;">{barcode_html}</td>
+      </tr>
+    </table>
     <div class="customer">파스토 고객사명 : &nbsp; {customer_name}</div>
 
-    <table class="party">
+    <table class="party" width="100%">
       <tr>
         <td class="vertical" rowspan="4">공<br>급<br>자</td>
         <td class="label">사업자번호</td><td colspan="4">{supplier_biz}</td>
@@ -564,7 +570,7 @@ def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
       </tr>
     </table>
 
-    <table class="items">
+    <table class="items" width="100%">
       <tr>
         <th style="width:36px">No</th>
         <th style="width:140px">상품코드</th>
@@ -578,7 +584,7 @@ def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
       <tr class="total"><td colspan="6" class="num">합계 :</td><td class="num">{total_qty:,}</td></tr>
     </table>
 
-    <table class="note">
+    <table class="note" width="100%">
       <tr><th>비고</th></tr>
       <tr><td>{remark}</td></tr>
     </table>
