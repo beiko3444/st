@@ -475,10 +475,7 @@ def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
     slip_no_raw = str(header.get("slipNo") or "").strip()
     slip_no = _statement_cell(slip_no_raw)
     remark = _statement_cell(header.get("remark"))
-    customer_name = _statement_cell(
-        cfg.statement_customer_name
-        or "-"
-    )
+    customer_name = _statement_cell(cfg.statement_customer_name or "엑스트래커")
     barcode_uri = _code128_svg_data_uri(slip_no_raw)
     barcode_html = (
         f'<img class="barcode-img" src="{barcode_uri}" width="210" height="42"/>'
@@ -519,23 +516,22 @@ def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
     .barcode-text {{ font-size: 8pt; line-height: 12px; text-align: center; }}
     .customer {{ font-size: 20pt; font-weight: 700; margin: 6px 0 8px; }}
     table {{ border-collapse: collapse; width: 100%; }}
-    th, td {{ border: 1px solid #222; padding: 4px 6px; vertical-align: middle; }}
-    th {{ font-weight: 700; text-align: center; background: #fff; }}
+    td {{ border: 1px solid #222; padding: 4px 6px; vertical-align: middle; }}
     .party {{ margin-bottom: 26px; table-layout: fixed; }}
     .party td, .party th {{ height: 22px; }}
     .vertical {{ width: 30px; text-align: center; font-weight: 700; line-height: 1.25; }}
     .label {{ width: 95px; text-align: center; font-weight: 700; }}
     .person-label {{ width: 70px; text-align: center; font-weight: 700; }}
     .items {{ table-layout: fixed; font-size: 9pt; }}
-    .items th {{ height: 22px; }}
     .items td {{ height: 26px; }}
+    .item-head {{ font-weight: 700; height: 22px; }}
     .center {{ text-align: center; }}
     .num {{ text-align: right; }}
     .empty {{ color: #666; }}
     .total td {{ height: 26px; }}
     .note {{ margin-top: 32px; table-layout: fixed; }}
-    .note th {{ height: 28px; }}
     .note td {{ height: 28px; }}
+    .note-head {{ font-weight: 700; text-align: center; }}
   </style>
 </head>
 <body>
@@ -570,22 +566,22 @@ def _statement_table_html(header: Mapping[str, Any], cfg: AppConfig) -> str:
       </tr>
     </table>
 
-    <table class="items" width="100%">
+    <table class="items" width="100%" cellspacing="0" cellpadding="0">
       <tr>
-        <th style="width:36px">No</th>
-        <th style="width:140px">상품코드</th>
-        <th style="width:145px">상품바코드</th>
-        <th>상품명</th>
-        <th style="width:64px">유통기한<br>관리</th>
-        <th style="width:116px">유통기한</th>
-        <th style="width:70px">수량</th>
+        <td class="item-head center" width="36">No</td>
+        <td class="item-head center" width="140">상품코드</td>
+        <td class="item-head center" width="145">상품바코드</td>
+        <td class="item-head center">상품명</td>
+        <td class="item-head center" width="64">유통기한<br>관리</td>
+        <td class="item-head center" width="116">유통기한</td>
+        <td class="item-head center" width="70">수량</td>
       </tr>
       {rows_blob}
       <tr class="total"><td colspan="6" class="num">합계 :</td><td class="num">{total_qty:,}</td></tr>
     </table>
 
-    <table class="note" width="100%">
-      <tr><th>비고</th></tr>
+    <table class="note" width="100%" cellspacing="0" cellpadding="0">
+      <tr><td class="note-head">비고</td></tr>
       <tr><td>{remark}</td></tr>
     </table>
   </div>

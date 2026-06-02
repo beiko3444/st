@@ -104,8 +104,12 @@ class FasstoWritePreviewTests(unittest.TestCase):
         self.assertIn("8809879791215", html)
         self.assertIn("럭베이트V3 상온보관 반건조 홍갯지렁이", html)
         self.assertIn('<table class="party" width="100%">', html)
-        self.assertIn('<table class="items" width="100%">', html)
-        self.assertIn('<table class="note" width="100%">', html)
+        self.assertIn('<table class="items" width="100%"', html)
+        self.assertIn('class="item-head center" width="36">No</td>', html)
+        self.assertIn('class="item-head center" width="140">상품코드</td>', html)
+        self.assertIn('class="item-head center">상품명</td>', html)
+        self.assertNotIn("<th", html)
+        self.assertIn('<table class="note" width="100%"', html)
         self.assertIn("합계 :</td><td class=\"num\">397</td>", html)
         self.assertIn("입고 전 &lt;검수&gt; 필요", html)
         self.assertNotIn("입고 전 <검수> 필요", html)
@@ -120,7 +124,7 @@ class FasstoWritePreviewTests(unittest.TestCase):
             _config(statement_customer_name=""),
         )
 
-        self.assertIn("파스토 고객사명 : &nbsp; -", html)
+        self.assertIn("파스토 고객사명 : &nbsp; 엑스트래커", html)
         self.assertNotIn("파스토 고객사명 : &nbsp; 상세응답 공급사", html)
 
     def test_statement_print_preview_connects_document_print(self) -> None:
