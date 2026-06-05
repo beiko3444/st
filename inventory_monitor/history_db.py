@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -321,6 +322,15 @@ class InventoryHistoryDB:
                     memo          TEXT,
                     active        INTEGER NOT NULL DEFAULT 1,
                     updated_at    TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS api_response_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 )
                 """
             )
@@ -2005,6 +2015,45 @@ class InventoryHistoryDB:
             conn.execute("DELETE FROM fixed_costs WHERE id = ?", (int(item_id),))
             conn.commit()
             return conn.total_changes - before
+
+    # ── Generic API response cache (Pi backend -> Vercel web) ──
+
+    def set_api_cache(self, cache_key: str, payload: dict) -> dict:
+        key = str(cache_key or "").strip()
+        if not key:
+            raise ValueError("cache_key required")
+        now = datetime.now().isoformat()
+        raw = json.dumps(payload, ensure_ascii=False, default=str)
+        with self._guard, self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO api_response_cache (cache_key, payload_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (key, raw, now),
+            )
+            conn.commit()
+        return {"cache_key": key, "payload": payload, "updated_at": now}
+
+    def get_api_cache(self, cache_key: str) -> dict | None:
+        key = str(cache_key or "").strip()
+        if not key:
+            return None
+        with self._guard, self._connection() as conn:
+            row = conn.execute(
+                "SELECT payload_json, updated_at FROM api_response_cache WHERE cache_key = ?",
+                (key,),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(str(row[0] or "{}"))
+        except Exception:  # noqa: BLE001
+            payload = {}
+        return {"cache_key": key, "payload": payload, "updated_at": str(row[1] or "")}
 
     # ── SMS 수신 내역 ──
 

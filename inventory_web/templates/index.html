@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SmartInventory</title>
+    <link rel="stylesheet" href="/static/app.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">SI</span>
+          <div>
+            <strong>SmartInventory</strong>
+            <small id="runtimeLabel">Vercel Web</small>
+          </div>
+        </div>
+        <nav class="tabs" aria-label="Main sections">
+          {% for key, label in tabs %}
+          <button class="tab-button{% if loop.first %} active{% endif %}" data-tab="{{ key }}">{{ label }}</button>
+          {% endfor %}
+        </nav>
+      </aside>
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <h1 id="viewTitle">상품관리</h1>
+            <p id="viewMeta">데이터를 불러오는 중입니다.</p>
+          </div>
+          <div class="actions">
+            <button id="refreshBtn" class="icon-button" title="새로고침" aria-label="새로고침">Refresh</button>
+            <button id="syncBtn" class="primary-button">Sync</button>
+          </div>
+        </header>
+
+        <section class="toolbar" id="toolbar"></section>
+        <section class="status-line" id="statusLine"></section>
+        <section class="content-grid">
+          <div class="data-panel">
+            <div class="table-wrap">
+              <table id="dataTable">
+                <thead></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+          <aside class="detail-panel">
+            <h2>Details</h2>
+            <pre id="details">{}</pre>
+          </aside>
+        </section>
+      </main>
+    </div>
+    <dialog id="modal">
+      <form method="dialog">
+        <header>
+          <h2 id="modalTitle">Action</h2>
+          <button value="cancel" aria-label="닫기">Close</button>
+        </header>
+        <div id="modalBody"></div>
+      </form>
+    </dialog>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

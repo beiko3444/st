@@ -122,6 +122,154 @@ def _sync_status() -> dict:
         return dict(_sync_state)
 
 
+def _jsonable(value):
+    from dataclasses import asdict, is_dataclass
+    from datetime import date as _date, datetime as _datetime
+
+    if is_dataclass(value):
+        return _jsonable(asdict(value))
+    if isinstance(value, (_datetime, _date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+def _cache_or_fetch(cache_key: str, refresh: bool, fetch_fn) -> dict:
+    if not refresh:
+        cached = db.get_api_cache(cache_key)
+        if cached is not None:
+            return {
+                "cache_key": cache_key,
+                "cached": True,
+                "updated_at": cached["updated_at"],
+                **(cached["payload"] if isinstance(cached["payload"], dict) else {"data": cached["payload"]}),
+            }
+    payload = _jsonable(fetch_fn())
+    if not isinstance(payload, dict):
+        payload = {"data": payload}
+    saved = db.set_api_cache(cache_key, payload)
+    return {
+        "cache_key": cache_key,
+        "cached": False,
+        "updated_at": saved["updated_at"],
+        **payload,
+    }
+
+
+def _load_app_config():
+    from inventory_app.config import load_config
+
+    return load_config()
+
+
+def _fetch_revenue(period_days: int) -> dict:
+    from inventory_app.services.revenue_services import RevenueComparisonService
+
+    snapshot, warnings = RevenueComparisonService(_load_app_config()).fetch(period_days)
+    return {"snapshot": snapshot, "warnings": warnings}
+
+
+def _fetch_keywords(period_days: int) -> dict:
+    from inventory_app.services.keyword_services import NaverKeywordRevenueService
+
+    snapshot, warnings = NaverKeywordRevenueService(_load_app_config()).fetch(period_days)
+    return {"snapshot": snapshot, "warnings": warnings}
+
+
+def _fassto_connector():
+    from inventory_app.connectors.fassto import FasstoConnector
+
+    cfg = _load_app_config()
+    return FasstoConnector(
+        api_cd=cfg.fassto_api_cd,
+        api_key=cfg.fassto_api_key,
+        cst_cd=cfg.fassto_cst_cd,
+        api_url=cfg.fassto_api_url,
+        timeout_seconds=cfg.timeout_seconds,
+    )
+
+
+def _fassto_query(kind: str, qs: dict) -> dict:
+    from datetime import date, timedelta
+
+    today = date.today()
+    start = (qs.get("start", [None])[0] or (today - timedelta(days=30)).strftime("%Y%m%d"))
+    end = (qs.get("end", [None])[0] or today.strftime("%Y%m%d"))
+    with _fassto_connector() as connector:
+        if kind == "config":
+            return connector.config_summary()
+        if kind == "goods":
+            return connector.get_goods_list()
+        if kind == "elements":
+            return connector.get_goods_elements()
+        if kind == "stock":
+            return connector.get_stock_list()
+        if kind == "warehousing":
+            return connector.get_warehousing_list(start, end)
+        if kind == "delivery":
+            status = qs.get("status", ["ALL"])[0] or "ALL"
+            out_div = qs.get("out_div", ["1"])[0] or "1"
+            return connector.get_delivery_list(start, end, status=status, out_div=out_div)
+        if kind == "parcels":
+            out_div = qs.get("out_div", ["1"])[0] or "1"
+            return connector.get_delivery_parcel_list(start, end, out_div=out_div)
+        if kind == "revenue":
+            return connector.get_delivery_good_detail_list(start, end)
+    raise ValueError(f"unknown fassto kind: {kind}")
+
+
+def _sync_card_usages(body: dict) -> dict:
+    from datetime import date, timedelta
+
+    from inventory_app.services.card_api_client import CardApiClient
+
+    cfg = _load_app_config()
+    start = body.get("start_date") or body.get("startDate")
+    end = body.get("end_date") or body.get("endDate")
+    if not start:
+        start = (date.today() - timedelta(days=30)).isoformat()
+    if not end:
+        end = date.today().isoformat()
+    card_num = body.get("card_num") or body.get("cardNum")
+    with CardApiClient.from_config(cfg) as client:
+        sync_result = client.sync_card_usages(
+            start_date=start,
+            end_date=end,
+            card_num=card_num,
+            refresh_before_fetch=bool(body.get("refresh_before_fetch") or body.get("refreshBeforeFetch")),
+        )
+        page = client.list_card_usages(
+            page=1,
+            page_size=min(500, int(body.get("page_size") or body.get("pageSize") or 500)),
+            card_num=card_num,
+            start_date=start,
+            end_date=end,
+        )
+    changed = db.upsert_card_usages(_jsonable(page.items))
+    return {
+        "sync": sync_result,
+        "changed": changed,
+        "fetched": len(page.items),
+        "page": page.page,
+        "total_count": page.total_count,
+    }
+
+
+def _match_coupang_purchases(body: dict) -> dict:
+    from datetime import date, timedelta
+
+    from inventory_app.services.card_api_client import CardApiClient
+
+    cfg = _load_app_config()
+    start = body.get("start_date") or body.get("startDate") or (date.today() - timedelta(days=30)).isoformat()
+    end = body.get("end_date") or body.get("endDate") or date.today().isoformat()
+    with CardApiClient.from_config(cfg) as client:
+        return client.match_coupang_purchases(start_date=start, end_date=end)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         log.info("%s - %s", self.address_string(), format % args)
@@ -243,6 +391,75 @@ class Handler(BaseHTTPRequestHandler):
                 naver = db.get_latest_reviews("naver")
                 coupang = db.get_latest_reviews("coupang")
                 self._send_json({"naver": naver, "coupang": coupang})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/revenue":
+            try:
+                days = max(1, min(365, int(qs.get("period_days", ["30"])[0] or 30)))
+                refresh = qs.get("refresh", ["0"])[0] in ("1", "true", "True", "yes")
+                self._send_json(
+                    _cache_or_fetch(
+                        f"revenue:{days}",
+                        refresh,
+                        lambda: _fetch_revenue(days),
+                    )
+                )
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/keywords":
+            try:
+                days = max(1, min(365, int(qs.get("period_days", ["30"])[0] or 30)))
+                refresh = qs.get("refresh", ["0"])[0] in ("1", "true", "True", "yes")
+                self._send_json(
+                    _cache_or_fetch(
+                        f"keywords:{days}",
+                        refresh,
+                        lambda: _fetch_keywords(days),
+                    )
+                )
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/fassto/config":
+            try:
+                self._send_json(_fassto_query("config", qs))
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path.startswith("/fassto/warehousing/"):
+            slip_no = path.rsplit("/", 1)[-1]
+            try:
+                with _fassto_connector() as connector:
+                    self._send_json(connector.get_warehousing_detail(slip_no))
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path.startswith("/fassto/delivery/"):
+            slip_no = path.rsplit("/", 1)[-1]
+            try:
+                with _fassto_connector() as connector:
+                    self._send_json(connector.get_delivery_detail(slip_no))
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path.startswith("/fassto/"):
+            kind = path.rsplit("/", 1)[-1]
+            try:
+                refresh = qs.get("refresh", ["0"])[0] in ("1", "true", "True", "yes")
+                cache_parts = [f"fassto:{kind}"]
+                for key in ("start", "end", "status", "out_div"):
+                    value = qs.get(key, [""])[0] or ""
+                    if value:
+                        cache_parts.append(f"{key}={value}")
+                self._send_json(
+                    _cache_or_fetch(
+                        "|".join(cache_parts),
+                        refresh,
+                        lambda: _fassto_query(kind, qs),
+                    )
+                )
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
@@ -430,6 +647,79 @@ class Handler(BaseHTTPRequestHandler):
             if not already_running:
                 threading.Thread(target=_worker, daemon=True, name="inventory-sync").start()
             self._send_json({"accepted": not already_running, "running": True, "state": _sync_status()}, 202)
+            return
+
+        if path == "/sync/revenue":
+            try:
+                body = self._read_json_body()
+                days = max(1, min(365, int(body.get("period_days") or qs.get("period_days", ["30"])[0] or 30)))
+                payload = _cache_or_fetch(f"revenue:{days}", True, lambda: _fetch_revenue(days))
+                self._send_json(payload)
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/sync/keywords":
+            try:
+                body = self._read_json_body()
+                days = max(1, min(365, int(body.get("period_days") or qs.get("period_days", ["30"])[0] or 30)))
+                payload = _cache_or_fetch(f"keywords:{days}", True, lambda: _fetch_keywords(days))
+                self._send_json(payload)
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/sync/card-usages":
+            try:
+                self._send_json(_sync_card_usages(self._read_json_body()))
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/sync/coupang-purchases/match":
+            try:
+                self._send_json(_match_coupang_purchases(self._read_json_body()))
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/fassto/warehousing":
+            try:
+                from inventory_app.connectors.fassto import build_warehousing_payload
+
+                body = self._read_json_body()
+                payload = [build_warehousing_payload(item) for item in body.get("items", [body])]
+                with _fassto_connector() as connector:
+                    self._send_json(connector.create_warehousing(payload))
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/fassto/warehousing/cancel":
+            try:
+                body = self._read_json_body()
+                with _fassto_connector() as connector:
+                    self._send_json(connector.cancel_warehousing(body.get("items", [body])))
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/fassto/delivery":
+            try:
+                body = self._read_json_body()
+                with _fassto_connector() as connector:
+                    self._send_json(connector.create_delivery_parcel(body.get("items", [body])))
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/fassto/delivery/cancel":
+            try:
+                body = self._read_json_body()
+                with _fassto_connector() as connector:
+                    self._send_json(connector.cancel_delivery(body.get("items", [body])))
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
             return
 
         if path == "/shared-stock":
@@ -625,6 +915,27 @@ class Handler(BaseHTTPRequestHandler):
 
         parsed = urlparse(self.path)
         path = parsed.path
+
+        if path == "/fassto/warehousing":
+            try:
+                from inventory_app.connectors.fassto import build_warehousing_payload
+
+                body = self._read_json_body()
+                payload = [build_warehousing_payload(item) for item in body.get("items", [body])]
+                with _fassto_connector() as connector:
+                    self._send_json(connector.update_warehousing(payload))
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/fassto/delivery":
+            try:
+                body = self._read_json_body()
+                with _fassto_connector() as connector:
+                    self._send_json(connector.update_delivery_parcel(body.get("items", [body])))
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
 
         # /card-usages/<use_key>
         cu_match = _CARD_USAGE_RE.match(path)
