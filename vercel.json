@@ -16,5 +16,11 @@
     "api/index.py": {
       "maxDuration": 60
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/reports/inventory/discord",
+      "schedule": "0 15 * * *"
+    }
+  ]
 }

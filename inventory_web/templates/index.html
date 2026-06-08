@@ -8,31 +8,22 @@
   </head>
   <body>
     <div class="app-shell">
-      <aside class="sidebar">
-        <div class="brand">
-          <span class="brand-mark">SI</span>
-          <div>
-            <strong>SmartInventory</strong>
-            <small id="runtimeLabel">Vercel Web</small>
-          </div>
-        </div>
+      <header class="window-tabs">
         <nav class="tabs" aria-label="Main sections">
           {% for key, label in tabs %}
           <button class="tab-button{% if loop.first %} active{% endif %}" data-tab="{{ key }}">{{ label }}</button>
           {% endfor %}
         </nav>
-      </aside>
-      <main class="workspace">
-        <header class="topbar">
-          <div>
-            <h1 id="viewTitle">상품관리</h1>
-            <p id="viewMeta">데이터를 불러오는 중입니다.</p>
-          </div>
-          <div class="actions">
-            <button id="refreshBtn" class="icon-button" title="새로고침" aria-label="새로고침">Refresh</button>
-            <button id="syncBtn" class="primary-button">Sync</button>
-          </div>
-        </header>
+        <div class="corner-actions">
+          <button id="fontBtn" type="button">글꼴</button>
+          <button id="piStatusBtn" type="button">라즈베리파이</button>
+          <button id="refreshBtn" type="button">새로고침</button>
+          <button id="syncBtn" type="button" class="primary-button">전체 동기화</button>
+        </div>
+      </header>
+      <main class="tab-pane">
+        <h1 id="viewTitle" class="sr-only">상품관리</h1>
+        <p id="viewMeta" class="sr-only">데이터를 불러오는 중입니다.</p>
 
         <section class="toolbar" id="toolbar"></section>
         <section class="status-line" id="statusLine"></section>
@@ -46,17 +37,34 @@
             </div>
           </div>
           <aside class="detail-panel">
-            <h2>Details</h2>
-            <pre id="details">{}</pre>
+            <h2>선택 상품 판매 로그</h2>
+            <p id="detailMeta">상품을 클릭하면 오늘 판매 이력이 표시됩니다.</p>
+            <div class="detail-table-wrap">
+              <table id="detailTable">
+                <thead>
+                  <tr>
+                    <th style="--col-width: 80px">시간</th>
+                    <th class="number" style="--col-width: 56px">수량</th>
+                    <th class="number" style="--col-width: 120px">매출</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr><td colspan="3" class="empty-cell">표시할 데이터가 없습니다.</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <pre id="details" class="sr-only">{}</pre>
           </aside>
         </section>
+        <div class="runtime-status" id="runtimeLabel">Local/Web</div>
+        <div class="sync-progress" id="syncProgress" aria-hidden="true"><span></span></div>
       </main>
     </div>
     <dialog id="modal">
       <form method="dialog">
         <header>
-          <h2 id="modalTitle">Action</h2>
-          <button value="cancel" aria-label="닫기">Close</button>
+          <h2 id="modalTitle">작업</h2>
+          <button value="cancel" aria-label="닫기">닫기</button>
         </header>
         <div id="modalBody"></div>
       </form>

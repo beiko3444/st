@@ -1,3 +1,5 @@
+.git/
+.codex/
 .venv/
 .python/
 __pycache__/
@@ -6,11 +8,16 @@ __pycache__/
 *.pyd
 *.log
 .DS_Store
-dist/
+
 build/
-python-embed.zip
-get-pip.py
-SmartInventory.spec
+dist/
+assets/
+android_sms_forwarder/
+inventory_monitor/
+scripts/
+tests/
+test_*.py
+
 config/credentials.json
 inventory_app.db
 inventory_app.db-shm

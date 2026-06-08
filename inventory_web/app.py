@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -18,11 +18,13 @@ from inventory_app.connectors.fassto import (
     FasstoConnector,
     build_warehousing_payload,
 )
+from inventory_app.models import ChannelProduct
 from inventory_app.services.card_api_client import CardApiClient
 from inventory_app.services.card_category import DEFAULT_CATEGORIES
 from inventory_app.services.channel_services import CoupangChannelService, NaverChannelService
 from inventory_app.services.keyword_services import NaverKeywordRevenueService
 from inventory_app.services.local_cache import ChannelProductCache
+from inventory_app.services.master_product_service import build_master_service
 from inventory_app.services.purchase_history_service import (
     PurchaseHistoryParser,
     PurchaseHistoryStore,
@@ -32,10 +34,17 @@ from inventory_app.services.revenue_services import RevenueComparisonService
 
 from .config import config_status, load_web_config
 from .jobs import jobs
-from .serializers import channel_product_to_dict, monitor_inventory_row, to_jsonable
+from .serializers import (
+    channel_product_to_dict,
+    master_product_row_to_dict,
+    monitor_inventory_row,
+    to_jsonable,
+)
 
 ROOT = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(ROOT / "templates"))
+KST = timezone(timedelta(hours=9), "KST")
+DISCORD_CONTENT_LIMIT = 1900
 
 
 def ok(data: Any = None, **extra: Any) -> JSONResponse:
@@ -87,6 +96,147 @@ def _search_filter(rows: list[dict[str, Any]], query: str) -> list[dict[str, Any
         for row in rows
         if q in str(row.get("name") or row.get("title") or row.get("store_name") or row).lower()
     ]
+
+
+def _to_int_or_none(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_datetime(value: Any) -> datetime:
+    text = str(value or "").strip()
+    if text:
+        try:
+            return datetime.fromisoformat(text)
+        except ValueError:
+            pass
+    return datetime.now()
+
+
+def _first_defined(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _monitor_channel_product(row: dict[str, Any], index: int) -> ChannelProduct:
+    return ChannelProduct(
+        serial=int(row.get("serial") or index),
+        product_id=str(_first_defined(row.get("product_id"), row.get("productId"), "") or ""),
+        item_id=(
+            str(_first_defined(row.get("item_id"), row.get("itemId")))
+            if _first_defined(row.get("item_id"), row.get("itemId")) is not None
+            else None
+        ),
+        name=str(_first_defined(row.get("name"), row.get("title"), "") or ""),
+        image_url=_first_defined(row.get("image_url"), row.get("imageUrl")),
+        product_url=_first_defined(row.get("product_url"), row.get("productUrl")),
+        stock=_to_int_or_none(row.get("stock")),
+        today_sales=_to_int_or_none(_first_defined(row.get("today_sales"), row.get("todaySales"))),
+        sales=_to_int_or_none(row.get("sales")),
+        price=_to_int_or_none(row.get("price")),
+        synced_at=_to_datetime(_first_defined(row.get("recorded_at"), row.get("syncedAt"))),
+    )
+
+
+def _report_int(value: Any) -> str:
+    if value is None:
+        return "-"
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _sum_report_values(rows: list[dict[str, Any]], key: str) -> int:
+    total = 0
+    for row in rows:
+        value = row.get(key)
+        if value is None:
+            continue
+        try:
+            total += int(value)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _discord_webhook_url() -> str:
+    return (
+        os.environ.get("DISCORD_INVENTORY_WEBHOOK_URL")
+        or os.environ.get("DISCORD_WEBHOOK_URL")
+        or ""
+    ).strip()
+
+
+def _build_inventory_report_messages(rows: list[dict[str, Any]]) -> list[str]:
+    now = datetime.now(KST)
+    total_naver = _sum_report_values(rows, "naverStock")
+    total_coupang = _sum_report_values(rows, "coupangStock")
+    total_stock = _sum_report_values(rows, "totalStock")
+    total_today_sales = _sum_report_values(rows, "totalTodaySales")
+    total_sales = _sum_report_values(rows, "totalSales")
+    total_stock_cost = _sum_report_values(rows, "stockCost")
+
+    header_lines = [
+        f"상품재고 일보 - {now:%Y-%m-%d} 00:00 KST",
+        f"상품관리 등록: {len(rows):,}개",
+        (
+            "총재고: "
+            f"{_report_int(total_stock)} "
+            f"(네이버 {_report_int(total_naver)} / 쿠팡 {_report_int(total_coupang)})"
+        ),
+        (
+            f"오늘판매: {_report_int(total_today_sales)} | "
+            f"30일판매: {_report_int(total_sales)} | "
+            f"재고원가: {_report_int(total_stock_cost)}원"
+        ),
+    ]
+    header = "\n".join(header_lines)
+
+    if not rows:
+        return [f"{header}\n\n상품관리 등록 상품이 없습니다."]
+
+    lines = []
+    for row in rows:
+        name = str(row.get("name") or f"상품 {row.get('id') or ''}").strip()
+        lines.append(
+            "- "
+            f"{name}: "
+            f"네이버 {_report_int(row.get('naverStock'))} / "
+            f"쿠팡 {_report_int(row.get('coupangStock'))} / "
+            f"총 {_report_int(row.get('totalStock'))} | "
+            f"오늘 {_report_int(row.get('totalTodaySales'))} | "
+            f"30일 {_report_int(row.get('totalSales'))}"
+        )
+
+    messages: list[str] = []
+    current = f"{header}\n\n상품별 재고\n"
+    for line in lines:
+        candidate = f"{current}{line}\n"
+        if len(candidate) > DISCORD_CONTENT_LIMIT and current.strip() != header:
+            messages.append(current.rstrip())
+            current = f"{header}\n\n상품별 재고 계속\n{line}\n"
+        else:
+            current = candidate
+    if current.strip():
+        messages.append(current.rstrip())
+    return messages
+
+
+def _send_discord_message(webhook_url: str, content: str) -> None:
+    try:
+        response = httpx.post(webhook_url, json={"content": content}, timeout=20.0)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"discord webhook failed: {exc}") from exc
+    if response.status_code >= 400:
+        detail = response.text.strip() or f"HTTP {response.status_code}"
+        raise HTTPException(status_code=502, detail=f"discord webhook failed: {detail}")
 
 
 def create_app() -> FastAPI:
@@ -168,6 +318,43 @@ def create_app() -> FastAPI:
     def start_job(name: str, work: Callable[[Callable[[str], None], Callable[[int], None]], Any]) -> JSONResponse:
         job = jobs.create(name, work)
         return ok(job.snapshot())
+
+    def master_inventory_data(include_links: bool = True) -> dict[str, Any]:
+        cache = ChannelProductCache()
+        service = build_master_service(cache=cache, monitor_url=config.monitor_url)
+        warnings: list[str] = []
+        if config.monitor_url:
+            service.refresh_from_remote()
+            inventory_payload = monitor_request("GET", "/inventory")
+            rows_by_channel = {
+                channel: [
+                    _monitor_channel_product(row, index)
+                    for index, row in enumerate(_as_list(inventory_payload.get(channel, [])), start=1)
+                    if isinstance(row, dict)
+                ]
+                for channel in ("naver", "coupang")
+            }
+            warnings.append("monitor")
+        else:
+            rows_by_channel = {
+                "naver": cache.load_rows("naver"),
+                "coupang": cache.load_rows("coupang"),
+            }
+
+        aggregation = service.aggregate(rows_by_channel)
+        data: dict[str, Any] = {
+            "masters": cache.list_masters(),
+            "rows": [master_product_row_to_dict(row) for row in aggregation.masters],
+            "unlinked": {
+                channel: len(rows)
+                for channel, rows in aggregation.unlinked_by_channel.items()
+            },
+            "syncedAt": aggregation.synced_at,
+            "warnings": warnings,
+        }
+        if include_links:
+            data["links"] = list(cache.load_all_links().values())
+        return data
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
@@ -290,16 +477,42 @@ def create_app() -> FastAPI:
 
     @app.get("/api/masters")
     def get_masters(include_links: bool = True) -> JSONResponse:
-        if config.monitor_url:
-            data = monitor_request("GET", "/masters")
-            if include_links:
-                data["links"] = monitor_request("GET", "/master-links").get("links", [])
-            return ok(data)
-        cache = ChannelProductCache()
-        data = {"masters": cache.list_masters()}
-        if include_links:
-            data["links"] = list(cache.load_all_links().values())
-        return ok(data)
+        return ok(master_inventory_data(include_links=include_links))
+
+    @app.get("/api/reports/inventory/discord")
+    def send_inventory_discord_report(request: Request, dry_run: bool = False) -> JSONResponse:
+        cron_secret = os.environ.get("CRON_SECRET", "").strip()
+        if cron_secret:
+            auth_header = request.headers.get("authorization", "")
+            if auth_header != f"Bearer {cron_secret}":
+                return fail("unauthorized", status_code=401)
+        elif is_vercel and not dry_run:
+            return fail("CRON_SECRET is required for Vercel cron reports", status_code=424)
+
+        data = master_inventory_data(include_links=False)
+        rows = data.get("rows", [])
+        messages = _build_inventory_report_messages(rows)
+        if dry_run:
+            return ok(
+                {
+                    "rows": len(rows),
+                    "messages": messages,
+                    "warnings": data.get("warnings", []),
+                }
+            )
+
+        webhook_url = _discord_webhook_url()
+        if not webhook_url:
+            return fail("DISCORD_INVENTORY_WEBHOOK_URL is required", status_code=424)
+        for message in messages:
+            _send_discord_message(webhook_url, message)
+        return ok(
+            {
+                "sentMessages": len(messages),
+                "rows": len(rows),
+                "warnings": data.get("warnings", []),
+            }
+        )
 
     @app.post("/api/masters")
     async def create_master(request: Request) -> JSONResponse:

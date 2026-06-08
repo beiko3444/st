@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import time
 import unittest
+from datetime import datetime
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ["VERCEL"] = "1"
@@ -10,6 +13,8 @@ os.environ["VERCEL"] = "1"
 import httpx
 from fastapi.testclient import TestClient
 
+from inventory_app.models import ChannelProduct
+from inventory_app.services.local_cache import ChannelProductCache
 from inventory_web.app import create_app
 from inventory_web.jobs import jobs
 
@@ -19,6 +24,10 @@ class InventoryWebTests(unittest.TestCase):
         os.environ["VERCEL"] = "1"
         os.environ.pop("SMARTINVENTORY_MONITOR_URL", None)
         os.environ.pop("MONITOR_URL", None)
+        os.environ.pop("SMARTINVENTORY_CACHE_DB", None)
+        os.environ.pop("CRON_SECRET", None)
+        os.environ.pop("DISCORD_INVENTORY_WEBHOOK_URL", None)
+        os.environ.pop("DISCORD_WEBHOOK_URL", None)
 
     def test_root_renders_all_work_tabs(self) -> None:
         client = TestClient(create_app())
@@ -138,6 +147,69 @@ class InventoryWebTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["data"]["cached"])
         self.assertEqual(payload["data"]["snapshot"]["products"][0]["product_id"], "A")
+
+    def test_discord_inventory_report_dry_run_uses_master_rows_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["SMARTINVENTORY_CACHE_DB"] = str(Path(tmpdir) / "cache.sqlite3")
+            cache = ChannelProductCache()
+            master = cache.create_master("관리상품", unit_cost=1000)
+            now = datetime(2026, 6, 6, 0, 0, 0)
+            cache.save_rows(
+                "naver",
+                [
+                    ChannelProduct(
+                        serial=1,
+                        product_id="linked",
+                        item_id=None,
+                        name="연결 네이버 상품",
+                        image_url=None,
+                        product_url="https://example.com/linked",
+                        stock=5,
+                        today_sales=2,
+                        sales=10,
+                        price=12000,
+                        synced_at=now,
+                    ),
+                    ChannelProduct(
+                        serial=2,
+                        product_id="unlinked",
+                        item_id=None,
+                        name="미연결 채널 상품",
+                        image_url=None,
+                        product_url="https://example.com/unlinked",
+                        stock=99,
+                        today_sales=9,
+                        sales=90,
+                        price=9900,
+                        synced_at=now,
+                    ),
+                ],
+            )
+            cache.link_channel_product("naver", "id:linked|item:", master.id)
+
+            client = TestClient(create_app())
+            payload = client.get("/api/reports/inventory/discord?dry_run=1").json()
+
+        self.assertTrue(payload["ok"])
+        messages = "\n".join(payload["data"]["messages"])
+        self.assertEqual(payload["data"]["rows"], 1)
+        self.assertIn("관리상품", messages)
+        self.assertIn("네이버 5", messages)
+        self.assertNotIn("미연결 채널 상품", messages)
+
+    def test_discord_inventory_report_checks_cron_secret(self) -> None:
+        os.environ["CRON_SECRET"] = "unit-secret"
+        client = TestClient(create_app())
+
+        unauthorized = client.get("/api/reports/inventory/discord?dry_run=1").json()
+        authorized = client.get(
+            "/api/reports/inventory/discord?dry_run=1",
+            headers={"Authorization": "Bearer unit-secret"},
+        ).json()
+
+        self.assertFalse(unauthorized["ok"])
+        self.assertEqual(unauthorized["error"], "unauthorized")
+        self.assertTrue(authorized["ok"])
 
 
 if __name__ == "__main__":

@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <style name="Theme.SmsForwarder" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-        <item name="colorPrimary">#0f766e</item>
-        <item name="colorPrimaryDark">#0b5e57</item>
-        <item name="colorAccent">#14b8a6</item>
-    </style>
-</resources>
