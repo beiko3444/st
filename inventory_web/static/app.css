@@ -312,12 +312,21 @@ th.image {
   text-align: center;
 }
 
+td.favorite-cell {
+  color: #b7791f;
+  font-weight: 800;
+}
+
 td img {
   width: 48px;
   height: 48px;
   object-fit: cover;
   border: 1px solid var(--line);
   background: #f8fafc;
+}
+
+td a {
+  color: inherit;
 }
 
 .empty-cell {
@@ -447,6 +456,112 @@ dialog h2 {
   flex-wrap: wrap;
 }
 
+#modalBody .stack,
+.stack {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.form-field {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.form-field > span {
+  font-weight: 700;
+  color: var(--strong);
+}
+
+.form-field input,
+.form-field select,
+.form-field textarea {
+  width: 100%;
+  min-width: 0;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.linked-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--soft-line);
+  padding: 8px;
+}
+
+.linked-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px;
+  border-bottom: 1px solid var(--soft-line);
+}
+
+.linked-item:last-child {
+  border-bottom: 0;
+}
+
+.summary-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--soft-line);
+  background: #f8fafc;
+}
+
+.statement-preview table {
+  width: 100%;
+  min-width: 0;
+}
+
+.statement-preview th {
+  width: 120px;
+}
+
+.login-page {
+  min-width: 0;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+}
+
+.login-panel {
+  width: min(360px, 100%);
+  border: 1px solid var(--line);
+  background: #ffffff;
+  padding: 20px;
+}
+
+.login-panel h1 {
+  margin: 0 0 16px;
+  font-size: 20px;
+}
+
+.login-panel form {
+  display: grid;
+  gap: 8px;
+}
+
+.login-error {
+  margin: 10px 0 0;
+  color: var(--danger);
+  font-weight: 700;
+}
+
 textarea {
   width: 100%;
   min-height: 220px;
@@ -494,6 +609,13 @@ textarea {
     flex-wrap: wrap;
   }
 
+  .corner-actions button,
+  .toolbar button,
+  .toolbar select,
+  .toolbar input {
+    max-width: 100%;
+  }
+
   .tab-pane {
     border-radius: 0 0 10px 10px;
   }
@@ -505,5 +627,13 @@ textarea {
 
   .detail-panel {
     display: none !important;
+  }
+
+  .form-field {
+    grid-template-columns: 1fr;
+  }
+
+  dialog {
+    width: calc(100vw - 16px);
   }
 }

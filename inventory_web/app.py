@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import hmac
 import io
 import os
 from datetime import date, datetime, timedelta, timezone
@@ -9,7 +11,7 @@ from typing import Any, Callable, Iterable
 
 import httpx
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -28,6 +30,12 @@ from inventory_app.services.master_product_service import build_master_service
 from inventory_app.services.purchase_history_service import (
     PurchaseHistoryParser,
     PurchaseHistoryStore,
+)
+from inventory_app.services.purchase_crawler import (
+    CrawlerProgress,
+    crawl_channel,
+    ensure_browser_installed,
+    sync_playwright as crawler_sync_playwright,
 )
 from inventory_app.services.pi_data_client import PiDataClient
 from inventory_app.services.revenue_services import RevenueComparisonService
@@ -244,6 +252,102 @@ def create_app() -> FastAPI:
     app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
     config = load_web_config()
     is_vercel = bool(os.environ.get("VERCEL"))
+    session_cookie = "smartinventory_session"
+
+    def web_password() -> str:
+        return os.environ.get("SMARTINVENTORY_WEB_PASSWORD", "").strip()
+
+    def session_secret() -> str:
+        return (os.environ.get("SMARTINVENTORY_SESSION_SECRET") or web_password()).strip()
+
+    def session_signature() -> str:
+        secret = session_secret() or "smartinventory-dev-session"
+        payload = f"smartinventory-web:{web_password()}".encode("utf-8")
+        return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+    def has_web_session(request: Request) -> bool:
+        password = web_password()
+        if not password:
+            return True
+        token = request.cookies.get(session_cookie, "")
+        return bool(token) and hmac.compare_digest(token, session_signature())
+
+    def cron_authorized(request: Request) -> bool:
+        cron_secret = os.environ.get("CRON_SECRET", "").strip()
+        if not cron_secret:
+            return False
+        return request.headers.get("authorization", "") == f"Bearer {cron_secret}"
+
+    def login_html(error: str = "") -> HTMLResponse:
+        error_html = f'<p class="login-error">{error}</p>' if error else ""
+        return HTMLResponse(
+            f"""<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SmartInventory Login</title>
+    <link rel="stylesheet" href="/static/app.css">
+  </head>
+  <body class="login-page">
+    <main class="login-panel">
+      <h1>SmartInventory</h1>
+      <form method="post" action="/login">
+        <input name="password" type="password" autocomplete="current-password" placeholder="비밀번호" autofocus>
+        <button type="submit" class="primary-button">로그인</button>
+      </form>
+      {error_html}
+    </main>
+  </body>
+</html>"""
+        )
+
+    @app.middleware("http")
+    async def web_auth_middleware(request: Request, call_next):
+        path = request.url.path
+        public_path = (
+            path == "/login"
+            or path.startswith("/static/")
+            or path in {"/favicon.ico", "/robots.txt"}
+        )
+        cron_path = path == "/api/reports/inventory/discord" and cron_authorized(request)
+        if public_path or cron_path or has_web_session(request):
+            return await call_next(request)
+        if path.startswith("/api/"):
+            return fail("unauthorized", status_code=401)
+        return RedirectResponse("/login", status_code=303)
+
+    @app.get("/login", response_class=HTMLResponse)
+    def login_page(request: Request) -> Response:
+        if not web_password() or has_web_session(request):
+            return RedirectResponse("/", status_code=303)
+        return login_html()
+
+    @app.get("/favicon.ico")
+    def favicon() -> Response:
+        return Response(status_code=204)
+
+    @app.post("/login")
+    async def login_submit(request: Request) -> Response:
+        form = await request.form()
+        if str(form.get("password") or "") != web_password():
+            return login_html("비밀번호가 맞지 않습니다.")
+        response = RedirectResponse("/", status_code=303)
+        response.set_cookie(
+            session_cookie,
+            session_signature(),
+            httponly=True,
+            secure=request.url.scheme == "https",
+            samesite="lax",
+            max_age=60 * 60 * 24 * 30,
+        )
+        return response
+
+    @app.post("/logout")
+    def logout() -> Response:
+        response = RedirectResponse("/login", status_code=303)
+        response.delete_cookie(session_cookie)
+        return response
 
     def monitor_url() -> str:
         url = (config.monitor_url or "").strip().rstrip("/")
@@ -319,6 +423,42 @@ def create_app() -> FastAPI:
         job = jobs.create(name, work)
         return ok(job.snapshot())
 
+    def normalize_job_result(value: Any) -> dict[str, Any]:
+        if isinstance(value, tuple):
+            return {"result": [to_jsonable(item) for item in value]}
+        if isinstance(value, dict):
+            return value
+        return {"result": to_jsonable(value)}
+
+    def enrich_channel_rows(channel: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        cache = ChannelProductCache()
+        if config.monitor_url:
+            try:
+                build_master_service(cache=cache, monitor_url=config.monitor_url).refresh_from_remote()
+            except Exception:
+                pass
+        favorites = cache.load_favorite_keys(channel)
+        name_overrides = cache.load_name_overrides(channel)
+        links = cache.load_all_links()
+        masters = {master.id: master for master in cache.list_masters()}
+        enriched: list[dict[str, Any]] = []
+        for row in rows:
+            clean = dict(row)
+            identity_key = str(clean.get("identityKey") or clean.get("productKey") or "")
+            custom_name = name_overrides.get(identity_key)
+            if custom_name:
+                clean["originalName"] = clean.get("name")
+                clean["name"] = custom_name
+                clean["customName"] = custom_name
+            link = links.get((channel, identity_key))
+            clean["isFavorite"] = identity_key in favorites
+            clean["favorite"] = identity_key in favorites
+            clean["linkedMasterId"] = link.master_id if link else None
+            clean["linkedMasterName"] = masters.get(link.master_id).name if link and masters.get(link.master_id) else None
+            clean["linkMultiplier"] = link.multiplier if link else None
+            enriched.append(clean)
+        return enriched
+
     def master_inventory_data(include_links: bool = True) -> dict[str, Any]:
         cache = ChannelProductCache()
         service = build_master_service(cache=cache, monitor_url=config.monitor_url)
@@ -352,6 +492,32 @@ def create_app() -> FastAPI:
             "syncedAt": aggregation.synced_at,
             "warnings": warnings,
         }
+        if config.monitor_url:
+            try:
+                inbound_payload = monitor_request("GET", "/stock-inbounds")
+                summaries = _as_list(inbound_payload.get("summaries", []))
+                pending_by_master: dict[tuple[int, str], int] = {}
+                for summary in summaries:
+                    if not isinstance(summary, dict):
+                        continue
+                    try:
+                        key = (int(summary.get("master_id")), str(summary.get("channel") or ""))
+                        pending_by_master[key] = int(summary.get("pending_qty") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                for row in data["rows"]:
+                    try:
+                        master_id = int(row.get("id"))
+                    except (TypeError, ValueError):
+                        continue
+                    naver_pending = pending_by_master.get((master_id, "naver"), 0)
+                    coupang_pending = pending_by_master.get((master_id, "coupang"), 0)
+                    row["naverInboundPending"] = naver_pending or None
+                    row["coupangInboundPending"] = coupang_pending or None
+                    row["totalInboundPending"] = (naver_pending + coupang_pending) or None
+                data["stockInbounds"] = inbound_payload
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"stock inbounds unavailable: {exc}")
         if include_links:
             data["links"] = list(cache.load_all_links().values())
         return data
@@ -438,7 +604,44 @@ def create_app() -> FastAPI:
                 service_rows, service_warnings = service.fetch_cached()
             rows = [channel_product_to_dict(row) for row in service_rows]
             warnings.extend([str(w) for w in service_warnings])
-        return ok({"rows": _search_filter(rows, q), "warnings": warnings})
+        return ok({"rows": _search_filter(enrich_channel_rows(channel, rows), q), "warnings": warnings})
+
+    @app.post("/api/sync/all")
+    def sync_all() -> JSONResponse:
+        def work(log: Callable[[str], None], progress: Callable[[int], None]) -> dict[str, Any]:
+            if config.monitor_url:
+                log("requesting Raspberry Pi inventory refresh")
+                progress(15)
+                payload = monitor_request("POST", "/sync/inventory", params={"wait": "1"}, timeout=120.0)
+                progress(85)
+                try:
+                    records, orders = purchase_store().pull_from_pi(limit=5000)
+                    log(f"purchase pull from Pi: records {records}, orders {orders}")
+                except Exception as exc:  # noqa: BLE001
+                    log(f"purchase pull skipped: {exc}")
+                return {"inventory": payload}
+
+            require_monitor_for_vercel("sync all")
+            results: dict[str, Any] = {}
+            steps: list[tuple[str, Callable[[], Any]]] = [
+                ("naver", lambda: NaverChannelService(config).fetch()),
+                ("coupang", lambda: CoupangChannelService(config).fetch()),
+                ("revenue", lambda: RevenueComparisonService(config).fetch(config.stats_lookback_days)),
+                ("keywords", lambda: NaverKeywordRevenueService(config).fetch(config.stats_lookback_days)),
+                ("purchase-pull", lambda: purchase_store().pull_from_pi(limit=5000)),
+            ]
+            for index, (name, fn) in enumerate(steps, start=1):
+                log(f"{name} sync started")
+                progress(int((index - 1) / len(steps) * 90) + 5)
+                try:
+                    results[name] = normalize_job_result(fn())
+                except Exception as exc:  # noqa: BLE001
+                    results[name] = {"error": str(exc)}
+                    log(f"{name} sync failed: {exc}")
+            progress(95)
+            return results
+
+        return start_job("sync-all", work)
 
     @app.post("/api/channels/{channel}/sync")
     def sync_channel(channel: str) -> JSONResponse:
@@ -613,6 +816,13 @@ def create_app() -> FastAPI:
     def get_sales_series(start: str, end: str) -> JSONResponse:
         return ok(monitor_request("GET", "/sales/series", params={"start": start, "end": end}))
 
+    @app.get("/api/sales/totals")
+    def get_sales_totals(days: int = 30) -> JSONResponse:
+        if config.monitor_url:
+            return ok(monitor_request("GET", "/sales/totals", params={"days": days}))
+        require_monitor_for_vercel("sales totals")
+        return ok({"totals": [], "warnings": ["monitor backend is not configured"]})
+
     @app.post("/api/sales/sync")
     def sync_sales() -> JSONResponse:
         return sync_channel("naver")
@@ -735,6 +945,79 @@ def create_app() -> FastAPI:
                 },
             )
         )
+
+    @app.get("/api/purchases/crawler/status")
+    def get_purchase_crawler_status() -> JSONResponse:
+        return ok(
+            {
+                "available": True,
+                "playwrightInstalled": crawler_sync_playwright is not None,
+                "runsIn": "local-tunnel",
+                "channels": ["naver", "coupang"],
+            }
+        )
+
+    @app.post("/api/purchases/crawler/prepare")
+    def prepare_purchase_crawler() -> JSONResponse:
+        def work(log: Callable[[str], None], progress: Callable[[int], None]) -> dict[str, Any]:
+            progress(20)
+            ensure_browser_installed(CrawlerProgress(on_log=log))
+            progress(90)
+            return {"ready": True}
+
+        return start_job("purchase-crawler-prepare", work)
+
+    @app.post("/api/purchases/crawl")
+    async def crawl_purchases(request: Request) -> JSONResponse:
+        body = await request.json()
+        channel = str(body.get("channel") or "coupang").strip().lower()
+        if channel not in {"naver", "coupang"}:
+            return fail("unknown channel", status_code=404)
+
+        def work(log: Callable[[str], None], progress: Callable[[int], None]) -> dict[str, Any]:
+            store = purchase_store()
+            saved_records = 0
+            saved_orders = 0
+
+            def on_partial(records, orders, partial_channel: str) -> None:
+                nonlocal saved_records, saved_orders
+                saved_records += store.save_records(records)
+                saved_orders += store.save_orders(orders)
+                log(f"{partial_channel} partial saved: records {len(records)}, orders {len(orders)}")
+
+            crawler_progress = CrawlerProgress(
+                on_log=log,
+                on_login_required=log,
+                on_partial=on_partial,
+            )
+            progress(10)
+            result = crawl_channel(
+                channel,
+                headless=bool(body.get("headless") or False),
+                max_pages=max(1, int(body.get("max_pages") or body.get("maxPages") or 5)),
+                reset_session=bool(body.get("reset_session") or body.get("resetSession") or False),
+                progress=crawler_progress,
+                coupang_email=str(body.get("coupang_email") or body.get("coupangEmail") or ""),
+                coupang_password=str(body.get("coupang_password") or body.get("coupangPassword") or ""),
+                login_only=bool(body.get("login_only") or body.get("loginOnly") or False),
+                account_label=str(body.get("account_label") or body.get("accountLabel") or ""),
+                crawl_days=int(body.get("crawl_days") or body.get("crawlDays") or 0),
+            )
+            if result.error:
+                raise RuntimeError(result.error)
+            progress(80)
+            saved_records += store.save_records(result.records)
+            saved_orders += store.save_orders(getattr(result, "orders", []))
+            progress(95)
+            return {
+                "channel": result.channel,
+                "records": len(result.records),
+                "orders": len(getattr(result, "orders", [])),
+                "savedRecords": saved_records,
+                "savedOrders": saved_orders,
+            }
+
+        return start_job(f"purchase-crawl-{channel}", work)
 
     @app.get("/api/purchases/coupang-credentials")
     def get_coupang_credentials() -> JSONResponse:

@@ -4,6 +4,11 @@ const state = {
   config: null,
   fasstoSection: "goods",
   selectedIndex: 0,
+  channelFavoriteFilter: { naver: "all", coupang: "all" },
+  currentPurchaseKind: "records",
+  currentPurchaseChannel: "all",
+  activeJob: null,
+  cardCategories: null,
 };
 
 const tabs = {
@@ -103,6 +108,34 @@ function formatDate(value) {
   return text.replace("T", " ").slice(0, 16);
 }
 
+function selectedRow() {
+  return state.rows[state.selectedIndex] || null;
+}
+
+function productIdentity(row) {
+  return compactValue(valueFrom(row, ["identityKey", "productIdentityKey", "productKey"]));
+}
+
+function productUrl(row) {
+  return compactValue(valueFrom(row, ["productUrl", "product_url", "naverUrl", "coupangUrl", "source_url", "sourceUrl"]));
+}
+
+function channelLabel(channel) {
+  return channel === "naver" ? "네이버" : channel === "coupang" ? "쿠팡" : channel;
+}
+
+function parseInteger(value) {
+  if (value === "" || value === null || value === undefined) return null;
+  const parsed = Number(String(value).replaceAll(",", ""));
+  return Number.isFinite(parsed) ? Math.trunc(parsed) : null;
+}
+
+function todayIso(deltaDays = 0) {
+  const d = new Date();
+  d.setDate(d.getDate() + deltaDays);
+  return d.toISOString().slice(0, 10);
+}
+
 function channelSoldOutDays(row, days) {
   const stock = Number(valueFrom(row, ["stock"]));
   const sales = Number(valueFrom(row, ["sales"]));
@@ -152,10 +185,12 @@ function centerCol(label, keys, width = 80, options = {}) {
 }
 
 const channelColumns = (days) => [
-  centerCol("★", "__favorite", 36, { derive: () => "" }),
+  centerCol("★", "__favorite", 36, { derive: (row) => row?.isFavorite ? "★" : "☆" }),
   centerCol("연번", ["serial"], 44),
   imageCol("상품이미지", ["imageUrl", "image_url"], 64),
   col("상품명", ["name", "title"], 360),
+  col("마스터", ["linkedMasterName"], 150),
+  numberCol("배수", ["linkMultiplier"], 52),
   numberCol("재고", ["stock"], 68),
   numberCol("오늘판매", ["todaySales", "today_sales"], 76),
   numberCol(`${days}일`, ["sales"], 66),
@@ -172,8 +207,11 @@ const schemas = {
     priceCol("네이버가", ["naverPrice"], 92),
     priceCol("쿠팡가", ["coupangPrice"], 88),
     numberCol("네이버재고", ["naverStock"], 86),
+    numberCol("네이버입고", ["naverInboundPending"], 86),
     numberCol("쿠팡재고", ["coupangStock"], 86),
+    numberCol("쿠팡입고", ["coupangInboundPending"], 86),
     numberCol("총재고", ["totalStock"], 80),
+    numberCol("총입고", ["totalInboundPending"], 72),
     priceCol("재고원가", ["stockCost"], 110),
     numberCol("네이버(오늘)", ["naverTodaySales"], 92),
     numberCol("쿠팡(오늘)", ["coupangTodaySales"], 84),
@@ -387,10 +425,13 @@ function renderCell(row, column) {
   const text = compactValue(value);
   const title = escapeHtml(compactValue(rawValue));
   const classes = [column.className || ""];
+  if (column.keys?.includes("__favorite")) classes.push("favorite-cell");
   if (column.type === "image") {
     const url = compactValue(rawValue);
+    const href = productUrl(row);
     const img = url ? `<img src="${escapeHtml(url)}" alt="">` : "";
-    return `<td class="${classes.join(" ")}" style="--col-width:${column.width}px">${img}</td>`;
+    const linked = img && href ? `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer">${img}</a>` : img;
+    return `<td class="${classes.join(" ")}" style="--col-width:${column.width}px">${linked}</td>`;
   }
   return `<td class="${classes.join(" ")}" style="--col-width:${column.width}px" title="${title}">${escapeHtml(text)}</td>`;
 }
@@ -418,6 +459,7 @@ function renderTable(rows) {
     tr.tabIndex = 0;
     tr.innerHTML = columns.map((column) => renderCell(row, column)).join("");
     tr.addEventListener("click", () => selectRow(index));
+    tr.addEventListener("dblclick", () => openSelectedAction());
     tableBody.appendChild(tr);
   });
   selectRow(0);
@@ -456,6 +498,15 @@ function renderDetailPanel(row) {
       <td class="number" style="--col-width:120px">${escapeHtml(formatPrice(amount))}</td>
     </tr>
   `;
+}
+
+function openSelectedAction() {
+  if (state.tab === "masters") return showMasterEditor(selectedRow());
+  if (state.tab === "naver" || state.tab === "coupang") return showChannelProductDetail(state.tab, selectedRow());
+  if (state.tab === "purchases") return showPurchaseDetail(selectedRow());
+  if (state.tab === "cards") return showCardUsageEditor(selectedRow());
+  if (state.tab === "fassto") return showFasstoDetail();
+  return showSelectedDetail();
 }
 
 function button(label, handler, className = "") {
@@ -515,6 +566,42 @@ function showModal(title, bodyNode) {
   $("#modal").showModal();
 }
 
+function closeModal() {
+  const modal = $("#modal");
+  if (modal?.open) modal.close();
+}
+
+function field(labelText, control) {
+  const wrap = document.createElement("label");
+  wrap.className = "form-field";
+  const span = document.createElement("span");
+  span.textContent = labelText;
+  wrap.append(span, control);
+  return wrap;
+}
+
+function actions(...buttons) {
+  const wrap = document.createElement("div");
+  wrap.className = "modal-actions";
+  buttons.forEach((btn) => wrap.appendChild(btn));
+  return wrap;
+}
+
+function preBlock(value) {
+  const pre = document.createElement("pre");
+  pre.textContent = typeof value === "string" ? value : JSON.stringify(value || {}, null, 2);
+  return pre;
+}
+
+function selectedRequired(message = "선택된 행이 없습니다.") {
+  const row = selectedRow();
+  if (!row) {
+    setStatus(message, true);
+    return null;
+  }
+  return row;
+}
+
 function showSelectedDetail() {
   const row = state.rows[state.selectedIndex];
   const body = document.createElement("pre");
@@ -523,11 +610,22 @@ function showSelectedDetail() {
 }
 
 async function loadJobs(job) {
+  state.activeJob = job;
   setProgress(12, true);
   setStatus(`작업 시작: ${job.id}`);
   const timer = setInterval(async () => {
     try {
       const current = await api(`/api/jobs/${job.id}`);
+      state.activeJob = current;
+      const logEl = document.querySelector("#jobLog");
+      if (logEl) {
+        logEl.textContent = [
+          `${current.name}: ${current.status} ${current.progress}%`,
+          ...(current.logs || []),
+          current.error ? `ERROR: ${current.error}` : "",
+          current.result ? JSON.stringify(current.result, null, 2) : "",
+        ].filter(Boolean).join("\n");
+      }
       setProgress(current.progress || 0, true);
       setStatus(`${current.name}: ${current.status} ${current.progress}%`);
       if (["succeeded", "failed"].includes(current.status)) {
@@ -546,6 +644,22 @@ async function loadJobs(job) {
       setStatus(error.message, true);
     }
   }, 1200);
+}
+
+function showJobLog(job) {
+  const wrap = document.createElement("div");
+  wrap.className = "stack";
+  const pre = document.createElement("pre");
+  pre.id = "jobLog";
+  pre.textContent = `${job.name || "job"}: ${job.status || "queued"}`;
+  wrap.append(pre);
+  showModal("작업 로그", wrap);
+}
+
+async function startLoggedJob(jobPromise) {
+  const job = await jobPromise;
+  showJobLog(job);
+  await loadJobs(job);
 }
 
 async function loadCurrentTab() {
@@ -575,30 +689,157 @@ async function loadCurrentTab() {
 
 async function loadMasters() {
   toolbar(
-    button("새 마스터", () => {
-      const form = document.createElement("div");
-      const name = input("name");
-      name.placeholder = "마스터 이름";
-      const cost = input("unit_cost", "", "number");
-      cost.placeholder = "원가";
-      form.append(name, cost, button("저장", async () => {
-        await api("/api/masters", {
-          method: "POST",
-          body: JSON.stringify({ name: name.value, unit_cost: cost.value || null }),
-        });
-        $("#modal").close();
-        loadCurrentTab();
-      }, "primary-button"));
-      showModal("새 마스터", form);
-    }),
-    button("상세", showSelectedDetail),
+    button("새 마스터", () => showMasterEditor(null)),
+    button("수정", () => showMasterEditor(selectedRequired())),
+    button("입고관리", () => showInboundManager(selectedRequired())),
+    button("상품URL", () => openMasterUrls(selectedRequired())),
     button("새로고침", loadMasters),
     spacer(),
   );
   const data = await api("/api/masters?include_links=1");
   const rows = normalizeRows(data.masters ? data : data.data);
   renderTable(rows);
-  setStatus(`마스터 ${rows.length.toLocaleString("ko-KR")}개`);
+  const unlinked = data.unlinked ? ` | 미연결 네이버 ${data.unlinked.naver || 0}, 쿠팡 ${data.unlinked.coupang || 0}` : "";
+  setStatus(`마스터 ${rows.length.toLocaleString("ko-KR")}개${unlinked}`);
+}
+
+function openMasterUrls(row) {
+  if (!row) return;
+  [row.naverUrl, row.coupangUrl].filter(Boolean).forEach((url) => window.open(url, "_blank", "noreferrer"));
+  if (!row.naverUrl && !row.coupangUrl) setStatus("연결된 상품 URL이 없습니다.", true);
+}
+
+async function showMasterEditor(row) {
+  const isNew = !row?.id;
+  const wrap = document.createElement("div");
+  wrap.className = "stack";
+  const name = input("name", row?.name || "");
+  const cost = input("unitCost", row?.unitCost ?? "", "number");
+  const memo = document.createElement("textarea");
+  memo.value = row?.memo || "";
+  memo.placeholder = "메모";
+  memo.style.minHeight = "90px";
+  wrap.append(field("마스터명", name), field("원가", cost), field("메모", memo));
+
+  if (!isNew && Array.isArray(row.linked) && row.linked.length) {
+    const list = document.createElement("div");
+    list.className = "linked-list";
+    row.linked.forEach((link) => {
+      const item = document.createElement("div");
+      item.className = "linked-item";
+      item.innerHTML = `<strong>${escapeHtml(channelLabel(link.channel))}</strong> ${escapeHtml(link.name || link.productKey || "")} <span>배수 ${escapeHtml(link.multiplier || 1)}</span>`;
+      item.append(
+        button("대표", async () => {
+          await api(`/api/masters/${row.id}/representative`, {
+            method: "PUT",
+            body: JSON.stringify({ channel: link.channel, product_key: link.productKey }),
+          });
+          closeModal();
+          loadCurrentTab();
+        }),
+        button("배수", async () => {
+          const next = prompt("배수", link.multiplier || 1);
+          if (!next) return;
+          await api("/api/master-links/multiplier", {
+            method: "PUT",
+            body: JSON.stringify({ channel: link.channel, product_key: link.productKey, multiplier: parseInteger(next) || 1 }),
+          });
+          closeModal();
+          loadCurrentTab();
+        }),
+        button("해제", async () => {
+          await api(`/api/master-links?channel=${encodeURIComponent(link.channel)}&product_key=${encodeURIComponent(link.productKey)}`, { method: "DELETE" });
+          closeModal();
+          loadCurrentTab();
+        }, "danger-button"),
+      );
+      list.appendChild(item);
+    });
+    wrap.append(list);
+  }
+
+  const save = button("저장", async () => {
+    const payload = {
+      name: name.value.trim(),
+      unit_cost: parseInteger(cost.value),
+      memo: memo.value.trim() || null,
+      clear_unit_cost: cost.value === "",
+      clear_memo: memo.value.trim() === "",
+    };
+    if (isNew) {
+      await api("/api/masters", { method: "POST", body: JSON.stringify(payload) });
+    } else {
+      await api(`/api/masters/${row.id}`, { method: "PATCH", body: JSON.stringify(payload) });
+    }
+    closeModal();
+    loadCurrentTab();
+  }, "primary-button");
+  const deleteBtn = button("삭제", async () => {
+    if (!row?.id || !confirm("마스터를 삭제할까요? 연결도 같이 해제됩니다.")) return;
+    await api(`/api/masters/${row.id}`, { method: "DELETE" });
+    closeModal();
+    loadCurrentTab();
+  }, "danger-button");
+  wrap.append(isNew ? actions(save) : actions(save, deleteBtn));
+  showModal(isNew ? "새 마스터" : "마스터 상세", wrap);
+}
+
+async function showInboundManager(row) {
+  if (!row?.id) return;
+  const wrap = document.createElement("div");
+  wrap.className = "stack";
+  const receipt = input("receiptDate", todayIso(), "date");
+  const channel = select("channel", [["naver", "네이버"], ["coupang", "쿠팡"]]);
+  const qty = input("quantity", "", "number");
+  qty.placeholder = "수량";
+  const list = document.createElement("div");
+  list.className = "linked-list";
+  async function refresh() {
+    list.textContent = "조회 중...";
+    const data = await api(`/api/stock-inbounds?master_id=${encodeURIComponent(row.id)}`);
+    const items = normalizeRows(data.items ? data.items : data);
+    if (!items.length) {
+      list.innerHTML = `<div class="empty-cell">입고 예정 내역이 없습니다.</div>`;
+      return;
+    }
+    list.innerHTML = "";
+    items.forEach((item) => {
+      const line = document.createElement("div");
+      line.className = "linked-item";
+      line.innerHTML = `${escapeHtml(item.receipt_date || item.receiptDate || "")} <strong>${escapeHtml(channelLabel(item.channel))}</strong> ${escapeHtml(formatNumber(item.remaining_qty ?? item.remainingQty ?? item.input_qty ?? item.inputQty))}`;
+      line.append(button("삭제", async () => {
+        await api(`/api/stock-inbounds/${item.id}`, { method: "DELETE" });
+        refresh();
+        loadCurrentTab();
+      }, "danger-button"));
+      list.appendChild(line);
+    });
+  }
+  wrap.append(
+    field("입고일", receipt),
+    field("채널", channel),
+    field("수량", qty),
+    actions(button("추가", async () => {
+      await api("/api/stock-inbounds", {
+        method: "POST",
+        body: JSON.stringify({
+          receipt_date: compactDate(receipt.value),
+          master_id: row.id,
+          channel: channel.value,
+          quantity: parseInteger(qty.value) || 0,
+        }),
+      });
+      qty.value = "";
+      await refresh();
+      loadCurrentTab();
+    }, "primary-button")),
+    list,
+  );
+  showModal("입고 예정 관리", wrap);
+  refresh().catch((error) => {
+    list.textContent = error.message;
+    setStatus(error.message, true);
+  });
 }
 
 async function loadChannel(channel, query = "") {
@@ -607,17 +848,30 @@ async function loadChannel(channel, query = "") {
   q.addEventListener("keydown", (event) => {
     if (event.key === "Enter") loadChannel(channel, q.value);
   });
+  const favoriteFilter = select("favorite", [["all", "전체"], ["favorite", "즐겨찾기"]]);
+  favoriteFilter.value = state.channelFavoriteFilter[channel] || "all";
+  favoriteFilter.addEventListener("change", () => {
+    state.channelFavoriteFilter[channel] = favoriteFilter.value;
+    loadChannel(channel, q.value);
+  });
   toolbar(
     button("동기화", async () => loadJobs(await api(`/api/channels/${channel}/sync`, { method: "POST" }))),
+    button("★", () => toggleFavorite(channel)),
+    button("이름수정", () => renameChannelProduct(channel)),
+    button("마스터연결", () => showLinkMaster(channel)),
+    button("새마스터+연결", () => createMasterFromChannel(channel)),
+    button("연결해제", () => unlinkSelectedMaster(channel), "danger-button"),
+    button("URL", () => openSelectedProduct()),
     label("필터"),
-    select("favorite", [["all", "전체"], ["favorite", "즐겨찾기"]]),
+    favoriteFilter,
     label("검색"),
     q,
     button("검색", () => loadChannel(channel, q.value)),
     spacer(),
   );
   const data = await api(`/api/channels/${channel}?q=${encodeURIComponent(q.value)}`);
-  const rows = normalizeRows(data);
+  let rows = normalizeRows(data);
+  if (favoriteFilter.value === "favorite") rows = rows.filter((row) => row.isFavorite);
   renderTable(rows);
   const total = rows.reduce((sum, row) => {
     const qty = Number(valueFrom(row, ["todaySales", "today_sales"])) || 0;
@@ -626,6 +880,122 @@ async function loadChannel(channel, query = "") {
   }, 0);
   const warnings = data.warnings?.length ? ` | 경고 ${data.warnings.length}건` : "";
   setStatus(`${channel === "naver" ? "네이버" : "쿠팡"} ${rows.length.toLocaleString("ko-KR")}건 | 오늘 총 판매금액: ${formatPrice(total) || "0원"}${warnings}`);
+}
+
+function selectedChannelRow() {
+  const row = selectedRequired();
+  if (!row) return null;
+  const key = productIdentity(row);
+  if (!key) {
+    setStatus("상품 식별키가 없습니다.", true);
+    return null;
+  }
+  return row;
+}
+
+async function patchChannelProduct(channel, row, payload) {
+  await api(`/api/channels/${channel}/products/${encodeURIComponent(productIdentity(row))}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+async function toggleFavorite(channel) {
+  const row = selectedChannelRow();
+  if (!row) return;
+  await patchChannelProduct(channel, row, { favorite: !row.isFavorite });
+  await loadChannel(channel);
+}
+
+async function renameChannelProduct(channel) {
+  const row = selectedChannelRow();
+  if (!row) return;
+  const next = prompt("표시할 상품명", row.customName || row.name || "");
+  if (next === null) return;
+  await patchChannelProduct(channel, row, { customName: next.trim() || null });
+  await loadChannel(channel);
+}
+
+async function showLinkMaster(channel) {
+  const row = selectedChannelRow();
+  if (!row) return;
+  const data = await api("/api/masters?include_links=0");
+  const masters = normalizeRows(data);
+  if (!masters.length) {
+    setStatus("연결할 마스터가 없습니다. 먼저 새 마스터를 만드세요.", true);
+    return;
+  }
+  const wrap = document.createElement("div");
+  wrap.className = "stack";
+  const master = select("master", masters.map((item) => [String(item.id), `${item.name} (#${item.id})`]));
+  const multiplier = input("multiplier", row.linkMultiplier || 1, "number");
+  wrap.append(
+    field("마스터", master),
+    field("배수", multiplier),
+    actions(button("연결", async () => {
+      await api("/api/master-links", {
+        method: "POST",
+        body: JSON.stringify({
+          channel,
+          product_key: productIdentity(row),
+          master_id: Number(master.value),
+          multiplier: parseInteger(multiplier.value) || 1,
+        }),
+      });
+      closeModal();
+      loadChannel(channel);
+    }, "primary-button")),
+  );
+  showModal("마스터 연결", wrap);
+}
+
+async function createMasterFromChannel(channel) {
+  const row = selectedChannelRow();
+  if (!row) return;
+  const name = prompt("새 마스터 이름", row.name || "");
+  if (!name) return;
+  const created = await api("/api/masters", {
+    method: "POST",
+    body: JSON.stringify({ name, unit_cost: null, memo: null }),
+  });
+  const masterId = created.master?.id || created.id || created.data?.master?.id;
+  if (!masterId) {
+    setStatus("마스터 생성 결과에서 ID를 찾지 못했습니다.", true);
+    return;
+  }
+  await api("/api/master-links", {
+    method: "POST",
+    body: JSON.stringify({ channel, product_key: productIdentity(row), master_id: masterId, multiplier: 1 }),
+  });
+  await loadChannel(channel);
+}
+
+async function unlinkSelectedMaster(channel) {
+  const row = selectedChannelRow();
+  if (!row) return;
+  await api(`/api/master-links?channel=${encodeURIComponent(channel)}&product_key=${encodeURIComponent(productIdentity(row))}`, { method: "DELETE" });
+  await loadChannel(channel);
+}
+
+function openSelectedProduct() {
+  const row = selectedRequired();
+  if (!row) return;
+  const url = productUrl(row);
+  if (!url) return setStatus("열 수 있는 URL이 없습니다.", true);
+  window.open(url, "_blank", "noreferrer");
+}
+
+function showChannelProductDetail(channel, row) {
+  if (!row) return;
+  const wrap = document.createElement("div");
+  wrap.className = "stack";
+  wrap.append(preBlock(row));
+  wrap.append(actions(
+    button(row.isFavorite ? "즐겨찾기 해제" : "즐겨찾기", () => toggleFavorite(channel)),
+    button("마스터연결", () => showLinkMaster(channel)),
+    button("URL 열기", openSelectedProduct),
+  ));
+  showModal(`${channelLabel(channel)} 상품 상세`, wrap);
 }
 
 async function loadSales() {
@@ -680,6 +1050,8 @@ async function loadKeywords(period = "30") {
 }
 
 async function loadPurchases(kind = "records", channelValue = "all") {
+  state.currentPurchaseKind = kind;
+  state.currentPurchaseChannel = channelValue;
   const channel = select("channel", [["all", "전체"], ["naver", "네이버"], ["coupang", "쿠팡"]]);
   channel.value = channelValue;
   toolbar(
@@ -687,17 +1059,46 @@ async function loadPurchases(kind = "records", channelValue = "all") {
     channel,
     button("구매내역", () => loadPurchaseRows("records", channel.value)),
     button("주문", () => loadPurchaseRows("orders", channel.value)),
+    button("브라우저 준비", async () => startLoggedJob(api("/api/purchases/crawler/prepare", { method: "POST" }))),
+    button("네이버 수집", async () => startLoggedJob(api("/api/purchases/crawl", {
+      method: "POST",
+      body: JSON.stringify({ channel: "naver", max_pages: 5 }),
+    })), "primary-button"),
+    button("쿠팡 수집", async () => startLoggedJob(api("/api/purchases/crawl", {
+      method: "POST",
+      body: JSON.stringify({ channel: "coupang", max_pages: 5 }),
+    })), "primary-button"),
     button("HTML 붙여넣기", () => showPasteImport(channel.value)),
+    button("상세", () => showPurchaseDetail(selectedRequired())),
+    button("URL", openSelectedProduct),
     spacer(),
   );
   await loadPurchaseRows(kind, channel.value);
 }
 
 async function loadPurchaseRows(kind, channel) {
+  state.currentPurchaseKind = kind;
+  state.currentPurchaseChannel = channel;
   const data = await api(`/api/purchases/${kind}?channel=${channel}&limit=2000`);
   const rows = normalizeRows(data);
   renderTable(rows);
   setStatus(`${kind === "records" ? "구매내역" : "주문"} ${rows.length.toLocaleString("ko-KR")}건`);
+}
+
+function showPurchaseDetail(row) {
+  if (!row) return;
+  const wrap = document.createElement("div");
+  wrap.className = "stack";
+  const summary = document.createElement("div");
+  summary.className = "summary-strip";
+  summary.innerHTML = `
+    <span>${escapeHtml(channelLabel(row.channel))}</span>
+    <strong>${escapeHtml(row.order_no || row.orderNo || "-")}</strong>
+    <span>${escapeHtml(row.order_date || row.orderDate || "")}</span>
+    <span>${escapeHtml(formatPrice(row.payment_total ?? row.amount ?? row.card_amount))}</span>
+  `;
+  wrap.append(summary, preBlock(row), actions(button("URL 열기", openSelectedProduct)));
+  showModal("구매/주문 상세", wrap);
 }
 
 function showPasteImport(channel) {
@@ -717,14 +1118,20 @@ function showPasteImport(channel) {
 }
 
 async function loadCards() {
-  const start = input("start_date", new Date(new Date().setDate(new Date().getDate() - 30)).toISOString().slice(0, 10), "date");
-  const end = input("end_date", new Date().toISOString().slice(0, 10), "date");
+  const categories = await loadCardCategories();
+  const start = input("start_date", todayIso(-30), "date");
+  const end = input("end_date", todayIso(), "date");
+  const category = select("category", [["", "카테고리"], ...categories.map((item) => [item.code, `${item.emoji || ""} ${item.label}`])]);
   toolbar(
     label("시작"),
     start,
     label("종료"),
     end,
     button("조회", () => loadCardRows(start.value, end.value)),
+    category,
+    button("카테고리저장", () => patchSelectedCard({ category: category.value || null })),
+    button("메모", () => editSelectedCardMemo()),
+    button("검토", () => toggleSelectedCardReview()),
     button("카드 동기화", async () => loadJobs(await api("/api/cards/sync", {
       method: "POST",
       body: JSON.stringify({ start_date: start.value, end_date: end.value }),
@@ -733,9 +1140,16 @@ async function loadCards() {
       method: "POST",
       body: JSON.stringify({ start_date: start.value, end_date: end.value }),
     }))),
+    button("고정비", showFixedCosts),
     spacer(),
   );
   await loadCardRows(start.value, end.value);
+}
+
+async function loadCardCategories() {
+  if (state.cardCategories) return state.cardCategories;
+  state.cardCategories = normalizeRows(await api("/api/cards/categories"));
+  return state.cardCategories;
 }
 
 async function loadCardRows(start, end) {
@@ -743,6 +1157,97 @@ async function loadCardRows(start, end) {
   const rows = normalizeRows(data);
   renderTable(rows);
   setStatus(`카드사용내역 ${rows.length.toLocaleString("ko-KR")}건`);
+}
+
+function cardUsageId(row) {
+  return compactValue(valueFrom(row, ["id", "use_key", "useKey"]));
+}
+
+async function patchSelectedCard(payload) {
+  const row = selectedRequired();
+  if (!row) return;
+  const id = cardUsageId(row);
+  if (!id) return setStatus("카드 사용내역 ID가 없습니다.", true);
+  await api(`/api/cards/usages/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+  await loadCards();
+}
+
+async function editSelectedCardMemo() {
+  const row = selectedRequired();
+  if (!row) return;
+  const memo = prompt("메모", row.memo || "");
+  if (memo === null) return;
+  await patchSelectedCard({ memo, clear_memo: memo.trim() === "" });
+}
+
+async function toggleSelectedCardReview() {
+  const row = selectedRequired();
+  if (!row) return;
+  await patchSelectedCard({ reviewed: !Boolean(row.reviewed) });
+}
+
+function showCardUsageEditor(row) {
+  if (!row) return;
+  const wrap = document.createElement("div");
+  wrap.className = "stack";
+  wrap.append(preBlock(row), actions(
+    button("메모", editSelectedCardMemo),
+    button(Boolean(row.reviewed) ? "검토해제" : "검토완료", toggleSelectedCardReview),
+  ));
+  showModal("카드 사용 상세", wrap);
+}
+
+async function showFixedCosts() {
+  const wrap = document.createElement("div");
+  wrap.className = "stack";
+  const list = document.createElement("div");
+  list.className = "linked-list";
+  const name = input("name");
+  name.placeholder = "고정비명";
+  const amount = input("amount", "", "number");
+  amount.placeholder = "금액";
+  const memo = input("memo");
+  memo.placeholder = "메모";
+  async function refresh() {
+    const rows = normalizeRows(await api("/api/cards/fixed-costs"));
+    list.innerHTML = rows.length ? "" : `<div class="empty-cell">고정비가 없습니다.</div>`;
+    rows.forEach((row) => {
+      const item = document.createElement("div");
+      item.className = "linked-item";
+      item.innerHTML = `<strong>${escapeHtml(row.name || row.title || "-")}</strong> ${escapeHtml(formatPrice(row.amount))} ${escapeHtml(row.memo || "")}`;
+      if (row.id) {
+        item.append(button("삭제", async () => {
+          await api(`/api/cards/fixed-costs/${row.id}`, { method: "DELETE" });
+          refresh();
+        }, "danger-button"));
+      }
+      list.appendChild(item);
+    });
+  }
+  wrap.append(
+    field("이름", name),
+    field("금액", amount),
+    field("메모", memo),
+    actions(button("저장", async () => {
+      await api("/api/cards/fixed-costs", {
+        method: "POST",
+        body: JSON.stringify({ items: [{ name: name.value, amount: parseInteger(amount.value), memo: memo.value }] }),
+      });
+      name.value = "";
+      amount.value = "";
+      memo.value = "";
+      refresh();
+    }, "primary-button")),
+    list,
+  );
+  showModal("고정비 관리", wrap);
+  refresh().catch((error) => {
+    list.textContent = error.message;
+    setStatus(error.message, true);
+  });
 }
 
 async function loadFassto(sectionValue = state.fasstoSection) {
@@ -767,6 +1272,11 @@ async function loadFassto(sectionValue = state.fasstoSection) {
     label("종료"),
     end,
     button("조회", () => loadFasstoSection(section.value, start.value, end.value)),
+    button("상세", showFasstoDetail),
+    button("생성", () => showFasstoJsonAction("생성", "POST")),
+    button("수정", () => showFasstoJsonAction("수정", "PATCH")),
+    button("취소", () => cancelFasstoSelected(), "danger-button"),
+    button("명세서", showFasstoStatement),
     button("CSV 저장", () => {
       window.location.href = `/api/fassto/${section.value}?start=${compactDate(start.value)}&end=${compactDate(end.value)}&download=true`;
     }),
@@ -794,30 +1304,113 @@ async function loadFasstoSection(section, start, end) {
   setStatus(`${sectionLabel} ${rows.length.toLocaleString("ko-KR")}건`);
 }
 
-async function syncAll() {
-  const tasks = [
-    ["재고", () => api("/api/channels/naver/sync", { method: "POST" })],
-    ["매출비교", () => api("/api/revenue/sync", { method: "POST" })],
-    ["키워드매출", () => api("/api/keywords/sync", { method: "POST" })],
-  ];
-  let started = 0;
-  const failed = [];
-  setProgress(0, true);
-  for (const [labelText, start] of tasks) {
+function fasstoSlip(row = selectedRow()) {
+  return compactValue(valueFrom(row, ["slipNo", "slip_no", "slip_no"]));
+}
+
+function fasstoWritableSection() {
+  if (state.fasstoSection === "warehousing") return "warehousing";
+  if (state.fasstoSection === "delivery") return "delivery";
+  setStatus("입고 또는 출고 탭에서 사용할 수 있습니다.", true);
+  return "";
+}
+
+async function showFasstoDetail() {
+  const section = fasstoWritableSection();
+  if (!section) return;
+  const slipNo = fasstoSlip();
+  if (!slipNo) return setStatus("전표번호가 없습니다.", true);
+  const data = await api(`/api/fassto/${section}/${encodeURIComponent(slipNo)}`);
+  showModal("파스토 상세", preBlock(data));
+}
+
+function defaultFasstoPayload(method) {
+  const row = selectedRow() || {};
+  if (state.fasstoSection === "warehousing") {
+    return {
+      items: [{
+        slipNo: method === "PATCH" ? fasstoSlip(row) : undefined,
+        ordDt: compactDate(todayIso()),
+        inPlanDt: compactDate(todayIso()),
+        whCd: row.whCd || "",
+        supCd: row.supCd || "",
+        remark: row.remark || "",
+        goods: [{ cstGodCd: row.cstGodCd || "", ordQty: 1 }],
+      }],
+    };
+  }
+  return {
+    items: [{
+      slipNo: method === "PATCH" ? fasstoSlip(row) : undefined,
+      ordDt: compactDate(todayIso()),
+      outDt: compactDate(todayIso()),
+      outDiv: row.outDiv || "1",
+      mallNm: row.mallNm || row.salesChannel || "",
+      rcvrNm: row.rcvrNm || "",
+      rcvrTel: row.rcvrTel || "",
+      addr: row.addr || "",
+      goods: [{ cstGodCd: row.cstGodCd || "", ordQty: 1 }],
+    }],
+  };
+}
+
+function showFasstoJsonAction(title, method) {
+  const section = fasstoWritableSection();
+  if (!section) return;
+  const wrap = document.createElement("div");
+  wrap.className = "stack";
+  const textarea = document.createElement("textarea");
+  textarea.value = JSON.stringify(defaultFasstoPayload(method), null, 2);
+  wrap.append(textarea, actions(button(title, async () => {
+    let payload;
     try {
-      const job = await start();
-      started += 1;
-      loadJobs(job);
+      payload = JSON.parse(textarea.value || "{}");
     } catch (error) {
-      failed.push(`${labelText}: ${error.message}`);
+      setStatus(`JSON 오류: ${error.message}`, true);
+      return;
     }
-  }
-  if (started === 0) {
-    setProgress(0, false);
-    setStatus(failed.join(" | ") || "동기화할 작업이 없습니다.", true);
-    return;
-  }
-  setStatus(`동기화 작업 ${started}개 시작${failed.length ? ` | 실패 ${failed.length}개` : ""}`, failed.length > 0);
+    await api(`/api/fassto/${section}`, { method, body: JSON.stringify(payload) });
+    closeModal();
+    loadFassto(section);
+  }, "primary-button")));
+  showModal(`파스토 ${title}`, wrap);
+}
+
+async function cancelFasstoSelected() {
+  const section = fasstoWritableSection();
+  if (!section) return;
+  const slipNo = fasstoSlip();
+  if (!slipNo) return setStatus("취소할 전표번호가 없습니다.", true);
+  if (!confirm(`${slipNo} 전표를 취소할까요?`)) return;
+  await api(`/api/fassto/${section}/cancel`, {
+    method: "POST",
+    body: JSON.stringify({ items: [{ slipNo }] }),
+  });
+  await loadFassto(section);
+}
+
+function showFasstoStatement() {
+  const row = selectedRequired();
+  if (!row) return;
+  const wrap = document.createElement("div");
+  wrap.className = "statement-preview";
+  wrap.innerHTML = `
+    <h3>거래명세서</h3>
+    <p>전표번호 ${escapeHtml(fasstoSlip(row) || "-")}</p>
+    <table>
+      <tbody>
+        <tr><th>일자</th><td>${escapeHtml(row.ordDt || row.outDt || row.inPlanDt || "")}</td></tr>
+        <tr><th>거래처</th><td>${escapeHtml(row.supNm || row.mallNm || row.salesChannel || "")}</td></tr>
+        <tr><th>수량</th><td>${escapeHtml(formatNumber(sumGoods(row, ["ordQty", "inQty", "outQty"])))}</td></tr>
+      </tbody>
+    </table>
+  `;
+  wrap.append(actions(button("인쇄", () => window.print(), "primary-button")));
+  showModal("명세서 미리보기", wrap);
+}
+
+async function syncAll() {
+  await startLoggedJob(api("/api/sync/all", { method: "POST" }));
 }
 
 document.querySelectorAll(".tab-button").forEach((btn) => {

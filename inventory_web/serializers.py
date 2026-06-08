@@ -21,9 +21,17 @@ def channel_product_to_dict(row: Any) -> dict[str, Any]:
     item_id = getattr(row, "item_id", None)
     product_id = str(getattr(row, "product_id", "") or "")
     product_key = f"{product_id}|{item_id or ''}"
+    identity_key = (
+        f"id:{product_id}|item:{item_id or ''}"
+        if product_id
+        else f"url:{getattr(row, 'product_url', None)}"
+        if getattr(row, "product_url", None)
+        else f"name:{getattr(row, 'name', '')}"
+    )
     return {
         "serial": getattr(row, "serial", None),
         "productKey": product_key,
+        "identityKey": identity_key,
         "productId": product_id,
         "itemId": item_id,
         "name": getattr(row, "name", ""),
@@ -40,10 +48,18 @@ def channel_product_to_dict(row: Any) -> dict[str, Any]:
 def monitor_inventory_row(channel: str, row: dict[str, Any], index: int) -> dict[str, Any]:
     product_id = str(row.get("product_id") or "")
     item_id = str(row.get("item_id")) if row.get("item_id") else None
+    identity_key = (
+        f"id:{product_id}|item:{item_id or ''}"
+        if product_id
+        else f"url:{row.get('product_url')}"
+        if row.get("product_url")
+        else f"name:{row.get('name') or ''}"
+    )
     return {
         "serial": index,
         "channel": channel,
         "productKey": f"{product_id}|{item_id or ''}",
+        "identityKey": identity_key,
         "productId": product_id,
         "itemId": item_id,
         "name": row.get("name") or "",
