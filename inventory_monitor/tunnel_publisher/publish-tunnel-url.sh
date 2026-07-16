@@ -26,11 +26,15 @@ fi
 # URL 추출: journalctl 에서 cloudflared 가 뿌린 trycloudflare URL 의 가장 최근 것
 # (quick tunnel 은 시작 시 로그에 https://xxx.trycloudflare.com 형태로 한 번 출력됨)
 extract_url() {
-    # 현 부팅 로그에서 가장 최근 매칭 하나
-    journalctl -b --no-pager 2>/dev/null \
+    # 현 부팅의 inventory tunnel 로그에서 가장 최근 매칭 하나
+    journalctl -u inventory-tunnel.service -b --no-pager 2>/dev/null \
         | grep -Eio 'https://[a-z0-9-]+\.trycloudflare\.com' \
         | grep -v '^https://api\.trycloudflare\.com$' \
         | tail -1
+}
+
+check_tunnel() {
+    curl -sSf --max-time 8 "${1}/status" > /dev/null
 }
 
 # cloudflared 가 아직 URL 을 뿌리지 않았을 수 있으므로 최대 60초 폴링
@@ -52,21 +56,42 @@ log "extracted URL: ${TUNNEL_URL}"
 
 # Pi 자체 health check — URL 이 실제로 응답하는지 확인 (아직 tunnel 이 뜨는 중일 수도 있음)
 for attempt in 1 2 3 4 5; do
-    if curl -sSf --max-time 8 "${TUNNEL_URL}/status" > /dev/null; then
+    if check_tunnel "${TUNNEL_URL}"; then
         log "health check passed on attempt ${attempt}"
         break
     fi
     log "health check failed attempt ${attempt}, retrying..."
     sleep 5
     if [[ ${attempt} -eq 5 ]]; then
-        log "ERROR: tunnel URL not responding after 5 attempts"
-        exit 4
+        STALE_URL="${TUNNEL_URL}"
+        log "tunnel URL is stale; restarting inventory-tunnel.service"
+        if ! sudo -n systemctl restart inventory-tunnel.service; then
+            log "ERROR: failed to restart inventory-tunnel.service"
+            exit 4
+        fi
+
+        RESTART_DEADLINE=$(( $(date +%s) + 60 ))
+        TUNNEL_URL=""
+        while [[ "$(date +%s)" -lt ${RESTART_DEADLINE} ]]; do
+            CANDIDATE_URL="$(extract_url)"
+            if [[ -n "${CANDIDATE_URL}" && "${CANDIDATE_URL}" != "${STALE_URL}" ]] && check_tunnel "${CANDIDATE_URL}"; then
+                TUNNEL_URL="${CANDIDATE_URL}"
+                log "replacement tunnel is healthy: ${TUNNEL_URL}"
+                break
+            fi
+            sleep 3
+        done
+
+        if [[ -z "${TUNNEL_URL}" ]]; then
+            log "ERROR: replacement tunnel did not become healthy within 60s"
+            exit 4
+        fi
     fi
 done
 
 # gist 현재 값 조회해서 같으면 skip (gist API rate limit 절약)
 CURRENT_URL=""
-CURRENT_URL="$(curl -sS --max-time 10 "https://gist.githubusercontent.com/beiko3444/${GIST_ID}/raw/monitor.json" \
+CURRENT_URL="$(curl -sS --max-time 10 "https://gist.githubusercontent.com/beiko3444/${GIST_ID}/raw?t=$(date +%s)" \
                 | python3 -c 'import json,sys; print(json.load(sys.stdin).get("url",""))' 2>/dev/null || true)"
 if [[ "${CURRENT_URL}" == "${TUNNEL_URL}" ]]; then
     log "gist already up-to-date, skip"
