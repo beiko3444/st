@@ -115,6 +115,23 @@ class TranslationServiceTests(FakeCodexMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final_texts(events), {"en": "[en] COMMENTARY 테스트"})
         self.assertEqual(streamed_texts(events), {"en": "[en] COMMENTARY 테스트"})
 
+    async def test_chinese_full_stops_never_reach_output_or_back_translation(self) -> None:
+        self.service = self.make_service()
+        events = await collect(self.service, "你好。请报价。", targets=["en", "zh"])
+        final = final_texts(events)
+        self.assertEqual(final["zh"], "[zh] 你好 请报价")
+        self.assertEqual(streamed_texts(events)["zh"].strip(), final["zh"])
+        self.assertEqual(final["en"], "[en] 你好。请报价。")
+        for event in events:
+            if event.get("lang") == "zh" and event["type"] in ("delta", "translated", "done"):
+                self.assertNotIn("。", event["text"])
+        back = next(e for e in events if e["type"] == "done" and e["lang"] == "zh")
+        self.assertEqual(back["backText"], "[ko] " + final["zh"])
+        cached = await collect(self.service, "你好。请报价。", targets=["zh"])
+        done = next(e for e in cached if e["type"] == "done")
+        self.assertTrue(done["cached"])
+        self.assertNotIn("。", done["text"])
+
     async def test_failed_turn_reports_final_error(self) -> None:
         self.service = self.make_service()
         events = await collect(self.service, "FAIL", targets=["en"])

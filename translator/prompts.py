@@ -43,7 +43,8 @@ TARGETS: dict[str, Target] = {
         html_lang="zh-CN",
         rules=(
             "Write Simplified Chinese characters (简体字) only, never Traditional characters. "
-            "Use standard Mainland China wording and full-width Chinese punctuation (，。？！：；“”)."
+            "Use standard Mainland China wording. Do not use the Chinese full stop 。 anywhere. "
+            "Separate sentences with line breaks instead. Other punctuation such as ，？！：；“” is allowed."
         ),
     ),
 }
