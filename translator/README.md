@@ -81,7 +81,7 @@ python3 -m translator --open
 | --- | --- | --- |
 | `--port` | `TRANSLATOR_PORT` | 기본 8777 |
 | `--host` | `TRANSLATOR_HOST` | 기본 127.0.0.1 (아래 보안 참고) |
-| `--model` | `TRANSLATOR_MODEL` | 번역 모델. 기본은 Codex 기본 모델 |
+| `--model` | `TRANSLATOR_MODEL` | 번역 모델. 기본은 `gpt-6-luna` (외국어 번역과 한국어 확인 번역 모두 적용) |
 | `--effort` | `TRANSLATOR_EFFORT` | 추론 강도. 기본은 모델이 지원하는 값 중 `none` → `minimal` → `low` 순으로 가장 빠른 것 |
 | `--prompt-mode` | `TRANSLATOR_PROMPT_MODE` | `base`(기본) 또는 `developer` |
 | `--codex-bin` | `TRANSLATOR_CODEX_BIN` | `codex` 실행 파일 경로 |
