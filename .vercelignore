@@ -16,6 +16,7 @@ android_sms_forwarder/
 inventory_monitor/
 scripts/
 tests/
+translator/
 test_*.py
 
 config/credentials.json

@@ -42,6 +42,10 @@ Optional configuration:
   if your deployment flow updates the monitor URL through a gist.
 - `DISCORD_WEBHOOK_URL`: fallback Discord webhook URL if
   `DISCORD_INVENTORY_WEBHOOK_URL` is not set.
+- `TRANSLATOR_SHARED_SECRET`: enables the '번역기' menu, which signs a short-lived
+  link to the translator running on the Raspberry Pi (see `translator/DEPLOY.md`).
+- `TRANSLATOR_URL_GIST` / `TRANSLATOR_URL`: where to find the translator. Defaults
+  to `translator.json` in the `SMARTINVENTORY_MONITOR_URL_GIST` gist.
 
 ## Daily Discord Inventory Report
 

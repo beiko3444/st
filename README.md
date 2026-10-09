@@ -36,6 +36,8 @@ http://<mac-lan-ip>:8766/
 
 - `SMARTINVENTORY_MONITOR_URL_GIST`: tunnel URL 갱신용 raw gist URL
 - `DISCORD_WEBHOOK_URL`: `DISCORD_INVENTORY_WEBHOOK_URL` 대신 쓸 수 있는 공용 Discord Webhook URL
+- `TRANSLATOR_SHARED_SECRET`: 우측 상단 '번역기' 메뉴용. 라즈베리파이 번역 서버와 같은 값 ([translator/DEPLOY.md](translator/DEPLOY.md))
+- `TRANSLATOR_URL_GIST` / `TRANSLATOR_URL`: 번역기 주소. 없으면 `SMARTINVENTORY_MONITOR_URL_GIST`와 같은 gist의 `translator.json`을 씁니다
 
 ## 상품재고 일보
 
@@ -50,3 +52,15 @@ Vercel Cron은 매일 `0 15 * * *` UTC에 `/api/reports/inventory/discord`를 �
 보고서는 상품관리의 마스터 상품만 포함하며, 미연결 네이버/쿠팡 채널 상품은 제외합니다.
 
 `config/credentials.json`과 로컬 SQLite DB는 Git/Vercel 배포 대상에서 제외됩니다.
+
+## KR 즉시 번역기
+
+한국어를 붙여넣으면 영어·중국어 간체로 바로 번역하는 도구가 `translator/`에 있습니다 (ChatGPT 로그인 + Jev).
+번역 서버는 라즈베리파이에서 돌고, 이 사이트 우측 상단 '번역기' 버튼으로 들어갑니다. 배포 방법은 [`translator/DEPLOY.md`](translator/DEPLOY.md).
+
+```bash
+npm install -g @openai/codex
+python3 -m translator --open
+```
+
+자세한 내용은 [`translator/README.md`](translator/README.md)를 참고하세요.
