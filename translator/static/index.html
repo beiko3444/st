@@ -10,7 +10,7 @@
 <body>
   <header class="topbar">
     <div class="brand">
-      <strong>KR → EN · 简体中文</strong>
+      <strong>텍스트 · 이미지 → EN · 简体中文</strong>
       <span>붙여넣으면 바로 번역</span>
     </div>
     <div class="account" id="account" aria-live="polite">확인 중…</div>
@@ -19,7 +19,7 @@
   <main class="workspace">
     <section class="pane source-pane">
       <div class="pane-head">
-        <span class="pane-title">한국어</span>
+        <span class="pane-title">원문 · 이미지</span>
         <div class="controls">
           <label class="field">
             <span>스타일</span>
@@ -35,8 +35,18 @@
         <div class="langs" id="langs" role="group" aria-label="번역할 언어"></div>
         <span class="muted" id="lang-hint" hidden>최소 한 언어는 선택해야 합니다</span>
       </div>
-      <textarea id="source" spellcheck="false" autofocus
-        placeholder="한국어를 붙여넣으세요 (Ctrl/⌘+V) — 체크한 언어로 바로 번역됩니다.&#10;직접 입력하면 잠시 멈췄을 때 번역합니다. Ctrl/⌘+Enter: 즉시 번역"></textarea>
+      <div class="image-tools">
+        <button type="button" id="choose-image">이미지 선택</button>
+        <input id="image-file" type="file" accept="image/png,image/jpeg,image/webp" hidden>
+        <span class="muted">이미지도 Ctrl/⌘+V로 붙여넣을 수 있어요</span>
+      </div>
+      <div class="image-preview" id="image-preview" hidden>
+        <div class="image-preview-head"><span id="image-name"></span><button type="button" id="remove-image">이미지 삭제</button></div>
+        <img id="source-image" alt="번역할 이미지 미리보기">
+      </div>
+      <p id="image-message" class="image-message" role="status" hidden></p>
+      <textarea id="source" aria-label="번역할 원문" spellcheck="false" autofocus
+        placeholder="한국어 또는 이미지를 붙여넣으세요 (Ctrl/⌘+V) — 체크한 언어로 바로 번역됩니다.&#10;직접 입력하면 잠시 멈췄을 때 번역합니다. Ctrl/⌘+Enter: 즉시 번역"></textarea>
       <div class="pane-foot">
         <span class="chip" id="jev-chip" hidden></span>
         <span class="chip muted" id="style-chip" hidden></span>

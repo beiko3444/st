@@ -6,6 +6,11 @@ const LANG_STORAGE_KEY = "kr-translator.langs";
 
 const el = {
   source: $("source"),
+  imageFile: $("image-file"),
+  imagePreview: $("image-preview"),
+  sourceImage: $("source-image"),
+  imageName: $("image-name"),
+  imageMessage: $("image-message"),
   style: $("style"),
   live: $("live"),
   counter: $("counter"),
@@ -34,6 +39,9 @@ const el = {
 };
 
 const state = {
+  image: null,
+  imageRevision: 0,
+  imageLoading: false,
   controller: null,
   jobId: null,
   lastKey: "",
@@ -126,7 +134,7 @@ function onLangToggle(checkbox) {
 // ------------------------------------------------------------ translation
 
 function requestKey(text) {
-  return `${el.style.value}\u0000${selectedLangs().join(",")}\u0000${text}`;
+  return `${el.style.value}\u0000${selectedLangs().join(",")}\u0000${text}\u0000${state.imageRevision}`;
 }
 
 function scheduleTranslate() {
@@ -177,10 +185,11 @@ function stopJob() {
 
 async function translate(force = false) {
   clearTimeout(state.typingTimer);
+  if (state.imageLoading) return;
   if (!state.langs.length) await statusReady;
   if (!state.langs.length) return;
   const text = el.source.value.trim();
-  if (!text) {
+  if (!text && !state.image) {
     stopJob();
     state.lastKey = "";
     resetOutputs(false);
@@ -208,7 +217,7 @@ async function translate(force = false) {
     // starting, the job id is still needed to cancel it.
     const job = await api("/api/jobs", {
       method: "POST",
-      body: { text, style: el.style.value, targets: selectedLangs(), replaces: previousJob },
+      body: { text, image: state.image, style: el.style.value, targets: selectedLangs(), replaces: previousJob },
     });
     if (state.controller !== controller) {
       fetch(`/api/jobs/${job.id}`, { method: "DELETE" }).catch(() => {});
@@ -554,9 +563,92 @@ async function startLogin(method) {
 
 // ----------------------------------------------------------------- wiring
 
-el.source.addEventListener("paste", () => {
-  // Let the pasted text land in the textarea first.
-  setTimeout(() => translate(), 0);
+function imageMessage(message, error = false) {
+  el.imageMessage.textContent = message;
+  el.imageMessage.hidden = !message;
+  el.imageMessage.classList.toggle("error", error);
+}
+
+function removeImage() {
+  state.imageRevision += 1; // Invalidate any unfinished file read.
+  state.imageLoading = false;
+  state.image = null;
+  el.sourceImage.removeAttribute("src");
+  el.imagePreview.hidden = true;
+  el.imageFile.value = "";
+  imageMessage("");
+}
+
+async function attachImage(file) {
+  if (!file) return;
+  if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
+    imageMessage("PNG, JPG, WebP 이미지만 번역할 수 있습니다.", true);
+    return;
+  }
+  if (file.size > 8 * 1024 * 1024) {
+    imageMessage("이미지는 8MB 이하로 붙여넣어 주세요.", true);
+    return;
+  }
+  const revision = ++state.imageRevision;
+  state.imageLoading = true;
+  stopJob();
+  state.lastKey = "";
+  imageMessage("이미지를 읽는 중…");
+  try {
+    const data = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error("이미지를 읽을 수 없습니다. 다시 붙여넣어 주세요."));
+      reader.readAsDataURL(file);
+    });
+    await new Promise((resolve, reject) => {
+      const preview = new Image();
+      preview.onload = () => {
+        if (preview.naturalWidth * preview.naturalHeight > 40000000) {
+          reject(new Error("이미지가 너무 큽니다. 필요한 부분만 잘라서 붙여넣어 주세요."));
+        } else resolve();
+      };
+      preview.onerror = () => reject(new Error("이미지를 읽을 수 없습니다. 다시 붙여넣어 주세요."));
+      preview.src = data;
+    });
+    if (revision !== state.imageRevision) return;
+    state.image = data;
+    el.sourceImage.src = data;
+    el.imageName.textContent = file.name || "붙여넣은 이미지";
+    el.imagePreview.hidden = false;
+    imageMessage("");
+  } catch (error) {
+    if (revision !== state.imageRevision) return;
+    imageMessage(error.message, true);
+  } finally {
+    if (revision === state.imageRevision) {
+      state.imageLoading = false;
+      translate();
+    }
+  }
+}
+
+// Paste works anywhere on this translator, including after clicking a result.
+// Text pastes keep their usual behavior; one image replaces the previous image.
+document.addEventListener("paste", (event) => {
+  const item = Array.from(event.clipboardData?.items || []).find((item) => item.type.startsWith("image/"));
+  if (item) {
+    event.preventDefault();
+    attachImage(item.getAsFile());
+  } else if (event.target === el.source) {
+    // Let the pasted text land in the textarea first.
+    setTimeout(() => translate(), 0);
+  }
+});
+$("choose-image").addEventListener("click", () => el.imageFile.click());
+el.imageFile.addEventListener("change", () => {
+  attachImage(el.imageFile.files[0]);
+  el.imageFile.value = "";
+});
+$("remove-image").addEventListener("click", () => {
+  removeImage();
+  translate();
+  el.source.focus();
 });
 
 el.source.addEventListener("input", (event) => {
@@ -575,6 +667,7 @@ el.source.addEventListener("keydown", (event) => {
 
 el.style.addEventListener("change", () => translate());
 el.clear.addEventListener("click", () => {
+  removeImage();
   el.source.value = "";
   el.counter.textContent = "0자";
   translate();
