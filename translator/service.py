@@ -19,7 +19,7 @@ from typing import Any, AsyncIterator, Optional, Sequence
 
 from .codex_client import CodexAppServer, CodexError, build_app_server_command, find_codex_binary
 from .jev import JevClassifier, JevError
-from .prompts import GENERAL, STYLES, TARGETS, build_instructions
+from .prompts import GENERAL, STYLES, TARGETS, build_instructions, build_back_instructions
 
 log = logging.getLogger(__name__)
 
@@ -267,15 +267,33 @@ class TranslationService:
             log.exception("translation failed")
             queue.put_nowait({"type": "error", "lang": code, "message": f"{type(exc).__name__}: {exc}"})
             return
-        self._cache_put(text, code, style_key, {"text": result["text"], "model": result["model"]})
+        queue.put_nowait({"type": "translated", "lang": code, **result})
+        try:
+            back = await self._run_turn(code, result["text"], style_key, queue, started, back=True)
+            if back is None:
+                self.prompt_mode = "developer"
+                queue.put_nowait({"type": "back_reset", "lang": code})
+                back = await self._run_turn(code, result["text"], style_key, queue, started, back=True)
+            if back is None:
+                raise CodexError("한국어 확인 번역 요청이 거부되었습니다.")
+            result["backText"] = back["text"]
+            result["ms"] = _elapsed_ms(started)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Korean back translation failed")
+            result["backError"] = "한국어 확인 번역을 완료하지 못했습니다. 다시 번역해 주세요."
+        if result.get("backText"):
+            self._cache_put(text, code, style_key, {"text": result["text"], "model": result["model"], "backText": result["backText"]})
         queue.put_nowait({"type": "done", "lang": code, "cached": False, **result})
 
     async def _run_turn(
-        self, code: str, text: str, style_key: str, queue: asyncio.Queue, started: float
+        self, code: str, text: str, style_key: str, queue: asyncio.Queue, started: float, *, back: bool = False
     ) -> Optional[dict[str, Any]]:
         """Run one Codex turn; `None` means base instructions were rejected."""
         codex = await self._codex()
-        instructions = build_instructions(TARGETS[code], STYLES[style_key])
+        instructions = build_back_instructions(TARGETS[code]) if back else build_instructions(TARGETS[code], STYLES[style_key])
+        prefix = "back_" if back else ""
         prompt_mode = self.prompt_mode
         thread_params: dict[str, Any] = {
             "ephemeral": True,
@@ -325,7 +343,7 @@ class TranslationService:
                         commentary.add(item.get("id"))
                         continue
                     if current_item is not None and item.get("id") != current_item:
-                        queue.put_nowait({"type": "reset", "lang": code})
+                        queue.put_nowait({"type": prefix + "reset", "lang": code})
                         streamed = ""
                     current_item = item.get("id")
                 elif method == "item/agentMessage/delta":
@@ -337,7 +355,7 @@ class TranslationService:
                     if first_token_ms is None:
                         first_token_ms = _elapsed_ms(started)
                     streamed += delta
-                    queue.put_nowait({"type": "delta", "lang": code, "text": delta})
+                    queue.put_nowait({"type": prefix + "delta", "lang": code, "text": delta})
                 elif method == "item/completed":
                     item = params.get("item") or {}
                     if (

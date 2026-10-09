@@ -404,3 +404,8 @@ button.copy.done {
     display: none;
   }
 }
+
+.back-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 12px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--head); color: var(--muted); font-size: 13px; font-weight: 700; }
+.back-output { flex: 1; min-height: 75px; padding: 12px 14px; overflow: auto; white-space: pre-wrap; word-break: break-word; line-height: 1.6; font-size: 15px; }
+.back-output.error { color: var(--danger); }
+.out-pane .output { min-height: 75px; }

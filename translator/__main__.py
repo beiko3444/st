@@ -56,7 +56,7 @@ def main() -> int:
     extra_hosts = [h.strip() for h in os.environ.get("TRANSLATOR_ALLOWED_HOSTS", "").split(",") if h.strip()]
     allowed_hosts = None
     if shared_secret:
-        print("[translator] 배포 모드: 재고 사이트의 '번역기' 링크로 들어온 사용자만 접속할 수 있습니다.", file=sys.stderr)
+        print("[translator] 배포 모드: Beiko 사이트의 '번역기' 링크로 들어온 사용자만 접속할 수 있습니다.", file=sys.stderr)
         allowed_hosts = DEPLOYED_HOSTS + extra_hosts
     elif not _is_loopback(args.host):
         print(
