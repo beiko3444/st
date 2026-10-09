@@ -14,6 +14,7 @@ import time
 import uuid
 from typing import Any, Optional, Sequence
 
+from .images import ImageAttachment
 from .service import TranslationService
 
 FINISHED_JOB_TTL = 120.0
@@ -45,17 +46,18 @@ class JobRegistry:
         style: str,
         targets: Optional[Sequence[str]],
         replaces: Optional[str] = None,
+        image: Optional[ImageAttachment] = None,
     ) -> Job:
         if replaces:
             self.cancel(replaces)
         self._prune()
         job = Job()
         self._jobs[job.id] = job
-        job.task = asyncio.create_task(self._run(job, text, style, targets))
+        job.task = asyncio.create_task(self._run(job, text, style, targets, image))
         return job
 
-    async def _run(self, job: Job, text: str, style: str, targets: Optional[Sequence[str]]) -> None:
-        events = self.service.translate(text, style=style, targets=targets)
+    async def _run(self, job: Job, text: str, style: str, targets: Optional[Sequence[str]], image: Optional[ImageAttachment]) -> None:
+        events = self.service.translate(text, style=style, targets=targets, image=image)
         try:
             async for event in events:
                 async with job.changed:

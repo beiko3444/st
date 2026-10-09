@@ -18,6 +18,7 @@ import time
 from typing import Any, AsyncIterator, Optional, Sequence
 
 from .codex_client import CodexAppServer, CodexError, build_app_server_command, find_codex_binary
+from .images import ImageAttachment
 from .jev import JevClassifier, JevError
 from .prompts import GENERAL, STYLES, TARGETS, build_instructions, build_back_instructions
 
@@ -177,7 +178,29 @@ class TranslationService:
     # -------------------------------------------------------------- translation
 
     async def translate(
-        self, text: str, *, style: str = AUTO_STYLE, targets: Optional[Sequence[str]] = None
+        self, text: str, *, style: str = AUTO_STYLE, targets: Optional[Sequence[str]] = None,
+        image: Optional[ImageAttachment] = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        # Both forward turns share one private temporary file. Wait for their
+        # cancellation before removing it; back translation receives only text.
+        with tempfile.TemporaryDirectory(prefix="kr-translator-image-") as folder:
+            image_path = None
+            if image is not None:
+                image_path = os.path.join(folder, "source" + image.extension)
+                with open(image_path, "xb") as handle:
+                    os.chmod(image_path, 0o600)
+                    handle.write(image.data)
+            events = self._translate(text, style=style, targets=targets,
+                                     image_path=image_path, image_key=image.digest if image else "")
+            try:
+                async for event in events:
+                    yield event
+            finally:
+                await events.aclose()
+
+    async def _translate(
+        self, text: str, *, style: str = AUTO_STYLE, targets: Optional[Sequence[str]] = None,
+        image_path: Optional[str] = None, image_key: str = ""
     ) -> AsyncIterator[dict[str, Any]]:
         """Yield UI events: start, jev, style, reset/delta per language, done or error, end.
 
@@ -186,7 +209,7 @@ class TranslationService:
         text = (text or "").strip()
         requested = TARGETS if targets is None else targets
         targets = [code for code in TARGETS if code in requested]
-        if not text or not targets:
+        if (not text and not image_path) or not targets:
             yield {"type": "end"}
             return
         if len(text) > MAX_TEXT_LENGTH:
@@ -199,7 +222,7 @@ class TranslationService:
         style_key = style if style in STYLES else GENERAL
         source = "manual" if style in STYLES else "default"
         if style == AUTO_STYLE:
-            if self.jev is None:
+            if self.jev is None or not text:
                 yield {"type": "jev", "status": "off"}
             else:
                 decision_event, picked = await self._ask_jev(text)
@@ -211,11 +234,13 @@ class TranslationService:
         queue: asyncio.Queue = asyncio.Queue()
         tasks = []
         for code in targets:
-            cached = self._cache_get(text, code, style_key)
+            cached = self._cache_get(text, code, style_key, image_key)
             if cached is not None:
                 queue.put_nowait({"type": "done", "lang": code, "cached": True, "ms": 0, **cached})
             else:
-                tasks.append(asyncio.create_task(self._translate_one(code, text, style_key, queue, started)))
+                tasks.append(asyncio.create_task(self._translate_one(
+                    code, text, style_key, queue, started, image_path=image_path, image_key=image_key
+                )))
         remaining = len(targets)
         try:
             while remaining:
@@ -227,6 +252,7 @@ class TranslationService:
             for task in tasks:
                 if not task.done():
                     task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
         yield {"type": "end", "ms": _elapsed_ms(started)}
 
     async def _ask_jev(self, text: str) -> tuple[dict[str, Any], Optional[str]]:
@@ -244,10 +270,11 @@ class TranslationService:
         return event, (decision.label if applied else None)
 
     async def _translate_one(
-        self, code: str, text: str, style_key: str, queue: asyncio.Queue, started: float
+        self, code: str, text: str, style_key: str, queue: asyncio.Queue, started: float,
+        *, image_path: Optional[str] = None, image_key: str = ""
     ) -> None:
         try:
-            result = await self._run_turn(code, text, style_key, queue, started)
+            result = await self._run_turn(code, text, style_key, queue, started, image_path=image_path)
             if result is None:
                 # The ChatGPT backend refused custom base instructions; keep
                 # Codex's own base prompt and pass ours as developer instructions.
@@ -256,7 +283,7 @@ class TranslationService:
                     log.warning("base instructions rejected, switching to developer prompt mode")
                     self.prompt_mode = "developer"
                 queue.put_nowait({"type": "reset", "lang": code})
-                result = await self._run_turn(code, text, style_key, queue, started)
+                result = await self._run_turn(code, text, style_key, queue, started, image_path=image_path)
             if result is None:
                 raise CodexError("번역 요청이 거부되었습니다.")
         except asyncio.CancelledError:
@@ -285,15 +312,18 @@ class TranslationService:
             log.exception("Korean back translation failed")
             result["backError"] = "한국어 확인 번역을 완료하지 못했습니다. 다시 번역해 주세요."
         if result.get("backText"):
-            self._cache_put(text, code, style_key, {"text": result["text"], "model": result["model"], "backText": result["backText"]})
+            self._cache_put(text, code, style_key, {"text": result["text"], "model": result["model"], "backText": result["backText"]}, image_key)
         queue.put_nowait({"type": "done", "lang": code, "cached": False, **result})
 
     async def _run_turn(
-        self, code: str, text: str, style_key: str, queue: asyncio.Queue, started: float, *, back: bool = False
+        self, code: str, text: str, style_key: str, queue: asyncio.Queue, started: float, *, back: bool = False, image_path: Optional[str] = None
     ) -> Optional[dict[str, Any]]:
         """Run one Codex turn; `None` means base instructions were rejected."""
         codex = await self._codex()
-        instructions = build_back_instructions(TARGETS[code]) if back else build_instructions(TARGETS[code], STYLES[style_key])
+        instructions = (
+            build_back_instructions(TARGETS[code]) if back
+            else build_instructions(TARGETS[code], STYLES[style_key], image=bool(image_path))
+        )
         prefix = "back_" if back else ""
         omit_chinese_period = code == "zh" and not back
         prompt_mode = self.prompt_mode
@@ -314,7 +344,8 @@ class TranslationService:
         try:
             turn_params: dict[str, Any] = {
                 "threadId": thread_id,
-                "input": [{"type": "text", "text": text, "text_elements": []}],
+                "input": ([{"type": "text", "text": text, "text_elements": []}] if text else [])
+                         + ([{"type": "localImage", "path": image_path}] if image_path else []),
             }
             effort = await self._effort(codex, model)
             if effort:
@@ -432,21 +463,21 @@ class TranslationService:
         with contextlib.suppress(CodexError):
             await codex.request(method, params, timeout=10)
 
-    def _cache_key(self, text: str, code: str, style_key: str) -> str:
-        raw = "\x00".join([self.model or "", code, style_key, text])
+    def _cache_key(self, text: str, code: str, style_key: str, image_key: str = "") -> str:
+        raw = "\x00".join([self.model or "", code, style_key, text, image_key])
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    def _cache_get(self, text: str, code: str, style_key: str) -> Optional[dict[str, Any]]:
-        key = self._cache_key(text, code, style_key)
+    def _cache_get(self, text: str, code: str, style_key: str, image_key: str = "") -> Optional[dict[str, Any]]:
+        key = self._cache_key(text, code, style_key, image_key)
         hit = self._cache.get(key)
         if hit is not None:
             self._cache.move_to_end(key)
         return hit
 
-    def _cache_put(self, text: str, code: str, style_key: str, value: dict[str, Any]) -> None:
+    def _cache_put(self, text: str, code: str, style_key: str, value: dict[str, Any], image_key: str = "") -> None:
         if not value.get("text"):
             return
-        key = self._cache_key(text, code, style_key)
+        key = self._cache_key(text, code, style_key, image_key)
         self._cache[key] = value
         self._cache.move_to_end(key)
         while len(self._cache) > CACHE_SIZE:

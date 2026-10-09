@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import shutil
@@ -21,10 +22,14 @@ from inventory_web.translator_portal import login_token, resolve_translator_url,
 from translator import auth as translator_auth
 from translator.app import create_app
 from translator.codex_client import CodexAppServer, build_app_server_command
+from translator.images import MAX_IMAGE_BYTES, parse_image
 from translator.jev import JevClassifier
 from translator.service import TranslationService
 
 FAKE_SERVER = Path(__file__).resolve().parent / "fake_codex_app_server.py"
+
+
+PNG_IMAGE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jH1sAAAAASUVORK5CYII="
 
 
 def jev_reply(choice: str, confidence: float) -> dict:
@@ -107,6 +112,59 @@ class TranslationServiceTests(FakeCodexMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(targets, [False, True])
         # The fake model offers low/medium, so the fastest supported effort is used.
         self.assertEqual({r["params"].get("effort") for r in self.requests("turn/start")}, {"low"})
+
+    async def test_image_only_has_vision_input_and_text_only_back_translation(self) -> None:
+        self.service = self.make_service()
+        image = parse_image(PNG_IMAGE)
+        events = await collect(self.service, "", image=image)
+        done = [e for e in events if e["type"] == "done"]
+        self.assertEqual({e["lang"] for e in done}, {"en", "zh"})
+        self.assertTrue(all("[image:" in e["text"] and e["backText"] for e in done))
+        turns = [r["params"]["input"] for r in self.requests("turn/start")]
+        forward = [items for items in turns if any(i["type"] == "localImage" for i in items)]
+        self.assertEqual(len(forward), 2)
+        paths = {i["path"] for items in forward for i in items if i["type"] == "localImage"}
+        self.assertEqual(len(paths), 1)
+        self.assertTrue(all(not Path(path).exists() for path in paths))
+        back = [items for items in turns if not any(i["type"] == "localImage" for i in items)]
+        self.assertEqual({items[0]["text"] for items in back}, {e["text"] for e in done})
+        instructions = self.requests("thread/start")[0]["params"]["baseInstructions"]
+        self.assertIn("from any source language", instructions)
+        self.assertIn("inside an image", instructions)
+
+    async def test_image_cache_includes_contents_and_accompanying_text(self) -> None:
+        self.service = self.make_service()
+        image = parse_image(PNG_IMAGE)
+        await collect(self.service, "", targets=["en"], image=image)
+        cached = await collect(self.service, "", targets=["en"], image=image)
+        self.assertTrue(next(e for e in cached if e["type"] == "done")["cached"])
+        self.assertEqual(len(self.requests("turn/start")), 2)
+        # Different image bytes must never reuse the previous image's result.
+        other = parse_image('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC')
+        changed = await collect(self.service, "", targets=["en"], image=other)
+        self.assertFalse(next(e for e in changed if e["type"] == "done")["cached"])
+        combined = await collect(self.service, "설명", targets=["en"], image=image)
+        result = next(e for e in combined if e["type"] == "done")
+        self.assertIn("설명", result["text"])
+        self.assertFalse(result["cached"])
+        plain = await collect(self.service, "설명", targets=["en"])
+        self.assertNotIn("[image:", next(e for e in plain if e["type"] == "done")["text"])
+
+    async def test_cancelled_image_translation_removes_temporary_file(self) -> None:
+        self.service = self.make_service()
+        stream = self.service.translate("SLOW", targets=["en"], image=parse_image(PNG_IMAGE))
+        async for event in stream:
+            if event["type"] == "delta":
+                break
+        path = next(i["path"] for i in self.requests("turn/start")[0]["params"]["input"] if i["type"] == "localImage")
+        self.assertTrue(Path(path).exists())
+        await stream.aclose()
+        self.assertFalse(Path(path).exists())
+        for _ in range(50):
+            if self.requests("turn/interrupt"):
+                break
+            await asyncio.sleep(0.01)
+        self.assertTrue(self.requests("turn/interrupt"))
 
     async def test_commentary_messages_are_not_shown(self) -> None:
         self.service = self.make_service()
@@ -336,6 +394,42 @@ class TranslatorHttpTests(FakeCodexMixin, unittest.TestCase):
         self.assertEqual(len(self.requests("thread/start")), 2)
         self.assertIn('"type": "end"', nothing.text)
         self.assertNotIn('"type": "start"', nothing.text)
+
+    def test_image_only_job_and_sse_translate_through_api(self) -> None:
+        with self.client() as client:
+            response = client.post("/api/jobs", json={"image": PNG_IMAGE, "targets": ["en", "zh"]})
+            self.assertEqual(response.status_code, 200)
+            events = poll_job(client, response.json()["id"])
+            self.assertEqual(set(final_texts(events)), {"en", "zh"})
+            response = client.post("/api/translate", json={"image": PNG_IMAGE, "targets": ["en"]})
+            self.assertEqual(response.status_code, 200)
+            self.assertIn('"backText"', response.text)
+
+    def test_jpeg_and_webp_uploads_keep_the_correct_file_format(self) -> None:
+        images = [
+            'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDi6KKK+ZP3E//Z',
+            'data:image/webp;base64,UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoBAAEAAUAmJaACdLoB+AADsAD+8ut//NgVzXPv9//S4P0uD9Lg/9KQAAA=',
+        ]
+        with self.client() as client:
+            for image in images:
+                response = client.post("/api/jobs", json={"image": image, "targets": ["en"]})
+                self.assertEqual(response.status_code, 200)
+                events = poll_job(client, response.json()["id"])
+                self.assertIn("[image:", final_texts(events)["en"])
+        paths = [item["path"] for r in self.requests("turn/start") for item in r["params"]["input"] if item["type"] == "localImage"]
+        self.assertEqual([Path(path).suffix for path in paths], [".jpg", ".webp"])
+        self.assertTrue(all(not Path(path).exists() for path in paths))
+
+    def test_invalid_and_oversized_images_do_not_start_model(self) -> None:
+        invalid = ["https://example.com/image.png", "/etc/passwd", "data:image/svg+xml;base64,PHN2Zz4=",
+                   "data:image/png;base64,@@@", "data:image/png;base64," + base64.b64encode(b"not an image").decode(),
+                   "data:image/png;base64," + base64.b64encode(b"x" * (MAX_IMAGE_BYTES + 1)).decode()]
+        with self.client() as client:
+            for value in invalid:
+                for route in ("/api/jobs", "/api/translate"):
+                    response = client.post(route, json={"image": value})
+                    self.assertEqual(response.status_code, 400, value[:40])
+        self.assertEqual(self.requests("turn/start"), [])
 
     def test_login_returns_browser_url_and_status_follows(self) -> None:
         with self.client(logged_in=False) as client:

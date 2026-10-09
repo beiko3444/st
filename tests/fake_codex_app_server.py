@@ -12,6 +12,8 @@ REJECT_BASE fails turns that set custom base instructions.
 from __future__ import annotations
 
 import json
+import hashlib
+from pathlib import Path
 import os
 import sys
 import threading
@@ -131,7 +133,12 @@ def handle(message: dict):
         return {"thread": {"id": thread_id, "ephemeral": True}, "model": params.get("model") or "gpt-fake"}
     if method == "turn/start":
         turn_id = str(uuid.uuid4())
-        text = params["input"][0]["text"]
+        text = "\n".join(item["text"] for item in params["input"] if item["type"] == "text")
+        for item in params["input"]:
+            if item["type"] == "localImage":
+                # Read it now, exactly when the actual app server loads images.
+                data = Path(item["path"]).read_bytes()
+                text += " [image:" + hashlib.sha256(data).hexdigest()[:12] + "]"
         threading.Thread(target=run_turn, args=(params["threadId"], turn_id, text), daemon=True).start()
         return {"turn": {"id": turn_id, "items": [], "status": "inProgress", "error": None}}
     if method == "turn/interrupt":

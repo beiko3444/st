@@ -14,6 +14,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import auth
 from .codex_client import CodexError
+from .images import ImageAttachment, parse_image
 from .jobs import JobRegistry
 from .service import AUTO_STYLE, TranslationService
 
@@ -26,7 +27,8 @@ MAX_POLL_WAIT = 25.0
 
 
 class TranslateBody(BaseModel):
-    text: str
+    text: str = ""
+    image: Optional[str] = None
     style: str = AUTO_STYLE
     targets: Optional[list[str]] = None
 
@@ -155,9 +157,19 @@ def create_app(
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         return {"ok": True}
 
+    def read_image(value: Optional[str]) -> Optional[ImageAttachment]:
+        if value is None:
+            return None
+        try:
+            return parse_image(value)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/jobs")
     async def start_job(body: JobBody) -> dict[str, str]:
-        job = jobs.start(body.text, style=body.style, targets=body.targets, replaces=body.replaces)
+        job = jobs.start(
+            body.text, style=body.style, targets=body.targets, replaces=body.replaces, image=read_image(body.image)
+        )
         return {"id": job.id}
 
     @app.get("/api/jobs/{job_id}")
@@ -175,8 +187,10 @@ def create_app(
     async def translate(body: TranslateBody) -> StreamingResponse:
         """Server-Sent Events stream for local use and scripts (quick tunnels cannot carry SSE)."""
 
+        image = read_image(body.image)
+
         async def stream() -> AsyncIterator[str]:
-            events = svc.translate(body.text, style=body.style, targets=body.targets)
+            events = svc.translate(body.text, style=body.style, targets=body.targets, image=image)
             try:
                 async for event in events:
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
