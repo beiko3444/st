@@ -24,6 +24,7 @@ from .prompts import GENERAL, STYLES, TARGETS, build_instructions, build_back_in
 log = logging.getLogger(__name__)
 
 MAX_TEXT_LENGTH = 20_000
+DEFAULT_MODEL = "gpt-6-luna"
 AUTO_STYLE = "auto"
 # Lowest-latency effort the model offers wins; translation gains little from reasoning.
 EFFORT_PREFERENCE = ("none", "minimal", "low")
@@ -69,7 +70,7 @@ class TranslationService:
     def from_env(cls, env: Optional[dict[str, str]] = None) -> "TranslationService":
         env = dict(os.environ if env is None else env)
         jev = JevClassifier.from_env(env)
-        model = env.get("TRANSLATOR_MODEL") or None
+        model = env.get("TRANSLATOR_MODEL") or DEFAULT_MODEL
         effort = env.get("TRANSLATOR_EFFORT") or None
         prompt_mode = env.get("TRANSLATOR_PROMPT_MODE") or "base"
         codex_bin = find_codex_binary(env.get("TRANSLATOR_CODEX_BIN") or None)

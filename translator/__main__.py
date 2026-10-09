@@ -30,7 +30,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=int(os.environ.get("TRANSLATOR_PORT", "8777")))
     parser.add_argument("--open", action="store_true", help="브라우저에서 번역기 열기")
     parser.add_argument("--codex-bin", help="codex 실행 파일 경로 (기본: PATH의 codex)")
-    parser.add_argument("--model", help="번역에 쓸 모델 (기본: Codex 기본 모델)")
+    parser.add_argument("--model", help="번역에 쓸 모델 (기본: gpt-6-luna)")
     parser.add_argument("--effort", help="추론 강도 (기본: 모델이 지원하는 가장 빠른 값)")
     parser.add_argument("--prompt-mode", choices=PROMPT_MODES, help="번역 지시문 전달 방식")
     args = parser.parse_args()

@@ -81,6 +81,10 @@ Next.js 번역기 연결에는 `SMARTINVENTORY_WEB_PASSWORD`나 관리자 로그
 
 ## 4. 사용
 
+기본 모델은 `gpt-6-luna`이며, 외국어 결과와 한국어 확인 번역에 모두 사용합니다.
+운영 모델은 `/etc/kr-translator.env`의 `TRANSLATOR_MODEL`로 지정할 수 있습니다.
+설정 변경 후 `sudo systemctl restart kr-translator`로 반영합니다.
+
 Beiko 메뉴의 **번역기** 아이콘 또는 `https://www.beiko.co.kr/translator` → 번역기가 열립니다.
 영어·중국어 결과 아래에는 각 외국어 결과를 다시 한국어로 번역한 확인본이 표시됩니다.
 
