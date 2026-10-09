@@ -17,7 +17,7 @@ Vercel 에 번역 서버를 직접 올리지 않는 이유: ChatGPT 로그인을
 
 재고 서버 설치 때 이미 갖춘 것들입니다.
 
-- 64비트 Raspberry Pi OS (Codex CLI 는 32비트 ARM 빌드가 없습니다)
+- 64비트 커널 (Codex CLI 는 32비트 ARM 빌드가 없습니다). 32비트 사용자 환경에서는 아래 ARM64 실행 파일 설정을 사용합니다.
 - `/usr/local/bin/cloudflared`
 - 파이의 `~/.github_gist_token` (재고 서버 주소를 gist 에 올릴 때 쓰는 토큰)
 - Vercel 의 `SMARTINVENTORY_WEB_PASSWORD` (사이트 비밀번호가 곧 번역기 열쇠입니다. 없으면 번역기 메뉴가 동작하지 않습니다)
@@ -30,11 +30,24 @@ Vercel 에 번역 서버를 직접 올리지 않는 이유: ChatGPT 로그인을
 
 코드를 파이로 보낸 뒤 파이에서 `translator/deploy/install.sh` 를 실행합니다.
 
-- Python 패키지, Node.js, Codex CLI 설치
+- 재고 서버와 분리된 Python 가상 환경에 패키지 설치, Node.js와 Codex CLI 확인
 - 서비스 등록: `kr-translator`(번역 서버), `kr-translator-tunnel`(터널), `publish-translator-url.timer`(2분마다 터널 주소를 gist 의 `translator.json` 에 게시)
 - `/etc/kr-translator.env` 생성 (공유 비밀키 포함, 권한 600)
 
 마지막에 출력되는 `TRANSLATOR_SHARED_SECRET=...` 값을 복사해 두세요.
+
+### 64비트 커널 + 32비트 Node.js
+
+`uname -m` 이 `aarch64` 여도 `node -p process.arch` 가 `arm` 이면 npm Codex는 실행되지 않습니다.
+OpenAI 공식 릴리스의 `codex-aarch64-unknown-linux-musl` 실행 파일은 Node.js 없이 실행할 수 있습니다.
+파이에서 실행 파일을 설치한 뒤 최초 설치에 경로를 지정하세요:
+
+```bash
+sudo TRANSLATOR_CODEX_BIN=/path/to/codex-aarch64-unknown-linux-musl bash ~/st/translator/deploy/install.sh https://www.beiko.co.kr/translator
+```
+
+설치 후에는 `/etc/kr-translator.env` 의 실행 파일 경로를 재사용하므로 일반 업데이트 명령으로 유지됩니다.
+Python 환경은 기본적으로 `~/.local/lib/kr-translator/venv` 에 생성됩니다.
 
 ## 2. 파이에서 ChatGPT 로그인 (처음 한 번)
 
@@ -47,10 +60,15 @@ sudo systemctl restart kr-translator
 화면에 나온 주소에서 코드를 입력하면 됩니다. 번역기 화면의 **기기 코드로 로그인** 버튼으로 해도 됩니다(이 경우 재시작 불필요).
 
 - 코드를 입력했는데 로그인이 안 되면 ChatGPT 설정의 보안 항목에서 **Codex 기기 코드 인증**을 켜야 합니다. 회사(Business/Enterprise) 계정은 관리자가 허용해야 합니다.
-  이 내용은 여러 외부 가이드가 같은 설명을 하고 있지만 OpenAI 공식 문서는 직접 확인하지 못했습니다.
+  [OpenAI 공식 인증 문서](https://learn.chatgpt.com/docs/auth#login-on-headless-devices)에서 확인할 수 있습니다.
 - 브라우저 로그인 버튼은 서버에서는 쓸 수 없습니다. 로그인 완료 주소가 파이 자신의 `127.0.0.1:1455` 로 돌아가기 때문입니다.
 
 ## 3. Vercel 환경변수
+
+`www.beiko.co.kr` 은 이 저장소의 Python 웹 앱이 아니라 `beiko3444/beico-app` 의 Next.js 앱입니다.
+해당 사이트에서는 `/translator` 경로가 기존 관리자 세션을 확인하고 파이로 연결합니다.
+`st` 브랜치 머지만으로는 이 사이트에 버튼이 추가되지 않으므로 `beico-app` 의 연결 코드도 배포해야 합니다.
+Next.js 사이트에는 `SMARTINVENTORY_WEB_PASSWORD` 대신 기존 관리자 로그인이 적용됩니다.
 
 | 이름 | 값 |
 | --- | --- |

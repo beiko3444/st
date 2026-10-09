@@ -44,28 +44,44 @@ if [ ! -f "$PROJECT_DIR/translator/__main__.py" ]; then
     exit 1
 fi
 
-# 2. Python 패키지
+# 2. 재고 서버의 Python 패키지를 바꾸지 않는 별도 환경
 echo "[2/7] Python 패키지 설치..."
-pip3 install --break-system-packages -r "$PROJECT_DIR/translator/requirements.txt" 2>/dev/null \
-    || pip3 install -r "$PROJECT_DIR/translator/requirements.txt"
+VENV_DIR="${TRANSLATOR_VENV_DIR:-$USER_HOME/.local/lib/kr-translator/venv}"
+if [ ! -x "$VENV_DIR/bin/python" ]; then
+    sudo -u "$CURRENT_USER" -H python3 -m venv "$VENV_DIR"
+fi
+sudo -u "$CURRENT_USER" -H "$VENV_DIR/bin/python" -m pip install -r "$PROJECT_DIR/translator/requirements.txt"
+PYTHON_BIN="$VENV_DIR/bin/python"
 
 # 3. Node.js + Codex CLI (ChatGPT 로그인과 GPT 번역 담당)
 echo "[3/7] Codex CLI 확인..."
-if ! command -v npm >/dev/null 2>&1; then
-    apt-get update
-    apt-get install -y nodejs npm
+CODEX_BIN="${TRANSLATOR_CODEX_BIN:-}"
+if [ -z "$CODEX_BIN" ] && [ -r "$ENV_FILE" ] && [ "${UPDATE_CODEX:-0}" != "1" ]; then
+    CODEX_BIN="$(sed -n 's/^TRANSLATOR_CODEX_BIN=//p' "$ENV_FILE" | head -1)"
 fi
-NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-if [ "$NODE_MAJOR" -lt 16 ]; then
-    echo "ERROR: Node.js 16 이상이 필요합니다 (현재 $(node --version))."
+if [ -z "$CODEX_BIN" ]; then
+    if ! command -v npm >/dev/null 2>&1; then
+        apt-get update
+        apt-get install -y nodejs npm
+    fi
+    NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+    if [ "$NODE_MAJOR" -lt 16 ]; then
+        echo "ERROR: Node.js 16 이상이 필요합니다 (현재 $(node --version))."
+        exit 1
+    fi
+    # 이미 설치돼 있으면 버전을 바꾸지 않습니다. 올리려면 UPDATE_CODEX=1 로 실행하세요.
+    if ! command -v codex >/dev/null 2>&1 || [ "${UPDATE_CODEX:-0}" = "1" ]; then
+        npm install -g @openai/codex@latest
+    fi
+    CODEX_BIN="$(command -v codex)"
+fi
+if ! CODEX_VERSION="$(sudo -u "$CURRENT_USER" -H "$CODEX_BIN" --version 2>&1)"; then
+    echo "ERROR: Codex 를 실행할 수 없습니다: $CODEX_VERSION"
+    echo "       64비트 커널에 32비트 Node.js 를 쓰는 경우 ARM64 musl 실행 파일을"
+    echo "       TRANSLATOR_CODEX_BIN 으로 지정하세요."
     exit 1
 fi
-# 이미 설치돼 있으면 버전을 바꾸지 않습니다. 올리려면 UPDATE_CODEX=1 로 실행하세요.
-if ! command -v codex >/dev/null 2>&1 || [ "${UPDATE_CODEX:-0}" = "1" ]; then
-    npm install -g @openai/codex@latest
-fi
-CODEX_BIN="$(command -v codex)"
-echo "  codex: $CODEX_BIN ($("$CODEX_BIN" --version 2>/dev/null || echo '버전 확인 실패'))"
+echo "  codex: $CODEX_BIN ($CODEX_VERSION)"
 
 CLOUDFLARED="$(command -v cloudflared || echo /usr/local/bin/cloudflared)"
 if [ ! -x "$CLOUDFLARED" ]; then
@@ -103,7 +119,6 @@ fi
 
 # 5. systemd 서비스
 echo "[5/7] 서비스 등록..."
-PYTHON_BIN="$(command -v python3)"
 SYSTEMCTL_BIN="$(command -v systemctl)"
 cat > /etc/systemd/system/kr-translator.service <<EOF
 [Unit]
