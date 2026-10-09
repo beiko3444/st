@@ -12,10 +12,13 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 from fastapi.testclient import TestClient
 
+from inventory_web.translator_portal import login_token, resolve_translator_url, translator_gist_url
+from translator import auth as translator_auth
 from translator.app import create_app
 from translator.codex_client import CodexAppServer, build_app_server_command
 from translator.jev import JevClassifier
@@ -319,6 +322,165 @@ class TranslatorHttpTests(FakeCodexMixin, unittest.TestCase):
             status = client.get("/api/status").json()
         self.assertFalse(status["codex"]["ok"])
         self.assertIn("npm install -g @openai/codex", status["codex"]["error"])
+
+
+SECRET = "test-shared-secret"
+PORTAL = "https://inventory.example/translator"
+TUNNEL = "https://quiet-river-1234.trycloudflare.com"
+
+
+def poll_job(client: TestClient, job_id: str) -> list[dict]:
+    events: list[dict] = []
+    after = 0
+    for _ in range(200):
+        page = client.get(f"/api/jobs/{job_id}", params={"after": after, "wait": 5}).json()
+        events += page["events"]
+        after = page["next"]
+        if page["done"]:
+            return events
+    raise AssertionError("job did not finish")
+
+
+class SingleSignOnTokenTests(unittest.TestCase):
+    def test_inventory_site_tokens_open_a_translator_session(self) -> None:
+        now = 1_800_000_000
+        token = login_token(SECRET, now=now)
+
+        self.assertTrue(translator_auth.verify(SECRET, translator_auth.LOGIN_PURPOSE, token, now=now))
+        self.assertFalse(translator_auth.verify(SECRET, translator_auth.LOGIN_PURPOSE, token, now=now + 121))
+        self.assertFalse(translator_auth.verify("other-secret", translator_auth.LOGIN_PURPOSE, token, now=now))
+        self.assertFalse(translator_auth.verify(SECRET, translator_auth.SESSION_PURPOSE, token, now=now))
+        expires, signature = token.split(".")
+        self.assertFalse(translator_auth.verify(SECRET, translator_auth.LOGIN_PURPOSE, f"{int(expires) + 999}.{signature}", now=now))
+        self.assertFalse(translator_auth.verify(SECRET, translator_auth.LOGIN_PURPOSE, "", now=now))
+
+    def test_translator_url_lookup(self) -> None:
+        gist = "https://gist.githubusercontent.com/beiko3444/abc/raw/monitor.json"
+        self.assertEqual(translator_gist_url(gist), "https://gist.githubusercontent.com/beiko3444/abc/raw/translator.json")
+        self.assertEqual(
+            translator_gist_url("https://gist.githubusercontent.com/u/abc/raw/0123abcd/monitor.json?x=1"),
+            "https://gist.githubusercontent.com/u/abc/raw/translator.json",
+        )
+        self.assertIsNone(translator_gist_url(""))
+
+        asked: list[str] = []
+
+        def resolve(url: str) -> str:
+            asked.append(url)
+            return TUNNEL + "/"
+
+        self.assertEqual(resolve_translator_url(gist, resolve, env={}), TUNNEL)
+        self.assertEqual(asked, ["https://gist.githubusercontent.com/beiko3444/abc/raw/translator.json"])
+        self.assertEqual(resolve_translator_url(gist, resolve, env={"TRANSLATOR_URL": "https://t.example/"}), "https://t.example")
+        self.assertIsNone(resolve_translator_url("", resolve, env={}))
+
+
+class DeployedTranslatorTests(FakeCodexMixin, unittest.TestCase):
+    def tearDown(self) -> None:
+        self.cleanup_tmp()
+
+    def client(self, **kwargs) -> TestClient:
+        app = create_app(self.make_service(**kwargs), shared_secret=SECRET, portal_url=PORTAL)
+        return TestClient(app, base_url=TUNNEL, follow_redirects=False)
+
+    def sign_in(self, client: TestClient) -> None:
+        response = client.get("/auth", params={"token": login_token(SECRET)})
+        self.assertEqual((response.status_code, response.headers["location"]), (303, "/"))
+        cookie = response.headers["set-cookie"]
+        for flag in ("HttpOnly", "Secure", "SameSite=lax"):
+            self.assertIn(flag, cookie)
+
+    def test_requires_a_session_from_the_inventory_site(self) -> None:
+        with self.client() as client:
+            self.assertEqual(client.get("/healthz").json(), {"ok": True})
+            denied = client.get("/api/status")
+            self.assertEqual((denied.status_code, denied.json()["portalUrl"]), (401, PORTAL))
+            self.assertEqual(client.get("/").headers["location"], PORTAL)
+            self.assertEqual(client.post("/api/jobs", json={"text": "안녕"}).status_code, 401)
+            self.assertEqual(client.get("/auth", params={"token": "123.bad"}).status_code, 403)
+
+            self.sign_in(client)
+            status = client.get("/api/status").json()
+            self.assertTrue(status["deployed"])
+            self.assertEqual(status["portalUrl"], PORTAL)
+            self.assertEqual(client.get("/").status_code, 200)
+        self.assertEqual(self.requests("turn/start"), [])
+
+    def test_long_poll_job_streams_translation(self) -> None:
+        with self.client() as client:
+            self.sign_in(client)
+            job = client.post("/api/jobs", json={"text": "견적 부탁드립니다", "targets": ["en", "zh"]}).json()
+            events = poll_job(client, job["id"])
+            self.assertEqual(client.get("/api/jobs/unknown").status_code, 404)
+
+        self.assertEqual(final_texts(events), {"en": "[en] 견적 부탁드립니다", "zh": "[zh] 견적 부탁드립니다"})
+        self.assertEqual(streamed_texts(events), final_texts(events))
+        self.assertEqual(events[-1]["type"], "end")
+
+    def test_new_job_replaces_the_running_one(self) -> None:
+        with self.client() as client:
+            self.sign_in(client)
+            slow = client.post("/api/jobs", json={"text": "SLOW 아주 긴 문장", "targets": ["en"]}).json()
+            first = client.get(f"/api/jobs/{slow['id']}", params={"after": 0, "wait": 5}).json()
+            self.assertFalse(first["done"])
+            fresh = client.post("/api/jobs", json={"text": "새 문장", "targets": ["en"], "replaces": slow["id"]}).json()
+            events = poll_job(client, fresh["id"])
+            old = client.get(f"/api/jobs/{slow['id']}", params={"after": first["next"], "wait": 5}).json()
+
+        self.assertEqual(final_texts(events), {"en": "[en] 새 문장"})
+        self.assertTrue(old["done"])
+        self.assertNotIn("done", [event["type"] for event in old["events"]])
+        for _ in range(50):
+            if self.requests("turn/interrupt"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(len(self.requests("turn/interrupt")), 1)
+
+    def test_server_login_uses_device_code_and_foreign_requests_fail(self) -> None:
+        with self.client(logged_in=False) as client:
+            self.sign_in(client)
+            self.assertEqual(client.post("/api/login", json={"method": "browser"}).status_code, 400)
+            self.assertEqual(client.post("/api/login", json={"method": "device"}).json()["userCode"], "ABCD-1234")
+            cross_site = client.post("/api/jobs", json={"text": "x"}, headers={"Origin": "https://evil.example"})
+            self.assertEqual(cross_site.status_code, 403)
+            self.assertEqual(client.get("/healthz", headers={"Host": "evil.example"}).status_code, 400)
+
+
+class InventoryTranslatorMenuTests(unittest.TestCase):
+    def client(self, **env: str) -> TestClient:
+        from inventory_web.app import create_app as create_inventory_app
+
+        base = {"VERCEL": "1", "SMARTINVENTORY_WEB_PASSWORD": "pw", "TRANSLATOR_SHARED_SECRET": SECRET, "TRANSLATOR_URL": TUNNEL}
+        patcher = patch.dict(os.environ, {**base, **env})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in ("SMARTINVENTORY_MONITOR_URL", "MONITOR_URL", "SMARTINVENTORY_CACHE_DB"):
+            os.environ.pop(key, None)
+        return TestClient(create_inventory_app(), follow_redirects=False)
+
+    def test_menu_link_redirects_signed_in_users_with_a_token(self) -> None:
+        client = self.client()
+        self.assertEqual(client.post("/login", data={"password": "pw"}).status_code, 303)
+        self.assertIn('href="/translator"', client.get("/").text)
+        response = client.get("/translator")
+
+        self.assertEqual(response.status_code, 303)
+        location = response.headers["location"]
+        self.assertTrue(location.startswith(f"{TUNNEL}/auth?token="))
+        token = location.split("token=", 1)[1]
+        self.assertTrue(translator_auth.verify(SECRET, translator_auth.LOGIN_PURPOSE, token))
+        self.assertEqual(response.headers["referrer-policy"], "no-referrer")
+
+    def test_menu_needs_site_login_and_configuration(self) -> None:
+        client = self.client()
+        self.assertEqual(client.get("/translator").headers["location"], "/login")
+
+        client = self.client(TRANSLATOR_SHARED_SECRET="")
+        client.post("/login", data={"password": "pw"})
+        self.assertEqual(client.get("/translator").status_code, 503)
+
+        client = self.client(SMARTINVENTORY_WEB_PASSWORD="")
+        self.assertIn("SMARTINVENTORY_WEB_PASSWORD", client.get("/translator").text)
 
 
 class _FakeResponsesHandler(BaseHTTPRequestHandler):

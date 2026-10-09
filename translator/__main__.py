@@ -9,7 +9,7 @@ import webbrowser
 
 import uvicorn
 
-from .app import LOOPBACK_HOSTS, create_app
+from .app import DEPLOYED_HOSTS, LOOPBACK_HOSTS, create_app
 from .service import PROMPT_MODES, TranslationService
 
 
@@ -51,15 +51,23 @@ def main() -> int:
     if service.jev is None:
         print("[translator] Jev 미설정: 스타일 자동 판단 없이 번역합니다 (translator/README.md 참고).", file=sys.stderr)
 
+    shared_secret = os.environ.get("TRANSLATOR_SHARED_SECRET", "").strip() or None
+    portal_url = os.environ.get("TRANSLATOR_PORTAL_URL", "").strip() or None
+    extra_hosts = [h.strip() for h in os.environ.get("TRANSLATOR_ALLOWED_HOSTS", "").split(",") if h.strip()]
     allowed_hosts = None
-    if not _is_loopback(args.host):
+    if shared_secret:
+        print("[translator] 배포 모드: 재고 사이트의 '번역기' 링크로 들어온 사용자만 접속할 수 있습니다.", file=sys.stderr)
+        allowed_hosts = DEPLOYED_HOSTS + extra_hosts
+    elif not _is_loopback(args.host):
         print(
             "[translator] 경고: 루프백이 아닌 주소로 열면 같은 네트워크의 누구나 "
-            "내 ChatGPT 구독으로 번역할 수 있습니다.",
+            "내 ChatGPT 구독으로 번역할 수 있습니다 (TRANSLATOR_SHARED_SECRET으로 보호하세요).",
             file=sys.stderr,
         )
         allowed_hosts = ["*"]
-    app = create_app(service, allowed_hosts=allowed_hosts or LOOPBACK_HOSTS)
+    elif extra_hosts:
+        allowed_hosts = LOOPBACK_HOSTS + extra_hosts
+    app = create_app(service, allowed_hosts=allowed_hosts, shared_secret=shared_secret, portal_url=portal_url)
 
     url = f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '::') else args.host}:{args.port}"
     print(f"[translator] {url}", file=sys.stderr)

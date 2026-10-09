@@ -1,6 +1,7 @@
 # KR 즉시 번역기
 
-한국어를 붙여넣으면 **영어**와 **중국어 간체**로 바로 번역해 실시간(스트리밍)으로 보여주는 로컬 웹 도구입니다.
+한국어를 붙여넣으면 **영어**와 **중국어 간체**로 바로 번역해 실시간(스트리밍)으로 보여주는 웹 도구입니다.
+내 컴퓨터에서 바로 실행할 수도 있고, 라즈베리파이에 배포해 재고 사이트의 **번역기** 메뉴로 어디서든 쓸 수도 있습니다 → [DEPLOY.md](DEPLOY.md)
 
 - **번역 = GPT**: 공식 Codex CLI의 `codex app-server`를 통해 **ChatGPT 계정으로 로그인**하고, 그 구독(Codex가 포함된 플랜)의 사용량으로 번역합니다. OpenAI API 키는 필요 없습니다.
 - **문체 판단 = Jev (TypeSafe AI, 선택)**: 붙여넣은 글이 어떤 종류인지(거래처 업무 / 상품·광고 / 고객응대 / 일상대화 / 기술·사양) 판단해 GPT에게 맞는 번역 문체를 지시합니다.
@@ -46,6 +47,11 @@ Jev는 2026-09-15 TypeSafe AI가 공개한 "System One" 모델로, **텍스트�
    터미널에서 이미 `codex login`을 했다면 같은 로그인(`~/.codex/auth.json`)을 그대로 씁니다.
    다른 기기(예: 라즈베리파이)에서 서버를 돌린다면 **기기 코드로 로그인**을 쓰세요.
 
+## 배포 (라즈베리파이 + 재고 사이트)
+
+폰이나 다른 컴퓨터에서도 쓰려면 [DEPLOY.md](DEPLOY.md)를 따르세요. Mac 에서 `./translator/deploy/deploy_pi.sh` 한 줄로 파이에 설치되고,
+재고 사이트 우측 상단 **번역기** 버튼으로 사이트 비밀번호 로그인 그대로 들어갑니다.
+
 ## Jev 설정 (선택)
 
 둘 중 하나만 설정하면 됩니다. 아무것도 없으면 Jev 없이 기본 문체로 번역합니다.
@@ -79,6 +85,9 @@ python3 -m translator --open
 | `--prompt-mode` | `TRANSLATOR_PROMPT_MODE` | `base`(기본) 또는 `developer` |
 | `--codex-bin` | `TRANSLATOR_CODEX_BIN` | `codex` 실행 파일 경로 |
 | | `TRANSLATOR_CODEX_ARGS` | `codex app-server`에 덧붙일 인자 |
+| | `TRANSLATOR_SHARED_SECRET` | 설정하면 배포 모드: 재고 사이트가 서명한 링크로만 접속 ([DEPLOY.md](DEPLOY.md)) |
+| | `TRANSLATOR_PORTAL_URL` | 배포 모드에서 세션이 없을 때 돌려보낼 재고 사이트 번역기 주소 |
+| | `TRANSLATOR_ALLOWED_HOSTS` | 추가로 허용할 호스트 이름(쉼표 구분, 예: 고정 도메인) |
 
 ## 사용법
 

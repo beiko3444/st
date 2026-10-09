@@ -16,6 +16,7 @@ const el = {
   login: $("login"),
   loginDesc: $("login-desc"),
   loginActions: $("login-actions"),
+  loginBrowser: $("login-browser"),
   loginMsg: $("login-msg"),
   deviceBox: $("device-box"),
   deviceUrl: $("device-url"),
@@ -33,6 +34,7 @@ const el = {
 
 const state = {
   controller: null,
+  jobId: null,
   lastKey: "",
   typingTimer: null,
   loginPoll: null,
@@ -140,13 +142,41 @@ function resetOutputs(streaming) {
   }
 }
 
+class SessionExpired extends Error {}
+
+// JSON request helper; a 401 means the translator session ran out.
+async function api(path, { method = "GET", body, signal } = {}) {
+  const response = await fetch(path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+    signal,
+  });
+  const data = await response.json().catch(() => ({}));
+  if (response.status === 401) {
+    showSessionExpired(data.portalUrl);
+    throw new SessionExpired("세션이 만료되었습니다.");
+  }
+  if (!response.ok) throw new Error(data.detail || data.error || `서버 오류 (HTTP ${response.status})`);
+  return data;
+}
+
+function stopJob() {
+  if (state.controller) state.controller.abort();
+  state.controller = null;
+  if (state.jobId) {
+    fetch(`/api/jobs/${state.jobId}`, { method: "DELETE" }).catch(() => {});
+    state.jobId = null;
+  }
+}
+
 async function translate(force = false) {
   clearTimeout(state.typingTimer);
   if (!state.langs.length) await statusReady;
   if (!state.langs.length) return;
   const text = el.source.value.trim();
   if (!text) {
-    if (state.controller) state.controller.abort();
+    stopJob();
     state.lastKey = "";
     resetOutputs(false);
     el.jevChip.hidden = true;
@@ -157,8 +187,10 @@ async function translate(force = false) {
   if (!force && key === state.lastKey) return;
   state.lastKey = key;
 
-  // A newer paste replaces the running request; the server then interrupts
-  // the unfinished GPT turns.
+  // A newer paste replaces the running job: the server cancels the old one,
+  // which interrupts its unfinished GPT turns.
+  const previousJob = state.jobId;
+  state.jobId = null;
   if (state.controller) state.controller.abort();
   const controller = new AbortController();
   state.controller = controller;
@@ -167,45 +199,37 @@ async function translate(force = false) {
   el.styleChip.hidden = true;
 
   try {
-    const response = await fetch("/api/translate", {
+    // Not tied to the abort signal: if this request is superseded while
+    // starting, the job id is still needed to cancel it.
+    const job = await api("/api/jobs", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, style: el.style.value, targets: selectedLangs() }),
-      signal: controller.signal,
+      body: { text, style: el.style.value, targets: selectedLangs(), replaces: previousJob },
     });
-    if (!response.ok || !response.body) {
-      throw new Error(`서버 오류 (HTTP ${response.status})`);
+    if (state.controller !== controller) {
+      fetch(`/api/jobs/${job.id}`, { method: "DELETE" }).catch(() => {});
+      return;
     }
-    await readEvents(response.body, (event) => {
-      if (state.controller === controller) handleEvent(event);
-    });
+    state.jobId = job.id;
+    // Each poll returns as soon as new text exists, so output keeps streaming
+    // even through tunnels that cannot carry Server-Sent Events.
+    let after = 0;
+    for (;;) {
+      const page = await api(`/api/jobs/${job.id}?after=${after}`, { signal: controller.signal });
+      if (state.controller !== controller) return;
+      for (const event of page.events) handleEvent(event);
+      after = page.next;
+      if (page.done) break;
+    }
+    if (state.jobId === job.id) state.jobId = null;
   } catch (error) {
-    if (error.name === "AbortError") return;
-    for (const lang of selectedLangs()) showError(lang, error.message || String(error));
+    if (error.name === "AbortError" || state.controller !== controller) return;
+    const message = error instanceof SessionExpired ? "재고 사이트의 '번역기' 메뉴로 다시 들어오세요." : error.message || String(error);
+    for (const lang of selectedLangs()) showError(lang, message);
     state.lastKey = "";
   } finally {
     if (state.controller === controller) {
       state.controller = null;
       for (const lang of state.langs) el.out[lang].classList.remove("streaming");
-    }
-  }
-}
-
-async function readEvents(body, onEvent) {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let boundary;
-    while ((boundary = buffer.indexOf("\n\n")) >= 0) {
-      const chunk = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      for (const line of chunk.split("\n")) {
-        if (line.startsWith("data: ")) onEvent(JSON.parse(line.slice(6)));
-      }
     }
   }
 }
@@ -324,6 +348,10 @@ async function refreshStatus() {
   try {
     const response = await fetch("/api/status", { cache: "no-store" });
     status = await response.json();
+    if (response.status === 401) {
+      showSessionExpired(status.portalUrl);
+      return null;
+    }
   } catch (error) {
     el.account.textContent = "서버에 연결할 수 없습니다";
     return null;
@@ -399,9 +427,35 @@ function describeUsage(usage) {
 }
 
 function showLogin(errorMessage, canLogin) {
+  const deployed = Boolean(state.status && state.status.deployed);
   el.login.hidden = false;
   el.loginActions.hidden = !canLogin;
+  // On the server, the browser flow's callback would go to the server's own
+  // 127.0.0.1, so only the device-code flow can work there.
+  el.loginBrowser.hidden = deployed;
+  el.loginDesc.textContent = deployed
+    ? "번역 서버(라즈베리파이)의 Codex에 ChatGPT 계정을 연결합니다. 기기 코드로 로그인하세요. " +
+      "코드 입력 후에도 로그인이 안 되면 ChatGPT 설정의 보안 항목에서 Codex 기기 코드 인증을 켜야 합니다."
+    : "번역은 로그인한 ChatGPT 구독(Codex 포함 플랜)의 사용량으로 처리됩니다.";
   if (errorMessage) setLoginMessage(errorMessage, true);
+}
+
+function showSessionExpired(portalUrl) {
+  stopLoginPoll();
+  el.login.hidden = false;
+  el.loginActions.hidden = true;
+  el.deviceBox.hidden = true;
+  el.loginDesc.textContent = "번역기 접속 시간이 만료되었습니다. 재고 사이트의 '번역기' 메뉴로 다시 들어오세요.";
+  el.account.textContent = "세션 만료";
+  if (portalUrl) {
+    el.loginMsg.hidden = false;
+    el.loginMsg.classList.remove("error");
+    el.loginMsg.replaceChildren();
+    const link = document.createElement("a");
+    link.href = portalUrl;
+    link.textContent = "재고 사이트에서 다시 열기";
+    el.loginMsg.appendChild(link);
+  }
 }
 
 function hideLogin() {

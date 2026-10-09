@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import hmac
+import html
 import io
 import os
 from datetime import date, datetime, timedelta, timezone
@@ -42,6 +43,8 @@ from inventory_app.services.revenue_services import RevenueComparisonService
 
 from .config import config_status, load_web_config
 from .jobs import jobs
+from .translator_portal import login_token as translator_login_token
+from .translator_portal import resolve_translator_url
 from .serializers import (
     channel_product_to_dict,
     master_product_row_to_dict,
@@ -348,6 +351,49 @@ def create_app() -> FastAPI:
         response = RedirectResponse("/login", status_code=303)
         response.delete_cookie(session_cookie)
         return response
+
+    def translator_problem(message: str) -> HTMLResponse:
+        return HTMLResponse(
+            f"""<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>번역기</title>
+    <link rel="stylesheet" href="/static/app.css">
+  </head>
+  <body class="login-page">
+    <main class="login-panel">
+      <h1>번역기</h1>
+      <p>{html.escape(message)}</p>
+    </main>
+  </body>
+</html>""",
+            status_code=503,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/translator")
+    def open_translator() -> Response:
+        # The translator spends the ChatGPT plan signed in on the Pi, so on
+        # Vercel it is only offered behind the site password.
+        if is_vercel and not web_password():
+            return translator_problem("번역기를 쓰려면 Vercel에 SMARTINVENTORY_WEB_PASSWORD를 설정하세요.")
+        secret = os.environ.get("TRANSLATOR_SHARED_SECRET", "").strip()
+        if not secret:
+            return translator_problem("Vercel에 TRANSLATOR_SHARED_SECRET이 설정되지 않았습니다.")
+        from inventory_app.config import resolve_monitor_url_from_gist
+
+        url = resolve_translator_url(config.monitor_url_gist, resolve_monitor_url_from_gist)
+        if not url:
+            return translator_problem(
+                "라즈베리파이 번역 서버 주소를 찾지 못했습니다. 파이의 kr-translator 서비스와 터널이 켜져 있는지 확인하세요."
+            )
+        return RedirectResponse(
+            f"{url}/auth?token={translator_login_token(secret)}",
+            status_code=303,
+            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+        )
 
     def monitor_url() -> str:
         url = (config.monitor_url or "").strip().rstrip("/")
