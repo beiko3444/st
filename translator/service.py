@@ -294,6 +294,7 @@ class TranslationService:
         codex = await self._codex()
         instructions = build_back_instructions(TARGETS[code]) if back else build_instructions(TARGETS[code], STYLES[style_key])
         prefix = "back_" if back else ""
+        omit_chinese_period = code == "zh" and not back
         prompt_mode = self.prompt_mode
         thread_params: dict[str, Any] = {
             "ephemeral": True,
@@ -350,6 +351,8 @@ class TranslationService:
                     if params.get("itemId") in commentary:
                         continue
                     delta = params.get("delta") or ""
+                    if omit_chinese_period:
+                        delta = delta.replace("。", " ")
                     if not delta:
                         continue
                     if first_token_ms is None:
@@ -364,6 +367,8 @@ class TranslationService:
                         and item.get("id") not in commentary
                     ):
                         final_text = item.get("text") or ""
+                        if omit_chinese_period:
+                            final_text = final_text.replace("。", " ")
                 elif method == "error":
                     error = params.get("error") or {}
                     if not params.get("willRetry"):
