@@ -95,7 +95,7 @@ class TranslationServiceTests(FakeCodexMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["type"], "end")
         self.assertIn({"type": "jev", "status": "off"}, events)
 
-        threads = self.requests("thread/start")
+        threads = [r for r in self.requests("thread/start") if "into Korean" not in r["params"].get("baseInstructions", "")]
         self.assertEqual(len(threads), 2)
         for request in threads:
             params = request["params"]
@@ -139,7 +139,32 @@ class TranslationServiceTests(FakeCodexMixin, unittest.IsolatedAsyncioTestCase):
         events = await collect(self.service, "같은 문장")
 
         self.assertTrue(all(event["cached"] for event in events if event["type"] == "done"))
+        self.assertEqual(len(self.requests("turn/start")), 4)
+
+    async def test_back_translation_uses_finished_translation_as_input(self) -> None:
+        self.service = self.make_service()
+        events = await collect(self.service, "원문입니다", targets=["en"])
+        translated = next(e for e in events if e["type"] == "translated")
+        done = next(e for e in events if e["type"] == "done")
+        self.assertEqual(done["backText"], "[ko] [en] 원문입니다")
+        self.assertLess(events.index(translated), events.index(done))
+        inputs = [r["params"]["input"][0]["text"] for r in self.requests("turn/start")]
+        self.assertEqual(inputs, ["원문입니다", translated["text"]])
+        again = await collect(self.service, "원문입니다", targets=["en"])
+        cached = next(e for e in again if e["type"] == "done")
+        self.assertTrue(cached["cached"])
+        self.assertEqual(cached["backText"], done["backText"])
         self.assertEqual(len(self.requests("turn/start")), 2)
+
+    async def test_back_translation_failure_preserves_foreign_translation(self) -> None:
+        self.service = self.make_service()
+        events = await collect(self.service, "BACK_FAIL", targets=["en"])
+        done = next(e for e in events if e["type"] == "done")
+        self.assertEqual(done["text"], "[en] BACK_FAIL")
+        self.assertIn("backError", done)
+        self.assertNotIn("backText", done)
+        self.assertEqual(events[-1]["type"], "end")
+        self.assertIsNone(self.service._cache_get("BACK_FAIL", "en", "general"))
 
     async def test_closing_the_stream_interrupts_running_turns(self) -> None:
         self.service = self.make_service()
@@ -291,7 +316,7 @@ class TranslatorHttpTests(FakeCodexMixin, unittest.TestCase):
         events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
         self.assertEqual(final_texts(events), {"zh": "[zh] 감사합니다"})
         self.assertEqual(events[0], {"type": "start", "targets": ["zh"]})
-        self.assertEqual(len(self.requests("thread/start")), 1)
+        self.assertEqual(len(self.requests("thread/start")), 2)
         self.assertIn('"type": "end"', nothing.text)
         self.assertNotIn('"type": "start"', nothing.text)
 
@@ -406,6 +431,19 @@ class DeployedTranslatorTests(FakeCodexMixin, unittest.TestCase):
             self.assertEqual(client.get("/").status_code, 200)
         self.assertEqual(self.requests("turn/start"), [])
 
+    def test_public_visitors_cannot_change_or_read_server_account(self) -> None:
+        with self.client() as client:
+            self.sign_in(client)
+            status = client.get("/api/status").json()
+            self.assertTrue(status["ready"])
+            for key in ("account", "usage", "login"):
+                self.assertNotIn(key, status)
+            self.assertEqual(client.post("/api/login", json={"method": "device"}).status_code, 403)
+            self.assertEqual(client.post("/api/logout").status_code, 403)
+            self.assertTrue(client.get("/api/status").json()["ready"])
+        self.assertEqual(self.requests("account/logout"), [])
+        self.assertEqual(self.requests("account/login/start"), [])
+
     def test_long_poll_job_streams_translation(self) -> None:
         with self.client() as client:
             self.sign_in(client)
@@ -423,6 +461,11 @@ class DeployedTranslatorTests(FakeCodexMixin, unittest.TestCase):
             slow = client.post("/api/jobs", json={"text": "SLOW 아주 긴 문장", "targets": ["en"]}).json()
             first = client.get(f"/api/jobs/{slow['id']}", params={"after": 0, "wait": 5}).json()
             self.assertFalse(first["done"])
+            after = first["next"]
+            while not any(e["type"] == "delta" for e in first["events"]):
+                first = client.get(f"/api/jobs/{slow['id']}", params={"after": after, "wait": 5}).json()
+                after = first["next"]
+                self.assertFalse(first["done"])
             fresh = client.post("/api/jobs", json={"text": "새 문장", "targets": ["en"], "replaces": slow["id"]}).json()
             events = poll_job(client, fresh["id"])
             old = client.get(f"/api/jobs/{slow['id']}", params={"after": first["next"], "wait": 5}).json()
@@ -436,11 +479,11 @@ class DeployedTranslatorTests(FakeCodexMixin, unittest.TestCase):
             time.sleep(0.05)
         self.assertEqual(len(self.requests("turn/interrupt")), 1)
 
-    def test_server_login_uses_device_code_and_foreign_requests_fail(self) -> None:
+    def test_server_account_management_and_foreign_requests_fail(self) -> None:
         with self.client(logged_in=False) as client:
             self.sign_in(client)
-            self.assertEqual(client.post("/api/login", json={"method": "browser"}).status_code, 400)
-            self.assertEqual(client.post("/api/login", json={"method": "device"}).json()["userCode"], "ABCD-1234")
+            self.assertEqual(client.post("/api/login", json={"method": "browser"}).status_code, 403)
+            self.assertEqual(client.post("/api/login", json={"method": "device"}).status_code, 403)
             cross_site = client.post("/api/jobs", json={"text": "x"}, headers={"Origin": "https://evil.example"})
             self.assertEqual(cross_site.status_code, 403)
             self.assertEqual(client.get("/healthz", headers={"Host": "evil.example"}).status_code, 400)

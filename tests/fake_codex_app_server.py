@@ -49,7 +49,8 @@ def agent_item(item_id: str, text: str, phase=None) -> dict:
 def run_turn(thread_id: str, turn_id: str, text: str) -> None:
     thread = threads[thread_id]
     instructions = thread.get("baseInstructions") or thread.get("developerInstructions") or ""
-    lang = "zh" if "Simplified Chinese" in instructions else "en"
+    back = "into Korean" in instructions
+    lang = "ko" if back else ("zh" if "Simplified Chinese" in instructions else "en")
 
     def complete(status: str, error=None) -> None:
         notify("turn/completed", {"threadId": thread_id, "turn": {
@@ -60,7 +61,7 @@ def run_turn(thread_id: str, turn_id: str, text: str) -> None:
         complete("failed", {"message": "Instructions are not valid", "codexErrorInfo": None,
                             "additionalDetails": None, "misalignment": None})
         return
-    if "FAIL" in text:
+    if ("FAIL" in text and "BACK_FAIL" not in text) or (back and "BACK_FAIL" in text):
         notify("error", {"threadId": thread_id, "turnId": turn_id, "willRetry": True,
                          "error": {"message": "Reconnecting... 1/5"}})
         notify("error", {"threadId": thread_id, "turnId": turn_id, "willRetry": False,

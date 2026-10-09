@@ -47,8 +47,8 @@ def create_app(
     shared_secret: Optional[str] = None,
     portal_url: Optional[str] = None,
 ) -> FastAPI:
-    """Build the app. With `shared_secret` it runs in deployed mode: every
-    request needs a session that starts from the inventory site's signed link."""
+    """In deployed mode, the public Beiko link issues visitor sessions.
+    Server account management is available only through the local CLI."""
     svc = service or TranslationService.from_env()
     jobs = JobRegistry(svc)
     deployed = bool(shared_secret)
@@ -88,7 +88,7 @@ def create_app(
             return JSONResponse({"ok": False, "error": "unauthorized", "portalUrl": portal_url}, status_code=401)
         if portal_url:
             return RedirectResponse(portal_url, status_code=303)
-        return _message_page("재고 사이트의 '번역기' 메뉴로 접속하세요.", status_code=401)
+        return _message_page("Beiko 사이트의 '번역기' 메뉴로 접속하세요.", status_code=401)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, bool]:
@@ -100,7 +100,7 @@ def create_app(
             return RedirectResponse("/", status_code=303)
         if not auth.verify(shared_secret or "", auth.LOGIN_PURPOSE, token):
             return _message_page(
-                "링크가 만료되었거나 올바르지 않습니다. 재고 사이트의 '번역기' 메뉴로 다시 들어오세요.",
+                "링크가 만료되었거나 올바르지 않습니다. Beiko 사이트의 '번역기' 메뉴로 다시 들어오세요.",
                 status_code=403,
                 link=portal_url,
             )
@@ -126,13 +126,20 @@ def create_app(
         result = await svc.status()
         result["deployed"] = deployed
         result["portalUrl"] = portal_url
+        if deployed:
+            # Public visitors need availability, never the owner's account details.
+            result["ready"] = bool(result.get("codex", {}).get("ok") and (
+                result.get("account") or result.get("requiresOpenaiAuth") is False
+            ))
+            for key in ("account", "usage", "login", "requiresOpenaiAuth"):
+                result.pop(key, None)
+            result["codex"] = {"ok": bool(result.get("codex", {}).get("ok"))}
         return result
 
     @app.post("/api/login")
     async def login(body: LoginBody) -> dict[str, Any]:
-        if deployed and body.method != "device":
-            # The browser flow's callback goes to 127.0.0.1:1455 on the server itself.
-            raise HTTPException(status_code=400, detail="서버 배포에서는 기기 코드 로그인을 사용하세요.")
+        if deployed:
+            raise HTTPException(status_code=403, detail="서버 계정은 관리자만 변경할 수 있습니다.")
         try:
             return await svc.start_login(device=body.method == "device")
         except CodexError as exc:
@@ -140,6 +147,8 @@ def create_app(
 
     @app.post("/api/logout")
     async def logout() -> dict[str, Any]:
+        if deployed:
+            raise HTTPException(status_code=403, detail="서버 계정은 관리자만 변경할 수 있습니다.")
         try:
             await svc.logout()
         except CodexError as exc:
@@ -191,7 +200,7 @@ def _is_https(request: Request) -> bool:
 
 
 def _message_page(message: str, *, status_code: int, link: Optional[str] = None) -> HTMLResponse:
-    link_html = f'<p><a href="{html.escape(link)}">재고 사이트로 이동</a></p>' if link else ""
+    link_html = f'<p><a href="{html.escape(link)}">Beiko 사이트로 이동</a></p>' if link else ""
     return HTMLResponse(
         f"""<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">

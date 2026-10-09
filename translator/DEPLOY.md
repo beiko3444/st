@@ -1,10 +1,10 @@
-# 번역기 배포: 라즈베리파이 + Vercel 재고 사이트
+# 번역기 배포: 라즈베리파이 + Vercel Beiko 사이트
 
-번역 서버는 재고 서버가 있는 라즈베리파이에서 상시 실행하고, Vercel 재고 사이트 우측 상단의 **번역기** 버튼으로 들어갑니다.
-재고 사이트 비밀번호로 로그인되어 있으면 번역기에는 따로 로그인하지 않습니다.
+번역 서버는 재고 서버가 있는 라즈베리파이에서 상시 실행하고, Vercel Beiko 사이트 우측 상단의 **번역기** 버튼으로 들어갑니다.
+`https://www.beiko.co.kr/translator` 링크만 있으면 사이트 로그인 없이 사용할 수 있습니다.
 
 ```
-[브라우저] 재고 사이트(Vercel) 로그인 → '번역기' 클릭
+[브라우저] Beiko 사이트(Vercel) '번역기' 클릭 또는 공유 링크 열기
      │  /translator: gist 에서 파이 번역기 주소를 읽고, 2분짜리 서명 토큰을 붙여 이동
      ▼
 [라즈베리파이] Cloudflare quick tunnel → kr-translator (127.0.0.1:8777)
@@ -57,7 +57,8 @@ codex login --device-auth
 sudo systemctl restart kr-translator
 ```
 
-화면에 나온 주소에서 코드를 입력하면 됩니다. 번역기 화면의 **기기 코드로 로그인** 버튼으로 해도 됩니다(이 경우 재시작 불필요).
+관리자가 화면에 나온 주소에서 코드를 입력하면 됩니다. 공개 번역기에서는 서버 계정을 변경할 수 없습니다.
+32비트 Node 환경에서 별도 Codex 실행 파일을 설치했다면 `/etc/kr-translator.env`의 `TRANSLATOR_CODEX_BIN` 경로를 사용하세요.
 
 - 코드를 입력했는데 로그인이 안 되면 ChatGPT 설정의 보안 항목에서 **Codex 기기 코드 인증**을 켜야 합니다. 회사(Business/Enterprise) 계정은 관리자가 허용해야 합니다.
   [OpenAI 공식 인증 문서](https://learn.chatgpt.com/docs/auth#login-on-headless-devices)에서 확인할 수 있습니다.
@@ -66,9 +67,9 @@ sudo systemctl restart kr-translator
 ## 3. Vercel 환경변수
 
 `www.beiko.co.kr` 은 이 저장소의 Python 웹 앱이 아니라 `beiko3444/beico-app` 의 Next.js 앱입니다.
-해당 사이트에서는 `/translator` 경로가 기존 관리자 세션을 확인하고 파이로 연결합니다.
+해당 사이트의 `/translator` 경로는 로그인 없이 방문자에게 서명 링크를 발급하고 파이로 연결합니다.
 `st` 브랜치 머지만으로는 이 사이트에 버튼이 추가되지 않으므로 `beico-app` 의 연결 코드도 배포해야 합니다.
-Next.js 사이트에는 `SMARTINVENTORY_WEB_PASSWORD` 대신 기존 관리자 로그인이 적용됩니다.
+Next.js 번역기 연결에는 `SMARTINVENTORY_WEB_PASSWORD`나 관리자 로그인이 필요하지 않습니다. Python 재고 앱의 기존 로그인 정책은 별도입니다.
 
 | 이름 | 값 |
 | --- | --- |
@@ -80,7 +81,8 @@ Next.js 사이트에는 `SMARTINVENTORY_WEB_PASSWORD` 대신 기존 관리자 �
 
 ## 4. 사용
 
-재고 사이트 우측 상단 **번역기** → 새 탭에 번역기가 열립니다.
+Beiko 메뉴의 **번역기** 아이콘 또는 `https://www.beiko.co.kr/translator` → 번역기가 열립니다.
+영어·중국어 결과 아래에는 각 외국어 결과를 다시 한국어로 번역한 확인본이 표시됩니다.
 
 - 번역기 세션은 30일 유지됩니다. 파이 재부팅으로 터널 주소가 바뀌면 메뉴로 다시 들어오면 됩니다.
 - 화면 갱신은 롱폴링입니다. Cloudflare quick tunnel 은 Server-Sent Events 를 지원하지 않기 때문입니다(Cloudflare 문서). 새 글자가 생기는 즉시 응답하므로 체감상 실시간입니다.
@@ -108,6 +110,7 @@ sudo UPDATE_CODEX=1 bash ~/st/translator/deploy/install.sh
 
 ## 보안
 
-- 파이의 번역 서버는 `127.0.0.1` 에만 열리고 터널로만 노출됩니다. 재고 사이트가 서명한 토큰이나 그 토큰으로 받은 세션 쿠키가 없으면 모든 요청을 거절합니다.
+- 파이의 번역 서버는 `127.0.0.1` 에만 열리고 터널로만 노출됩니다. Beiko의 공개 링크가 서명한 토큰으로 방문자 세션을 발급합니다. 세션이 없으면 공유 링크로 연결하며 별도 로그인을 요구하지 않습니다.
+- 배포 모드의 웹 계정 로그인·로그아웃 API는 차단되며, 서버 계정 정보와 사용량을 방문자에게 노출하지 않습니다. 계정 관리는 SSH에서만 합니다.
 - 비밀키를 바꾸려면 `/etc/kr-translator.env` 와 Vercel 값을 함께 바꾸고 `sudo systemctl restart kr-translator` 후 Vercel 을 다시 배포하세요.
 - 게시 스크립트가 죽은 터널을 재시작할 수 있도록 `/etc/sudoers.d/kr-translator` 에 `systemctl restart kr-translator-tunnel.service` 한 가지만 허용합니다.

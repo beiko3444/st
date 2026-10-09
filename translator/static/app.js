@@ -29,6 +29,7 @@ const el = {
   checkbox: {},
   panel: {},
   out: {},
+  back: {},
   meta: {},
 };
 
@@ -94,6 +95,8 @@ function buildLanguages(targets) {
     el.outputs.appendChild(panel);
     el.panel[code] = panel;
     el.out[code] = output;
+    el.back[code] = panel.querySelector(".back-output");
+    panel.querySelector(".copy-back").dataset.copyBack = code;
     el.meta[code] = panel.querySelector(".meta");
   }
   applyLangSelection();
@@ -136,6 +139,8 @@ function resetOutputs(streaming) {
   for (const lang of state.langs) {
     const working = streaming && active.includes(lang);
     el.out[lang].textContent = "";
+    el.back[lang].textContent = working ? "번역문이 완성되면 한국어로 다시 번역합니다." : "";
+    el.back[lang].classList.remove("error");
     el.out[lang].classList.toggle("streaming", working);
     el.out[lang].classList.remove("error");
     el.meta[lang].textContent = working ? "번역 중…" : "";
@@ -223,7 +228,7 @@ async function translate(force = false) {
     if (state.jobId === job.id) state.jobId = null;
   } catch (error) {
     if (error.name === "AbortError" || state.controller !== controller) return;
-    const message = error instanceof SessionExpired ? "재고 사이트의 '번역기' 메뉴로 다시 들어오세요." : error.message || String(error);
+    const message = error instanceof SessionExpired ? "Beiko 사이트의 '번역기' 메뉴로 다시 들어오세요." : error.message || String(error);
     for (const lang of selectedLangs()) showError(lang, message);
     state.lastKey = "";
   } finally {
@@ -253,9 +258,23 @@ function handleEvent(event) {
       el.out[lang].textContent += event.text;
       el.meta[lang].textContent = "번역 중…";
       break;
+    case "translated":
+      el.out[lang].textContent = event.text;
+      el.out[lang].classList.remove("streaming");
+      el.back[lang].textContent = "";
+      el.meta[lang].textContent = "한국어 확인 번역 중…";
+      break;
+    case "back_reset":
+      el.back[lang].textContent = "";
+      break;
+    case "back_delta":
+      el.back[lang].textContent += event.text;
+      break;
     case "done":
       el.out[lang].textContent = event.text;
       el.out[lang].classList.remove("streaming");
+      el.back[lang].textContent = event.backText || event.backError || "";
+      el.back[lang].classList.toggle("error", Boolean(event.backError));
       el.meta[lang].textContent = describeTiming(event);
       break;
     case "error":
@@ -307,6 +326,7 @@ function showError(lang, message) {
   el.out[lang].classList.add("error");
   el.out[lang].textContent = message;
   el.meta[lang].textContent = "";
+  el.back[lang].textContent = "";
   if (/auth|login|401|로그인/i.test(message)) refreshStatus();
 }
 
@@ -328,9 +348,9 @@ async function copyText(text) {
 }
 
 el.outputs.addEventListener("click", async (event) => {
-  const button = event.target.closest("button[data-copy]");
+  const button = event.target.closest("button[data-copy], button[data-copy-back]");
   if (!button) return;
-  const output = el.out[button.dataset.copy];
+  const output = button.dataset.copyBack ? el.back[button.dataset.copyBack] : el.out[button.dataset.copy];
   if (!output.textContent || output.classList.contains("error")) return;
   await copyText(output.textContent);
   button.textContent = "복사됨";
@@ -375,6 +395,12 @@ function fillStyles(styles) {
 
 function renderAccount(status) {
   el.account.replaceChildren();
+  if (status.deployed) {
+    el.account.textContent = status.ready ? "바로 번역할 수 있습니다" : "번역 서버 확인이 필요합니다";
+    if (status.ready) hideLogin();
+    else showLogin("번역 서버를 확인 중입니다. 잠시 후 다시 시도해 주세요.", false);
+    return;
+  }
   if (!status.codex || !status.codex.ok) {
     el.account.textContent = "Codex 연결 안 됨";
     showLogin((status.codex && status.codex.error) || "Codex CLI를 찾을 수 없습니다.", false);
@@ -429,13 +455,13 @@ function describeUsage(usage) {
 function showLogin(errorMessage, canLogin) {
   const deployed = Boolean(state.status && state.status.deployed);
   el.login.hidden = false;
-  el.loginActions.hidden = !canLogin;
+  el.loginActions.hidden = deployed || !canLogin;
+  $("login-title").textContent = deployed ? "번역 서버 확인 중" : "ChatGPT 계정으로 로그인";
   // On the server, the browser flow's callback would go to the server's own
   // 127.0.0.1, so only the device-code flow can work there.
   el.loginBrowser.hidden = deployed;
   el.loginDesc.textContent = deployed
-    ? "번역 서버(라즈베리파이)의 Codex에 ChatGPT 계정을 연결합니다. 기기 코드로 로그인하세요. " +
-      "코드 입력 후에도 로그인이 안 되면 ChatGPT 설정의 보안 항목에서 Codex 기기 코드 인증을 켜야 합니다."
+    ? "서버 연결을 확인 중입니다. 잠시 후 다시 시도해 주세요."
     : "번역은 로그인한 ChatGPT 구독(Codex 포함 플랜)의 사용량으로 처리됩니다.";
   if (errorMessage) setLoginMessage(errorMessage, true);
 }
@@ -445,7 +471,7 @@ function showSessionExpired(portalUrl) {
   el.login.hidden = false;
   el.loginActions.hidden = true;
   el.deviceBox.hidden = true;
-  el.loginDesc.textContent = "번역기 접속 시간이 만료되었습니다. 재고 사이트의 '번역기' 메뉴로 다시 들어오세요.";
+  el.loginDesc.textContent = "번역기 접속 시간이 만료되었습니다. Beiko 사이트의 '번역기' 메뉴로 다시 들어오세요.";
   el.account.textContent = "세션 만료";
   if (portalUrl) {
     el.loginMsg.hidden = false;
@@ -453,7 +479,7 @@ function showSessionExpired(portalUrl) {
     el.loginMsg.replaceChildren();
     const link = document.createElement("a");
     link.href = portalUrl;
-    link.textContent = "재고 사이트에서 다시 열기";
+    link.textContent = "번역기 다시 열기";
     el.loginMsg.appendChild(link);
   }
 }
