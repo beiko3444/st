@@ -276,6 +276,22 @@ class TranslatorHttpTests(FakeCodexMixin, unittest.TestCase):
         events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
         self.assertEqual(final_texts(events), {"en": "[en] 감사합니다", "zh": "[zh] 감사합니다"})
 
+    def test_only_checked_languages_are_translated(self) -> None:
+        with self.client() as client:
+            languages = client.get("/api/status").json()["targets"]
+            response = client.post("/api/translate", json={"text": "감사합니다", "targets": ["zh"]})
+            nothing = client.post("/api/translate", json={"text": "감사합니다", "targets": []})
+        self.assertEqual(
+            [(t["code"], t["native"], t["htmlLang"]) for t in languages],
+            [("en", "English", "en"), ("zh", "简体中文", "zh-CN")],
+        )
+        events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+        self.assertEqual(final_texts(events), {"zh": "[zh] 감사합니다"})
+        self.assertEqual(events[0], {"type": "start", "targets": ["zh"]})
+        self.assertEqual(len(self.requests("thread/start")), 1)
+        self.assertIn('"type": "end"', nothing.text)
+        self.assertNotIn('"type": "start"', nothing.text)
+
     def test_login_returns_browser_url_and_status_follows(self) -> None:
         with self.client(logged_in=False) as client:
             self.assertIsNone(client.get("/api/status").json()["account"])

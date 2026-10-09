@@ -117,7 +117,7 @@ textarea {
 
 .outputs {
   display: grid;
-  grid-template-rows: 1fr 1fr;
+  grid-auto-rows: minmax(0, 1fr);
   gap: 12px;
   min-height: 0;
 }
@@ -172,6 +172,45 @@ textarea {
   gap: 6px;
   font-size: 13px;
   color: var(--muted);
+}
+
+.lang-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.lang-bar-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.langs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.lang-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.lang-option:has(input:checked) {
+  border-color: var(--primary);
+  background: var(--accent-bg);
+  color: var(--primary);
 }
 
 select {
@@ -354,7 +393,7 @@ button.copy.done {
   }
 
   .outputs {
-    grid-template-rows: auto auto;
+    grid-auto-rows: auto;
   }
 
   #source {

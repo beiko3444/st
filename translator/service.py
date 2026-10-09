@@ -122,7 +122,10 @@ class TranslationService:
             "jev": self.jev.describe() if self.jev else None,
             "login": self._login or None,
             "styles": [{"key": s.key, "label": s.label} for s in STYLES.values()],
-            "targets": [{"code": t.code, "label": t.label} for t in TARGETS.values()],
+            "targets": [
+                {"code": t.code, "label": t.label, "native": t.native, "htmlLang": t.html_lang}
+                for t in TARGETS.values()
+            ],
         }
         try:
             codex = await self._codex()
@@ -175,9 +178,13 @@ class TranslationService:
     async def translate(
         self, text: str, *, style: str = AUTO_STYLE, targets: Optional[Sequence[str]] = None
     ) -> AsyncIterator[dict[str, Any]]:
-        """Yield UI events: start, jev, style, reset/delta per language, done or error, end."""
+        """Yield UI events: start, jev, style, reset/delta per language, done or error, end.
+
+        `targets` are the language codes checked in the page; `None` means all.
+        """
         text = (text or "").strip()
-        targets = [code for code in (targets or TARGETS) if code in TARGETS]
+        requested = TARGETS if targets is None else targets
+        targets = [code for code in TARGETS if code in requested]
         if not text or not targets:
             yield {"type": "end"}
             return

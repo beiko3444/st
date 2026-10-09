@@ -30,8 +30,13 @@
           <label class="toggle"><input type="checkbox" id="live" checked> 입력 중 자동 번역</label>
         </div>
       </div>
+      <div class="lang-bar">
+        <span class="lang-bar-title">번역 언어</span>
+        <div class="langs" id="langs" role="group" aria-label="번역할 언어"></div>
+        <span class="muted" id="lang-hint" hidden>최소 한 언어는 선택해야 합니다</span>
+      </div>
       <textarea id="source" spellcheck="false" autofocus
-        placeholder="한국어를 붙여넣으세요 (Ctrl/⌘+V) — 바로 영어와 중국어 간체로 번역됩니다.&#10;직접 입력하면 잠시 멈췄을 때 번역합니다. Ctrl/⌘+Enter: 즉시 번역"></textarea>
+        placeholder="한국어를 붙여넣으세요 (Ctrl/⌘+V) — 체크한 언어로 바로 번역됩니다.&#10;직접 입력하면 잠시 멈췄을 때 번역합니다. Ctrl/⌘+Enter: 즉시 번역"></textarea>
       <div class="pane-foot">
         <span class="chip" id="jev-chip" hidden></span>
         <span class="chip muted" id="style-chip" hidden></span>
@@ -41,24 +46,7 @@
       </div>
     </section>
 
-    <section class="outputs">
-      <article class="pane out-pane" data-lang="en">
-        <div class="pane-head">
-          <span class="pane-title">English</span>
-          <button type="button" class="copy" data-copy="en">복사</button>
-        </div>
-        <div class="output" id="out-en" lang="en"></div>
-        <div class="pane-foot"><span class="muted meta" id="meta-en"></span></div>
-      </article>
-      <article class="pane out-pane" data-lang="zh">
-        <div class="pane-head">
-          <span class="pane-title">简体中文</span>
-          <button type="button" class="copy" data-copy="zh">복사</button>
-        </div>
-        <div class="output" id="out-zh" lang="zh-CN"></div>
-        <div class="pane-foot"><span class="muted meta" id="meta-zh"></span></div>
-      </article>
-    </section>
+    <section class="outputs" id="outputs"></section>
   </main>
 
   <div class="overlay" id="login" hidden>
@@ -77,6 +65,17 @@
       <p class="notice" id="login-msg" hidden></p>
     </div>
   </div>
+
+  <template id="output-template">
+    <article class="pane out-pane">
+      <div class="pane-head">
+        <span class="pane-title"></span>
+        <button type="button" class="copy">복사</button>
+      </div>
+      <div class="output"></div>
+      <div class="pane-foot"><span class="muted meta"></span></div>
+    </article>
+  </template>
 
   <script src="/static/app.js"></script>
 </body>

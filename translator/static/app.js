@@ -1,8 +1,8 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const LANGS = ["en", "zh"];
 const TYPING_DELAY_MS = 700;
+const LANG_STORAGE_KEY = "kr-translator.langs";
 
 const el = {
   source: $("source"),
@@ -20,8 +20,15 @@ const el = {
   deviceBox: $("device-box"),
   deviceUrl: $("device-url"),
   deviceCode: $("device-code"),
-  out: { en: $("out-en"), zh: $("out-zh") },
-  meta: { en: $("meta-en"), zh: $("meta-zh") },
+  langs: $("langs"),
+  langHint: $("lang-hint"),
+  outputs: $("outputs"),
+  outputTemplate: $("output-template"),
+  // Filled per language by buildLanguages().
+  checkbox: {},
+  panel: {},
+  out: {},
+  meta: {},
 };
 
 const state = {
@@ -30,12 +37,91 @@ const state = {
   typingTimer: null,
   loginPoll: null,
   status: null,
+  // Language codes in server order, e.g. ["en", "zh"].
+  langs: [],
 };
+
+// --------------------------------------------------------------- languages
+
+function selectedLangs() {
+  return state.langs.filter((code) => el.checkbox[code].checked);
+}
+
+function loadSavedLangs() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(LANG_STORAGE_KEY) || "null");
+    return Array.isArray(saved) ? saved : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function saveLangs() {
+  try {
+    localStorage.setItem(LANG_STORAGE_KEY, JSON.stringify(selectedLangs()));
+  } catch (error) {
+    // Storage can be unavailable (private window); the choice then lasts for this visit.
+  }
+}
+
+function buildLanguages(targets) {
+  if (state.langs.length || !targets.length) return;
+  const saved = loadSavedLangs();
+  const savedValid = saved && saved.some((code) => targets.some((target) => target.code === code));
+  for (const target of targets) {
+    const code = target.code;
+    state.langs.push(code);
+
+    const label = document.createElement("label");
+    label.className = "lang-option";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.value = code;
+    checkbox.checked = savedValid ? saved.includes(code) : true;
+    checkbox.addEventListener("change", () => onLangToggle(checkbox));
+    label.append(checkbox, ` ${target.label}`);
+    el.langs.appendChild(label);
+    el.checkbox[code] = checkbox;
+
+    const panel = el.outputTemplate.content.firstElementChild.cloneNode(true);
+    panel.dataset.lang = code;
+    panel.querySelector(".pane-title").textContent = target.native;
+    panel.querySelector(".copy").dataset.copy = code;
+    const output = panel.querySelector(".output");
+    output.lang = target.htmlLang;
+    el.outputs.appendChild(panel);
+    el.panel[code] = panel;
+    el.out[code] = output;
+    el.meta[code] = panel.querySelector(".meta");
+  }
+  applyLangSelection();
+}
+
+function applyLangSelection() {
+  for (const code of state.langs) el.panel[code].hidden = !el.checkbox[code].checked;
+}
+
+function onLangToggle(checkbox) {
+  if (!selectedLangs().length) {
+    // Translating into nothing is never useful; keep the last language on.
+    checkbox.checked = true;
+    el.langHint.hidden = false;
+    setTimeout(() => {
+      el.langHint.hidden = true;
+    }, 2000);
+    return;
+  }
+  applyLangSelection();
+  saveLangs();
+  // Unchecking only hides the panel. Checking fetches the new language;
+  // languages already translated come back from the server cache.
+  if (checkbox.checked) translate();
+}
 
 // ------------------------------------------------------------ translation
 
 function requestKey(text) {
-  return `${el.style.value}\u0000${text}`;
+  return `${el.style.value}\u0000${selectedLangs().join(",")}\u0000${text}`;
 }
 
 function scheduleTranslate() {
@@ -44,16 +130,20 @@ function scheduleTranslate() {
 }
 
 function resetOutputs(streaming) {
-  for (const lang of LANGS) {
+  const active = selectedLangs();
+  for (const lang of state.langs) {
+    const working = streaming && active.includes(lang);
     el.out[lang].textContent = "";
-    el.out[lang].classList.toggle("streaming", streaming);
+    el.out[lang].classList.toggle("streaming", working);
     el.out[lang].classList.remove("error");
-    el.meta[lang].textContent = streaming ? "번역 중…" : "";
+    el.meta[lang].textContent = working ? "번역 중…" : "";
   }
 }
 
 async function translate(force = false) {
   clearTimeout(state.typingTimer);
+  if (!state.langs.length) await statusReady;
+  if (!state.langs.length) return;
   const text = el.source.value.trim();
   if (!text) {
     if (state.controller) state.controller.abort();
@@ -80,7 +170,7 @@ async function translate(force = false) {
     const response = await fetch("/api/translate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, style: el.style.value }),
+      body: JSON.stringify({ text, style: el.style.value, targets: selectedLangs() }),
       signal: controller.signal,
     });
     if (!response.ok || !response.body) {
@@ -91,12 +181,12 @@ async function translate(force = false) {
     });
   } catch (error) {
     if (error.name === "AbortError") return;
-    for (const lang of LANGS) showError(lang, error.message || String(error));
+    for (const lang of selectedLangs()) showError(lang, error.message || String(error));
     state.lastKey = "";
   } finally {
     if (state.controller === controller) {
       state.controller = null;
-      for (const lang of LANGS) el.out[lang].classList.remove("streaming");
+      for (const lang of state.langs) el.out[lang].classList.remove("streaming");
     }
   }
 }
@@ -122,6 +212,7 @@ async function readEvents(body, onEvent) {
 
 function handleEvent(event) {
   const lang = event.lang;
+  if (lang && !el.out[lang]) return;
   switch (event.type) {
     case "jev":
       renderJev(event);
@@ -147,7 +238,7 @@ function handleEvent(event) {
       showError(lang, event.message);
       break;
     case "fatal":
-      for (const code of LANGS) showError(code, event.message);
+      for (const code of selectedLangs()) showError(code, event.message);
       break;
     default:
       break;
@@ -212,18 +303,18 @@ async function copyText(text) {
   helper.remove();
 }
 
-document.querySelectorAll("button[data-copy]").forEach((button) => {
-  button.addEventListener("click", async () => {
-    const output = el.out[button.dataset.copy];
-    if (!output.textContent || output.classList.contains("error")) return;
-    await copyText(output.textContent);
-    button.textContent = "복사됨";
-    button.classList.add("done");
-    setTimeout(() => {
-      button.textContent = "복사";
-      button.classList.remove("done");
-    }, 1200);
-  });
+el.outputs.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-copy]");
+  if (!button) return;
+  const output = el.out[button.dataset.copy];
+  if (!output.textContent || output.classList.contains("error")) return;
+  await copyText(output.textContent);
+  button.textContent = "복사됨";
+  button.classList.add("done");
+  setTimeout(() => {
+    button.textContent = "복사";
+    button.classList.remove("done");
+  }, 1200);
 });
 
 // ------------------------------------------------------------ account/login
@@ -239,6 +330,7 @@ async function refreshStatus() {
   }
   state.status = status;
   fillStyles(status.styles || []);
+  buildLanguages(status.targets || []);
   renderAccount(status);
   return status;
 }
@@ -411,7 +503,7 @@ el.clear.addEventListener("click", () => {
 $("login-browser").addEventListener("click", () => startLogin("browser"));
 $("login-device").addEventListener("click", () => startLogin("device"));
 
-refreshStatus();
+const statusReady = refreshStatus();
 setInterval(() => {
   if (!state.loginPoll && document.visibilityState === "visible") refreshStatus();
 }, 60000);

@@ -11,6 +11,8 @@ class Target:
     code: str
     name: str
     label: str
+    native: str
+    html_lang: str
     rules: str
 
 
@@ -29,12 +31,16 @@ TARGETS: dict[str, Target] = {
         code="en",
         name="English",
         label="영어",
+        native="English",
+        html_lang="en",
         rules="Write natural, idiomatic English with American spelling.",
     ),
     "zh": Target(
         code="zh",
         name="Simplified Chinese",
         label="중국어 간체",
+        native="简体中文",
+        html_lang="zh-CN",
         rules=(
             "Write Simplified Chinese characters (简体字) only, never Traditional characters. "
             "Use standard Mainland China wording and full-width Chinese punctuation (，。？！：；“”)."
